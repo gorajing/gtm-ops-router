@@ -1,0 +1,13 @@
+{
+  "ryder-digital.com":      { "employees": 1200, "industry": "logistics",         "techSignals": ["twilio", "salesforce"], "regulated": true,  "confidence": 0.95 },
+  "cargoloop.io":           { "employees": 400,  "industry": "freight-brokerage",  "techSignals": ["hubspot"],              "regulated": true,  "confidence": 0.92 },
+  "midwest3pl.com":         { "employees": 150,  "industry": "3pl",                "techSignals": ["aircall"],              "regulated": false, "confidence": 0.90 },
+  "acme-retail.com":        { "employees": 900,  "industry": "retail",             "techSignals": ["zendesk"],              "regulated": false, "confidence": 0.88 },
+  "tinytrucking.com":       { "employees": 12,   "industry": "trucking",           "techSignals": [],                       "regulated": false, "confidence": 0.80 },
+  "globexfoods.com":        { "employees": 6000, "industry": "manufacturing",      "techSignals": ["genesys"],              "regulated": false, "confidence": 0.85 },
+  "offtarget.io":           { "employees": 300,  "industry": "media",              "techSignals": [],                       "regulated": false, "confidence": 0.90 },
+  "foggyfreight.com":       { "employees": 200,  "industry": "freight",            "techSignals": ["legacy-tms"],           "regulated": false, "confidence": 0.15 },
+  "laggylines.com":         { "employees": 100,  "industry": "freight",            "techSignals": ["twilio"],               "regulated": false, "confidence": 0.90, "simulate": "timeout" },
+  "britannia-haulage.co.uk":{ "employees": 2000, "industry": "freight",            "techSignals": ["twilio"],               "regulated": true,  "confidence": 0.93 },
+  "eurodist.eu":            { "employees": 800,  "industry": "distribution",       "techSignals": ["aircall"],              "regulated": false, "confidence": 0.90 }
+}
