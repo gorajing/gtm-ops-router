@@ -35,6 +35,8 @@ const QUARANTINE_CODES: QuarantineCode[] = [
   "enrichment_unresolved",
   "insufficient_data",
   "store_error",
+  "sink_terminal",
+  "sink_exhausted",
 ];
 
 const SCHEMA: string[] = [
@@ -174,13 +176,17 @@ export class Store {
 
     const routeMix = { nurture: 0, self_serve: 0, human_assisted: 0 };
     const flags = { pricing_approval: 0, regulated_review: 0 };
+    const arrByRoute = { nurture: 0, self_serve: 0, human_assisted: 0 };
     for (const d of this.routed()) {
       routeMix[d.route.kind] += 1;
+      arrByRoute[d.route.kind] += d.dealUSD;
       if (d.route.kind === "human_assisted") {
         if (d.route.financeFlag) flags.pricing_approval += 1;
         if (d.route.legalFlag) flags.regulated_review += 1;
       }
     }
+    const routedArrUsd =
+      arrByRoute.nurture + arrByRoute.self_serve + arrByRoute.human_assisted;
 
     const quarantineByCode = Object.fromEntries(
       QUARANTINE_CODES.map((c) => [c, 0]),
@@ -209,6 +215,10 @@ export class Store {
       quarantineByCode,
       latencyMsP50: percentile(lat, 50),
       latencyMsP95: percentile(lat, 95),
+      routedArrUsd,
+      humanRoutedArrUsd: arrByRoute.human_assisted,
+      arrByRoute,
+      autoHandled: routeMix.nurture + routeMix.self_serve,
     };
   }
 

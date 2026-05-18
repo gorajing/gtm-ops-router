@@ -104,7 +104,9 @@ export type QuarantineCode =
   | "schema_invalid" // intake failed validation
   | "enrichment_unresolved" // could not resolve the company — we do NOT guess
   | "insufficient_data" // cannot score safely
-  | "store_error"; // persistence failed — surfaced, not swallowed
+  | "store_error" // internal persistence failed — surfaced, not swallowed
+  | "sink_terminal" // downstream write rejected non-retryably (e.g. 4xx)
+  | "sink_exhausted"; // downstream write retried to budget and still failed
 
 export interface Quarantine {
   dealId: string;
@@ -140,4 +142,9 @@ export interface Metrics {
   quarantineByCode: Record<QuarantineCode, number>;
   latencyMsP50: number;
   latencyMsP95: number;
+  // Business intuition: tie routing to money and to human-touch saved.
+  routedArrUsd: number; // sum dealUSD of all routed deals
+  humanRoutedArrUsd: number; // sum dealUSD that needs a person (>= $10K gate)
+  arrByRoute: { nurture: number; self_serve: number; human_assisted: number };
+  autoHandled: number; // routed without consuming a rep touch (nurture+self_serve)
 }

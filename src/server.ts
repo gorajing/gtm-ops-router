@@ -38,6 +38,8 @@ function dashboard(m: Metrics): string {
  ${card("conversion", m.conversionPct + "%")}
  ${card("quarantined", m.quarantined)}
  ${card("quar. rate", m.quarantineRatePct + "%")}
+ ${card("routed ARR", "$" + Math.round(m.routedArrUsd).toLocaleString("en-US"))}
+ ${card("auto-handled", m.autoHandled)}
  ${card("p95 latency", m.latencyMsP95 + "ms")}
 </div>
 <table>

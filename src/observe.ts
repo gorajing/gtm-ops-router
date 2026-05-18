@@ -14,6 +14,10 @@ function rule(width = 64): string {
   return "─".repeat(width);
 }
 
+function money(n: number): string {
+  return "$" + Math.round(n).toLocaleString("en-US");
+}
+
 export function renderMetricsTable(m: Metrics): string {
   const lines = [
     rule(),
@@ -36,6 +40,11 @@ export function renderMetricsTable(m: Metrics): string {
     ...Object.entries(m.quarantineByCode).map(
       ([k, v]) => `    ${pad(k, 24)} ${v}`,
     ),
+    "",
+    "  business",
+    `    routed ARR ........ ${money(m.routedArrUsd)}`,
+    `    human-routed ARR .. ${money(m.humanRoutedArrUsd)}`,
+    `    auto-handled ...... ${m.autoHandled} deals (routed with no rep touch)`,
     "",
     `  latency  p50 ${m.latencyMsP50}ms   p95 ${m.latencyMsP95}ms`,
     rule(),

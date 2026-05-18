@@ -19,6 +19,7 @@ import {
   renderRoutedTable,
 } from "./observe.js";
 import { startServer } from "./server.js";
+import { FlakySink } from "./sink.js";
 import { Store } from "./store.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -45,12 +46,29 @@ function loadJsonl(path: string): unknown[] {
     });
 }
 
-async function cmdDemo(): Promise<void> {
+async function cmdDemo(flaky: boolean): Promise<void> {
   const store = new Store(":memory:");
   const enricher = new FixtureEnricher(loadFixture());
   const seed = loadJsonl(`${ROOT}data/inbound.seed.jsonl`);
 
-  const outcomes = await processBatch(seed, store, enricher);
+  const opts = flaky
+    ? {
+        dryRun: false,
+        sink: new FlakySink({
+          retryableTimes: 1,
+          terminalCompanies: new Set(["EuroDist"]),
+        }),
+        retry: { maxAttempts: 3, baseDelayMs: 0, sleep: async () => {} },
+      }
+    : {};
+  if (flaky) {
+    console.log(
+      "[--flaky] live sink: 1 retryable failure then success; " +
+        "EuroDist → terminal (see QUARANTINED: sink_terminal)\n",
+    );
+  }
+
+  const outcomes = await processBatch(seed, store, enricher, opts);
 
   console.log(renderMetricsTable(store.metrics()));
   console.log("\nROUTED");
@@ -98,20 +116,24 @@ function cmdServe(portArg: string | undefined): void {
 }
 
 async function main(): Promise<void> {
-  const [cmd, arg] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const positionals = args.filter((a) => !a.startsWith("-"));
+  const cmd = positionals[0];
+  const flaky = args.includes("--flaky");
   switch (cmd) {
     case "demo":
-      await cmdDemo();
+      await cmdDemo(flaky);
       return;
     case "run":
-      await cmdRun(arg);
+      await cmdRun(positionals[1]);
       return;
     case "serve":
-      cmdServe(arg);
+      cmdServe(positionals[1]);
       return;
     default:
       console.error(
-        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve`,
+        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve` +
+          ` (flags: --flaky)`,
       );
       process.exitCode = 2;
   }

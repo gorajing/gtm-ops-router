@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FixtureEnricher, type FixtureEntry } from "../src/enrich.js";
 import { processBatch, processOne } from "../src/pipeline.js";
+import { FlakySink } from "../src/sink.js";
 import { Store } from "../src/store.js";
 
 const DATA = fileURLToPath(new URL("../data/", import.meta.url));
@@ -43,8 +44,8 @@ describe("pipeline — happy path", () => {
         expect(out.deal.route.legalFlag).toBe("regulated_review");
       }
     }
-    // intake -> enriched -> scored -> routed = 4 events
-    expect(store.events(store.routed()[0]?.id).length).toBe(4);
+    // intake -> enriched -> scored -> sink(dry-run) -> routed = 5 events
+    expect(store.events(store.routed()[0]?.id).length).toBe(5);
     store.close();
   });
 });
@@ -156,9 +157,21 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
       enrichment_unresolved: 2,
       insufficient_data: 1,
       store_error: 0,
+      sink_terminal: 0,
+      sink_exhausted: 0,
     });
     expect(m.conversionPct).toBe(69.2);
     expect(m.quarantineRatePct).toBe(30.8);
+
+    // business intuition: money + human-touch saved (default run = dry-run)
+    expect(m.routedArrUsd).toBe(508000);
+    expect(m.humanRoutedArrUsd).toBe(457000);
+    expect(m.autoHandled).toBe(3);
+    expect(m.arrByRoute).toEqual({
+      nurture: 40000,
+      self_serve: 11000,
+      human_assisted: 457000,
+    });
 
     const ryder = outcomes.find(
       (o) => o.ok && o.deal.company === "Ryder Digital",
@@ -169,6 +182,50 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
     );
     expect(offTarget?.ok && offTarget.deal.route.kind).toBe("nurture");
 
+    store.close();
+  });
+});
+
+describe("pipeline — downstream sink (live, not dry-run)", () => {
+  const liveRetry = { maxAttempts: 3, baseDelayMs: 0, sleep: async () => {} };
+
+  it("retryable sink failures recover, deal still routes", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()), {
+      dryRun: false,
+      sink: new FlakySink({ retryableTimes: 2 }),
+      retry: liveRetry,
+    });
+    expect(out.ok).toBe(true);
+    expect(store.routed().length).toBe(1);
+    store.close();
+  });
+
+  it("terminal sink rejection -> sink_terminal quarantine, not routed", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()), {
+      dryRun: false,
+      sink: new FlakySink({
+        retryableTimes: 0,
+        terminalCompanies: new Set(["Ryder Digital"]),
+      }),
+      retry: liveRetry,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.quarantine.code).toBe("sink_terminal");
+    expect(store.routed().length).toBe(0); // invariant: routed XOR quarantined
+    store.close();
+  });
+
+  it("retries exhausted -> sink_exhausted quarantine", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()), {
+      dryRun: false,
+      sink: new FlakySink({ retryableTimes: 99 }),
+      retry: liveRetry,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.quarantine.code).toBe("sink_exhausted");
     store.close();
   });
 });

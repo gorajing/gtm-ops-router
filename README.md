@@ -21,8 +21,7 @@ At S23 → $60M scale, the place leverage leaks is the **handoff**: an inbound
 deal that should be auto-qualified instead waits on a human; a $150K regulated
 deal reaches an AE with no finance or legal context; a malformed record gets
 silently dropped and nobody knows until the quarter closes. This is a small,
-real system that closes those leaks — and, more importantly, shows *how I
-reason* about building durable internal leverage.
+real system that closes those leaks.
 
 ---
 
@@ -35,15 +34,21 @@ universal; claiming honest about its floor.
 
 ```bash
 npm install
-npm run demo      # deterministic batch over a seed corpus — no API keys, no ports
-npm test          # 21 tests incl. every failure mode
-npm run serve     # live dashboard at http://localhost:8787
+npm run demo            # deterministic batch — no API keys, no ports (dry-run)
+npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
+npm test                # TypeScript suite, incl. every failure mode
+npm run serve           # live dashboard at http://localhost:8787
+
+# Python side (stdlib only — the JD names Python explicitly):
+npm run run -- data/inbound.seed.jsonl    # process a batch -> data/router.db
+python3 ops_audit.py --db data/router.db  # data-integrity + SLO gate; exit 1 on breach
+python3 -m unittest test_ops_audit        # Python tests
 ```
 
-`npm run demo` prints run metrics, the routed table, the quarantine table
-(loud, never dropped), and a full event trail for one deal. Node prints one
-`ExperimentalWarning: SQLite ...` line — that is expected and intentional (see
-below), not a defect.
+`npm run demo` prints metrics, the routed table, the quarantine table (loud,
+never dropped), business numbers (routed ARR, auto-handled), and a full event
+trail. Node prints one `ExperimentalWarning: SQLite ...` line — expected, the
+disclosed cost of zero native deps, not a defect.
 
 ---
 
@@ -54,11 +59,15 @@ intake 13 · routed 9 (conv 69.2%) · quarantined 4 (rate 30.8%)
 route mix      nurture 1 · self_serve 2 · human_assisted 6
 human-gate     pricing_approval 4 · regulated_review 4
 quarantine     schema_invalid 1 · enrichment_unresolved 2 · insufficient_data 1
+business       routed ARR $508,000 · auto-handled 3 (routed, no rep touch)
 ```
 
-14 input lines, but only 9 distinct routed rows: one line is a duplicate of
-another and is **deduped at the store** — re-ingesting the same logical deal
-never double-counts. That number being 9 and not 10 is the point.
+14 input lines, 9 distinct routed rows: one line duplicates another and is
+**deduped at the store** — re-ingesting the same logical deal never
+double-counts. 9, not 10, is the point. The default run is dry-run (no
+external writes, zero `sink_*` quarantines); `--flaky` injects deterministic
+retryable and terminal sink faults so the retry/terminal taxonomy is visible
+in the quarantine table, not just asserted in tests.
 
 ---
 
@@ -109,20 +118,21 @@ That boundary is a deliberate design output, not a missing feature.
 
 | Their "Must Have" | In this repo |
 |---|---|
-| Ship real systems, strong SWE fundamentals | runs end-to-end; `tsc` strict + `noUncheckedIndexedAccess`; 21 tests |
-| Automations/tools w/ SQL, APIs, scripting | `node:sqlite` store; `node:http` API; CLI batch + cron-shaped `run` |
-| Reason about edge cases, failure modes, maintainability | 5 typed quarantine paths, all tested incl. injected `store_error` |
-| Business intuition (cost, speed, scale) | scoring weights fit-first; `$10K`/`$50K` gates are named policy |
-| Extreme ownership, ambiguity | scoped, built, and verified from a one-line JD bullet |
-| Clear communication | this README; one audit note per score dimension |
+| Ship real systems, strong SWE fundamentals | runs end-to-end; `tsc` strict + `noUncheckedIndexedAccess`; TS + Python suites |
+| Automations/tools w/ **Python**, SQL, APIs, scripting | Python `ops_audit.py` (SLO gate, stdlib, tested); `node:sqlite` store; `node:http` API; cron-shaped `run` |
+| Reason about edge cases, failure modes, maintainability | 6 typed quarantine codes incl. injected `store_error`; retryable-vs-terminal sink taxonomy w/ bounded backoff; dry-run |
+| Business intuition (cost, speed, scale) | routed/human ARR + auto-handled metrics; `$10K`/`$50K` gates are named policy |
+| Extreme ownership, ambiguity | scoped from a one-line JD bullet to a running system; `ASSUMPTIONS.md` + `RUNBOOK.md` |
+| Clear communication | this README, runbook, assumptions; one audit note per score dimension |
 
 ## What I'd build next (ownership beyond the demo)
 
-- Real enricher adapter (Apollo/warehouse) behind the existing `Enricher`
-  seam — with a timeout + retry budget and a circuit breaker.
-- A quarantine-rate **SLO with alerting**, and a dead-letter requeue once a
-  bad upstream is fixed.
-- Auth on `POST /deals`; structured log shipping.
+- Live `Enricher` / `OpportunitySink` adapters (Apollo, Salesforce) behind
+  the existing seams + a circuit breaker; dead-letter requeue after upstream
+  recovery. (Retry/backoff, terminal-vs-retryable, dry-run, and the SLO gate
+  are already built — see `sink.ts` and `ops_audit.py`.)
+- Auth on `POST /deals`; structured log shipping; alerting wired to the
+  existing audit gate.
 - **The self-improving loop:** score routing decisions against closed-won
   outcomes, surface the false-positive / missed-pattern quadrants, and tune
   the thresholds from data instead of by hand. (Same loop, pointed at ops.)
@@ -130,16 +140,18 @@ That boundary is a deliberate design output, not a missing feature.
 ## Architecture
 
 ```
-inbound ─► intake ─► enrich ─► score ─► route ─► store ─► dashboard /metrics
-            (zod)     (seam,   (deterministic, (sales/    (sqlite,   (http)
-                       no guess) auditable)    finance/   idempotent,
-              │           │         │           legal)    events)
-              └───────────┴─────────┴── any failure ─► typed Quarantine (loud)
+inbound ─► intake ─► enrich ─► score ─► route ─► sink ──► store ─► dashboard
+            (zod)    (seam,   (determ., (sales/  (retry/  (sqlite, /metrics
+                      no guess) audit)   fin/     terminal idempot. (http)
+              │          │        │       legal)   dry-run)  events)
+              └──────────┴────────┴───────┴── any failure ─► typed Quarantine (loud)
+
+data/router.db ─► ops_audit.py   (Python: invariant + SLO gate, exit 1 on breach)
 ```
 
 Each stage is single-purpose and swappable; the pipeline doesn't change when
-an enricher does. `src/` is ~10 small files; read `pipeline.ts` first — the
-error boundaries are the interesting part.
+an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
+— the stage order and error boundaries are the interesting part.
 
 ## 90-second walkthrough (for the screen recording)
 

@@ -2,12 +2,26 @@
  * Orchestration. Every stage is wrapped: the only two ways out of this
  * function are a routed deal or a typed Quarantine. Nothing is ever silently
  * dropped, and an unexpected throw is surfaced (store_error), not swallowed.
+ *
+ * Stage order matters: the downstream write (sink) is attempted BEFORE the
+ * internal routed-state is persisted, so a deal is never both "routed
+ * internally" and "failed to sync" — it is exactly one terminal state, and
+ * routed + quarantined == intake always holds.
  */
 
 import { createHash } from "node:crypto";
 import { normalize } from "./intake.js";
 import { score } from "./score.js";
 import { route } from "./route.js";
+import {
+  DEFAULT_RETRY,
+  LoggingSink,
+  SinkExhaustedError,
+  TerminalSinkError,
+  withRetry,
+  type OpportunitySink,
+  type RetryOptions,
+} from "./sink.js";
 import type { Enricher } from "./enrich.js";
 import type { Store } from "./store.js";
 import type {
@@ -20,6 +34,17 @@ import type {
 // Below this enrichment confidence we refuse to score — acting on data we
 // don't believe is how silent corruption enters an ops system.
 const LOW_CONFIDENCE = 0.2;
+
+export interface PipelineOptions {
+  /** Default true: do not attempt the external write, just record intent. */
+  dryRun: boolean;
+  sink: OpportunitySink;
+  retry: RetryOptions;
+}
+
+function defaults(): PipelineOptions {
+  return { dryRun: true, sink: new LoggingSink(), retry: DEFAULT_RETRY };
+}
 
 function syntheticId(raw: unknown): string {
   let s: string;
@@ -56,7 +81,9 @@ export async function processOne(
   raw: unknown,
   store: Store,
   enricher: Enricher,
+  options: Partial<PipelineOptions> = {},
 ): Promise<PipelineOutcome> {
+  const opts = { ...defaults(), ...options };
   const t0 = performance.now();
 
   // ── Stage 1: intake ──────────────────────────────────────────────────────
@@ -132,24 +159,58 @@ export async function processOne(
 
   // ── Stage 4: route ───────────────────────────────────────────────────────
   const routed = { ...scored, route: route(scored) };
-  store.appendEvent(
-    deal.id,
-    "scored",
-    "routed",
-    `route ${routed.route.kind}`,
-  );
 
-  // ── Persist (loud on failure) ────────────────────────────────────────────
+  // ── Stage 5: downstream write (before persisting routed state) ───────────
+  if (opts.dryRun) {
+    await opts.sink.upsert(routed); // LoggingSink: records intent only
+    store.appendEvent(deal.id, "scored", "scored", "sink: dry-run (skipped)");
+  } else {
+    try {
+      await withRetry(() => opts.sink.upsert(routed), opts.retry);
+      store.appendEvent(
+        deal.id,
+        "scored",
+        "scored",
+        `sink: upserted via ${opts.sink.name}`,
+      );
+    } catch (err) {
+      if (err instanceof TerminalSinkError) {
+        return quarantine(
+          store,
+          deal.id,
+          "scored",
+          "routed",
+          "sink_terminal",
+          err.message,
+          t0,
+        );
+      }
+      if (err instanceof SinkExhaustedError) {
+        return quarantine(
+          store,
+          deal.id,
+          "scored",
+          "routed",
+          "sink_exhausted",
+          err.message,
+          t0,
+        );
+      }
+      throw err; // unknown — do not absorb
+    }
+  }
+
+  // ── Persist routed state (loud on failure) ───────────────────────────────
+  store.appendEvent(deal.id, "scored", "routed", `route ${routed.route.kind}`);
   const latency = Math.round(performance.now() - t0);
   try {
     store.upsertRouted(routed, latency);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Surfaced, not swallowed. If even quarantining fails, it rethrows.
     return quarantine(
       store,
       deal.id,
-      "scored",
+      "routed",
       "routed",
       "store_error",
       `persist failed: ${msg}`,
@@ -164,10 +225,11 @@ export async function processBatch(
   rawList: unknown[],
   store: Store,
   enricher: Enricher,
+  options: Partial<PipelineOptions> = {},
 ): Promise<PipelineOutcome[]> {
   const out: PipelineOutcome[] = [];
   for (const raw of rawList) {
-    out.push(await processOne(raw, store, enricher));
+    out.push(await processOne(raw, store, enricher, options));
   }
   return out;
 }
