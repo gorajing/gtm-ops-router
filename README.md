@@ -37,18 +37,27 @@ npm install
 npm run demo            # deterministic batch — no API keys, no ports (dry-run)
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm test                # TypeScript suite, incl. every failure mode
-npm run serve           # live dashboard at http://localhost:8787
+
+# Dashboard proof surface:
+npm run run -- data/inbound.seed.jsonl  # process seed data -> data/router.db
+npm run serve                           # open http://localhost:8787
 
 # Python side (stdlib only — the JD names Python explicitly):
-npm run run -- data/inbound.seed.jsonl    # process a batch -> data/router.db
 python3 ops_audit.py --db data/router.db  # data-integrity + SLO gate; exit 1 on breach
 python3 -m unittest test_ops_audit        # Python tests
 ```
 
-`npm run demo` prints metrics, the routed table, the quarantine table (loud,
-never dropped), business numbers (routed ARR, auto-handled), and a full event
-trail. Node prints one `ExperimentalWarning: SQLite ...` line — expected, the
-disclosed cost of zero native deps, not a defect.
+`npm run demo` prints the same proof in the terminal. The dashboard renders it
+as an operator view: KPIs, route mix, routed deals, quarantine ledger, and an
+event trail, all backed by the same SQLite store. Node prints one
+`ExperimentalWarning: SQLite ...` line — expected, the disclosed cost of zero
+native deps, not a defect.
+
+---
+
+## Dashboard proof
+
+![GTM Ops Router dashboard](docs/dashboard.png)
 
 ---
 
@@ -157,11 +166,12 @@ an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
 
 1. (0:00) "HappyRobot sells autonomous ops. This is a working slice of the
    sales/finance/legal tooling bullet from the JD — built, not mocked."
-2. (0:10) `npm run demo` — point at the metrics: "13 in, 9 routed, 4
-   quarantined. Conversion and quarantine-by-code are asserted in tests."
-3. (0:30) Routed table: "Ryder, $120K, regulated → human + finance + legal,
+2. (0:10) `npm run run -- data/inbound.seed.jsonl && npm run serve`, then open
+   `http://localhost:8787` — point at the dashboard metrics: "13 in, 9 routed,
+   4 quarantined. Conversion and quarantine-by-code are asserted in tests."
+3. (0:30) Routed deals: "Ryder, $120K, regulated → human + finance + legal,
    pre-flagged. Off-ICP → nurture, zero rep time. $8K → self-serve."
-4. (0:45) Quarantine table: "Unknown company is *not guessed* — quarantined
+4. (0:45) Quarantine ledger: "Unknown company is *not guessed* — quarantined
    with a reason. Bad schema, low-confidence data, provider timeout: all
    typed, none dropped."
 5. (1:05) `src/types.ts` + `pipeline.ts`: "Invalid states are
