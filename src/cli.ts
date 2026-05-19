@@ -37,7 +37,9 @@ function loadDotEnv(): void {
     const eq = line.indexOf("=");
     if (eq <= 0) continue;
     const key = line.slice(0, eq).trim();
-    const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, "");
+    const rawValue = line.slice(eq + 1).trim();
+    const quoted = rawValue.match(/^(['"])(.*)\1$/);
+    const value = quoted ? quoted[2] ?? "" : rawValue;
     if (!process.env[key]) process.env[key] = value;
   }
 }
@@ -168,14 +170,40 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   const Store = await loadStore();
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
+  const mode = integrationMode(args);
   const { label, opts } = pipelineOptions(args);
-  startServer(store, enricher, port, {
+  const server = startServer(store, enricher, port, {
     pipelineOptions: opts,
     sinkLabel: label,
+    liveIntegrations: mode === "live",
   });
+  let closed = false;
+  const closeStore = (): void => {
+    if (closed) return;
+    closed = true;
+    store.close();
+  };
+  const shutdown = (signal: NodeJS.Signals): void => {
+    console.log(`\nreceived ${signal}; shutting down`);
+    const timer = setTimeout(() => {
+      closeStore();
+      process.exit(0);
+    }, 2_000);
+    server.close(() => {
+      clearTimeout(timer);
+      closeStore();
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
   console.log(`gtm-ops-router listening on http://localhost:${port}`);
-  console.log(`  GET  /            dashboard`);
+  console.log(`  GET  /            operator console`);
+  console.log(`  GET  /state       operator state`);
+  console.log(`  GET  /deals/:id/events`);
+  console.log(`  GET  /integration-health`);
   console.log(`  GET  /metrics     JSON metrics`);
+  console.log(`  POST /preview     dry-run route preview`);
   console.log(`  POST /deals       ingest (single object or array)`);
   console.log(`  sink              ${label}`);
 }

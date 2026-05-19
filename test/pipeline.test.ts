@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FixtureEnricher, type FixtureEntry } from "../src/enrich.js";
 import { processBatch, processOne } from "../src/pipeline.js";
-import { FlakySink } from "../src/sink.js";
+import { FlakySink, type OpportunitySink } from "../src/sink.js";
 import { Store } from "../src/store.js";
 
 const DATA = fileURLToPath(new URL("../data/", import.meta.url));
@@ -46,6 +46,37 @@ describe("pipeline — happy path", () => {
     }
     // intake -> enriched -> scored -> sink(dry-run) -> routed = 5 events
     expect(store.events(store.routed()[0]?.id).length).toBe(5);
+    store.close();
+  });
+
+  it("keeps limited deal journeys bounded while preserving the intake event", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
+    expect(out.ok).toBe(true);
+    if (!out.ok) throw new Error("expected routed deal");
+    for (let i = 0; i < 60; i += 1) {
+      store.appendEvent(out.deal.id, "scored", "scored", `operator note ${i}`);
+    }
+
+    const { events, total, truncated } = store.eventsBookended(out.deal.id, 50);
+    expect(events).toHaveLength(50);
+    expect(total).toBe(65);
+    expect(truncated).toBe(true);
+    expect(events[0]?.detail).toBe("intake: Ryder Digital");
+    expect(events.at(-1)?.detail).toBe("operator note 59");
+    store.close();
+  });
+
+  it("plain event reads are explicit and uncapped", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
+    expect(out.ok).toBe(true);
+    if (!out.ok) throw new Error("expected routed deal");
+    for (let i = 0; i < 1001; i += 1) {
+      store.appendEvent(out.deal.id, "scored", "scored", `operator note ${i}`);
+    }
+
+    expect(store.events(out.deal.id)).toHaveLength(1006);
     store.close();
   });
 });
@@ -117,6 +148,32 @@ describe("pipeline — every failure mode is typed, never dropped", () => {
     }
     store.close();
   });
+
+  it("returns a loud fallback when quarantine persistence itself fails", async () => {
+    class ExplodingQuarantineStore extends Store {
+      override recordQuarantine(): void {
+        throw new Error("db locked");
+      }
+    }
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new ExplodingQuarantineStore(":memory:");
+    const out = await processOne(
+      { ...validDeal, contactEmail: "nope" },
+      store,
+      new FixtureEnricher(fixture()),
+    );
+
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.quarantine.code).toBe("schema_invalid");
+      expect(out.quarantine.reason).toContain("quarantine persistence failed");
+    }
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("quarantine_persist_failed"),
+    );
+    errorSpy.mockRestore();
+    store.close();
+  });
 });
 
 describe("pipeline — idempotency (data accuracy by construction)", () => {
@@ -145,6 +202,7 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
     expect(m.intake).toBe(13);
     expect(m.routed).toBe(9);
     expect(m.quarantined).toBe(4);
+    expect(store.integrity().ok).toBe(true);
 
     expect(m.routeMix).toEqual({
       nurture: 1,
@@ -157,6 +215,7 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
       enrichment_unresolved: 2,
       insufficient_data: 1,
       store_error: 0,
+      pipeline_error: 0,
       sink_terminal: 0,
       sink_exhausted: 0,
     });
@@ -167,6 +226,8 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
     expect(m.routedArrUsd).toBe(508000);
     expect(m.humanRoutedArrUsd).toBe(457000);
     expect(m.autoHandled).toBe(3);
+    expect(m.partialSyncs).toBe(0);
+    expect(m.externallySyncedStoreErrors).toBe(0);
     expect(m.arrByRoute).toEqual({
       nurture: 40000,
       self_serve: 11000,
@@ -226,6 +287,70 @@ describe("pipeline — downstream sink (live, not dry-run)", () => {
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.quarantine.code).toBe("sink_exhausted");
+    store.close();
+  });
+
+  it("counts live sync gaps when external write succeeds but local persistence fails", async () => {
+    class ExplodingStore extends Store {
+      override upsertRouted(): "inserted" | "updated" {
+        throw new Error("disk full");
+      }
+    }
+    const sink: OpportunitySink = {
+      name: "crm",
+      async upsert(deal) {
+        return [{ system: "hubspot", externalId: deal.id, detail: "upserted" }];
+      },
+    };
+    const store = new ExplodingStore(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()), {
+      dryRun: false,
+      sink,
+      retry: liveRetry,
+    });
+
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.quarantine.code).toBe("store_error");
+    expect(store.metrics().externallySyncedStoreErrors).toBe(1);
+    store.close();
+  });
+
+  it("keeps processing a batch after an unexpected per-deal throw", async () => {
+    let calls = 0;
+    const sink: OpportunitySink = {
+      name: "buggy-sink",
+      async upsert(deal) {
+        calls += 1;
+        if (calls === 1) throw new TypeError("undefined is not a function");
+        return [{ system: "hubspot", externalId: deal.id, detail: "upserted" }];
+      },
+    };
+    const store = new Store(":memory:");
+    const outcomes = await processBatch(
+      [
+        validDeal,
+        {
+          ...validDeal,
+          company: "Ryder Digital Expansion",
+          contactEmail: "expansion@ryder-digital.com",
+        },
+      ],
+      store,
+      new FixtureEnricher(fixture()),
+      { dryRun: false, sink, retry: liveRetry },
+    );
+
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes[0]?.ok).toBe(false);
+    if (outcomes[0] && !outcomes[0].ok) {
+      expect(outcomes[0].quarantine.code).toBe("pipeline_error");
+      expect(outcomes[0].quarantine.reason).toContain(
+        "unexpected pipeline error",
+      );
+    }
+    expect(outcomes[1]?.ok).toBe(true);
+    expect(store.metrics().routed).toBe(1);
+    expect(store.metrics().quarantineByCode.pipeline_error).toBe(1);
     store.close();
   });
 });

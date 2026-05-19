@@ -19,6 +19,8 @@ Live integrations: copy `.env.example` to `.env`, fill HubSpot and Slack
 secrets, then run with `--live-integrations`. HubSpot requires a unique deal
 property named by `HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY`; without that, live mode
 refuses to run because retrying create-only writes would duplicate deals.
+The local `.env` loader is intentionally simple: one `KEY=value` per line,
+optional quotes, no multiline values or inline comments.
 
 ## Read the metrics
 
@@ -27,7 +29,8 @@ refuses to run because retrying create-only writes would duplicate deals.
 - **quarantine rate** — SLO default 35%. Above it, the audit fails. The
   `quarantineByCode` breakdown tells you *which* boundary broke.
 - **routed ARR / human-routed ARR** — revenue moving through, and how much
-  needs a person. Use it to size rep capacity, not just count leads.
+  landed on the `human_assisted` route. Use it to size rep capacity, not just
+  count leads.
 - **auto-handled** — deals routed with zero rep touch. This is the leverage
   number; it is the thing this system exists to grow.
 
@@ -39,6 +42,7 @@ refuses to run because retrying create-only writes would duplicate deals.
 | `enrichment_unresolved` | provider miss/timeout/unknown co. | check provider health; backfill then replay |
 | `insufficient_data` | enrichment confidence too low | lower-confidence source; do not "fix" by guessing |
 | `store_error` | internal persistence failed | page: disk/db; this should never be normal |
+| `pipeline_error` | unexpected per-record throw; batch continued | inspect stderr/test the failing adapter; replay |
 | `sink_terminal` | downstream rejected (4xx/auth) | bad mapping or creds; fix config, replay |
 | `sink_exhausted` | downstream retried to budget | dependency degraded; check its status, replay |
 

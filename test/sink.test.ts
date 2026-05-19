@@ -70,6 +70,29 @@ describe("withRetry — retryable vs terminal is the whole point", () => {
     );
     expect(fn).toHaveBeenCalledTimes(3);
   });
+
+  it("adds bounded jitter to retry delays", async () => {
+    const sleeps: number[] = [];
+    let n = 0;
+    const fn = vi.fn(async () => {
+      n += 1;
+      if (n === 1) throw new RetryableSinkError("429 once");
+      return "ok";
+    });
+
+    await expect(
+      withRetry(fn, {
+        maxAttempts: 2,
+        baseDelayMs: 100,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+        random: () => 1,
+      }),
+    ).resolves.toBe("ok");
+
+    expect(sleeps).toEqual([125]);
+  });
 });
 
 describe("sinks", () => {

@@ -126,8 +126,9 @@ Built to a production bar.
   constructed. The compiler enforces the business rules.
 - **Fail loud, never silent.** Every failure is a typed `Quarantine` with a
   code and a human-readable reason. An unknown company is *not guessed*. A
-  persistence error is surfaced as `store_error`, not swallowed. Nothing is
-  ever dropped — `quarantined + routed == intake`, always.
+  persistence error is surfaced as `store_error`; an unexpected per-row throw is
+  surfaced as `pipeline_error`. Nothing is ever dropped: routed + quarantined
+  always reconciles to intake.
 - **Observability is first-class.** Every stage transition is an event row;
   metrics (conversion, quarantine rate by code, route mix, p50/p95 latency)
   are queryable and rendered on a live dashboard and a JSON endpoint. External
@@ -164,7 +165,7 @@ That boundary is a deliberate design output, not a missing feature.
 |---|---|
 | Ship real systems, strong SWE fundamentals | runs end-to-end; `tsc` strict + `noUncheckedIndexedAccess`; TS + Python suites |
 | Automations/tools w/ **Python**, SQL, APIs, scripting | Python `ops_audit.py` (SLO gate, stdlib, tested); `node:sqlite` store; `node:http` API; HubSpot + Slack REST adapters; cron-shaped `run` |
-| Reason about edge cases, failure modes, maintainability | 6 typed quarantine codes incl. injected `store_error`; retryable-vs-terminal sink taxonomy w/ bounded backoff; dry-run |
+| Reason about edge cases, failure modes, maintainability | 7 typed quarantine codes incl. injected `store_error`; retryable-vs-terminal sink taxonomy w/ bounded backoff; dry-run |
 | Business intuition (cost, speed, scale) | routed/human ARR + auto-handled metrics; `$10K`/`$50K` gates are named policy |
 | Extreme ownership, ambiguity | scoped from a one-line JD bullet to a running system; `ASSUMPTIONS.md` + `RUNBOOK.md` |
 | Clear communication | this README, runbook, assumptions; one audit note per score dimension |

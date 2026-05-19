@@ -46,6 +46,7 @@ export interface SinkReceipt {
   system: string;
   externalId: string;
   detail: string;
+  status?: "ok" | "warning";
   url?: string;
 }
 
@@ -53,6 +54,8 @@ export interface RetryOptions {
   maxAttempts: number;
   baseDelayMs: number;
   sleep: (ms: number) => Promise<void>;
+  jitterRatio?: number;
+  random?: () => number;
 }
 
 const realSleep = (ms: number): Promise<void> =>
@@ -63,6 +66,15 @@ export const DEFAULT_RETRY: RetryOptions = {
   baseDelayMs: 100,
   sleep: realSleep,
 };
+
+function retryDelayMs(opts: RetryOptions, attempt: number): number {
+  const base = opts.baseDelayMs * 2 ** (attempt - 1);
+  const jitterRatio = opts.jitterRatio ?? 0.25;
+  if (base <= 0 || jitterRatio <= 0) return base;
+  const random = opts.random ?? Math.random;
+  const factor = 1 + (random() * 2 - 1) * jitterRatio;
+  return Math.max(0, Math.round(base * factor));
+}
 
 /**
  * Run `fn` with bounded exponential backoff.
@@ -82,7 +94,7 @@ export async function withRetry<T>(
       if (err instanceof RetryableSinkError) {
         lastReason = err.message;
         if (attempt < opts.maxAttempts) {
-          await opts.sleep(opts.baseDelayMs * 2 ** (attempt - 1));
+          await opts.sleep(retryDelayMs(opts, attempt));
           continue;
         }
         throw new SinkExhaustedError(opts.maxAttempts, lastReason);
@@ -113,6 +125,8 @@ export class LoggingSink implements OpportunitySink {
  * Deterministic fault-injecting sink for tests and the --flaky demo.
  *  - ids in `terminalIds` throw TerminalSinkError (never retried)
  *  - other ids throw RetryableSinkError `retryableTimes` times, then succeed
+ * Attempts are tracked per deal id so one reusable instance behaves like a
+ * stateful downstream in long-running demos.
  */
 export class FlakySink implements OpportunitySink {
   readonly name = "flaky";

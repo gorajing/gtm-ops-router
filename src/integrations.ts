@@ -8,21 +8,25 @@
  */
 
 import {
+  DEFAULT_RETRY,
   RetryableSinkError,
+  SinkExhaustedError,
   TerminalSinkError,
   type OpportunitySink,
+  type RetryOptions,
   type SinkReceipt,
+  withRetry,
 } from "./sink.js";
 import type { RoutedDeal } from "./types.js";
 
 type FetchLike = typeof fetch;
+const DEFAULT_FETCH_TIMEOUT_MS = 8_000;
 
 export interface IntegrationSinkConfig {
   mode: "dry-run" | "live";
   hubspotAccessToken: string | undefined;
   hubspotExternalIdProperty: string;
   hubspotApiBase: string;
-  hubspotApiVersion: string;
   hubspotPipeline: string;
   hubspotDealstage: string;
   hubspotPortalId: string | undefined;
@@ -30,6 +34,7 @@ export interface IntegrationSinkConfig {
   slackChannelId: string;
   slackApiBase: string;
   fetchImpl: FetchLike;
+  slackRetry?: RetryOptions;
 }
 
 export interface IntegrationBuild {
@@ -89,6 +94,32 @@ interface HubSpotPipelineResponse {
       archived?: unknown;
     }>;
   }>;
+}
+
+function fetchTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = Number(env.INTEGRATION_FETCH_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+function withFetchTimeout(fetchImpl: FetchLike, timeoutMs: number): FetchLike {
+  return (async (
+    input: Parameters<FetchLike>[0],
+    init?: Parameters<FetchLike>[1],
+  ) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(new Error(`fetch timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const signals = [controller.signal];
+    if (init?.signal) signals.push(init.signal);
+    const signal =
+      signals.length === 1 ? controller.signal : AbortSignal.any(signals);
+    try {
+      return await fetchImpl(input, { ...init, signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }) as FetchLike;
 }
 
 interface SlackAuthResponse {
@@ -161,12 +192,21 @@ export function slackHandoffPayload(
   hubspot: SinkReceipt,
 ): { channel: string; text: string } {
   const lines = [
-    `GTM routed deal: ${deal.company}`,
-    `ARR: ${money(deal.dealUSD)} | score: ${deal.score.total.toFixed(2)} | route: ${routeSummary(deal)}`,
-    `HubSpot: ${hubspot.externalId}${hubspot.url ? ` (${hubspot.url})` : ""}`,
-    `Router id: ${deal.id}`,
+    `GTM routed deal: ${escapeSlackMrkdwn(deal.company)}`,
+    `ARR: ${money(deal.dealUSD)} | score: ${deal.score.total.toFixed(2)} | route: ${escapeSlackMrkdwn(routeSummary(deal))}`,
+    `HubSpot: ${escapeSlackMrkdwn(hubspot.externalId)}${
+      hubspot.url ? ` (${escapeSlackMrkdwn(hubspot.url)})` : ""
+    }`,
+    `Router id: ${escapeSlackMrkdwn(deal.id)}`,
   ];
   return { channel, text: lines.join("\n") };
+}
+
+function escapeSlackMrkdwn(s: string): string {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 function bodyMessage(body: unknown): string {
@@ -197,12 +237,14 @@ function httpFailure(system: string, res: Response, body: unknown): Error {
 }
 
 function isRetryableSlackError(code: string): boolean {
+  // Slack can use fatal_error for server-side failures, so retry it before
+  // preserving the HubSpot write as a warning receipt.
   return [
     "ratelimited",
     "request_timeout",
     "service_unavailable",
-    "fatal_error",
     "internal_error",
+    "fatal_error",
   ].includes(code);
 }
 
@@ -241,14 +283,13 @@ function integrationConfigFromEnv(
     hubspotExternalIdProperty:
       env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY ?? "gtm_router_deal_id",
     hubspotApiBase: env.HUBSPOT_API_BASE ?? "https://api.hubapi.com",
-    hubspotApiVersion: env.HUBSPOT_API_VERSION ?? "2026-03",
     hubspotPipeline: env.HUBSPOT_PIPELINE ?? "default",
     hubspotDealstage: env.HUBSPOT_DEALSTAGE ?? "appointmentscheduled",
     hubspotPortalId: env.HUBSPOT_PORTAL_ID,
     slackBotToken: env.SLACK_BOT_TOKEN,
     slackChannelId: env.SLACK_CHANNEL_ID ?? "#gtm-ops-router-demo",
     slackApiBase: env.SLACK_API_BASE ?? "https://slack.com",
-    fetchImpl,
+    fetchImpl: withFetchTimeout(fetchImpl, fetchTimeoutMs(env)),
   };
 }
 
@@ -264,6 +305,17 @@ function missingLiveEnv(
     cfg.slackBotToken ? "" : "SLACK_BOT_TOKEN",
     env.SLACK_CHANNEL_ID ? "" : "SLACK_CHANNEL_ID",
   ].filter(Boolean);
+}
+
+function invalidLiveEnv(cfg: IntegrationSinkConfig): string[] {
+  const invalid: string[] = [];
+  if (!/^[a-z][a-z0-9_]*$/i.test(cfg.hubspotExternalIdProperty)) {
+    invalid.push("HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY");
+  }
+  if (!/^[CGD][A-Z0-9]{2,}$/.test(cfg.slackChannelId)) {
+    invalid.push("SLACK_CHANNEL_ID");
+  }
+  return invalid;
 }
 
 function authHeaders(token: string): Record<string, string> {
@@ -312,9 +364,7 @@ async function checkHubSpotProperty(
     );
   }
   const property = encodeURIComponent(cfg.hubspotExternalIdProperty);
-  const url =
-    `${cfg.hubspotApiBase}/crm/properties/${cfg.hubspotApiVersion}` +
-    `/deals/${property}`;
+  const url = `${cfg.hubspotApiBase}/crm/v3/properties/deals/${property}`;
   let res: Response;
   try {
     res = await cfg.fetchImpl(url, {
@@ -652,8 +702,30 @@ export class HubSpotSlackSink implements OpportunitySink {
 
   async upsert(deal: RoutedDeal): Promise<SinkReceipt[]> {
     const hubspot = await this.upsertHubSpot(deal);
-    const slack = await this.postSlack(deal, hubspot);
-    return [hubspot, slack];
+    try {
+      const slack = await withRetry(
+        () => this.postSlack(deal, hubspot),
+        this.cfg.slackRetry ?? DEFAULT_RETRY,
+      );
+      return [hubspot, slack];
+    } catch (err) {
+      if (
+        err instanceof RetryableSinkError ||
+        err instanceof SinkExhaustedError ||
+        err instanceof TerminalSinkError
+      ) {
+        return [
+          hubspot,
+          {
+            system: "slack",
+            externalId: this.cfg.slackChannelId,
+            detail: `notification failed: ${err.message}`,
+            status: "warning",
+          },
+        ];
+      }
+      throw err;
+    }
   }
 
   private async upsertHubSpot(deal: RoutedDeal): Promise<SinkReceipt> {
@@ -672,8 +744,8 @@ export class HubSpotSlackSink implements OpportunitySink {
     if (!token) throw new TerminalSinkError("HUBSPOT_ACCESS_TOKEN is missing");
     const idProperty = encodeURIComponent(this.cfg.hubspotExternalIdProperty);
     const url =
-      `${this.cfg.hubspotApiBase}/crm/objects/${this.cfg.hubspotApiVersion}` +
-      `/deals/batch/upsert?idProperty=${idProperty}`;
+      `${this.cfg.hubspotApiBase}/crm/v3/objects/0-3/batch/upsert` +
+      `?idProperty=${idProperty}`;
     let res: Response;
     try {
       res = await this.cfg.fetchImpl(url, {
@@ -702,10 +774,10 @@ export class HubSpotSlackSink implements OpportunitySink {
       );
     }
     const first = parsed.results?.[0] ?? {};
-    if (!first.id) {
+    if (typeof first.id !== "string" || first.id.length === 0) {
       throw new TerminalSinkError("hubspot upsert response had no result");
     }
-    const id = resultId(first.id, deal.id);
+    const id = first.id;
     const urlFromBody = hubSpotUrl(this.cfg, id, first.url);
     return {
       system: "hubspot",
@@ -784,11 +856,15 @@ export function integrationOptionsFromEnv(
     if (missing.length > 0) {
       throw new Error(`missing live integration env: ${missing.join(", ")}`);
     }
+    const invalid = invalidLiveEnv(cfg);
+    if (invalid.length > 0) {
+      throw new Error(`invalid live integration env: ${invalid.join(", ")}`);
+    }
   }
 
   const sink = new HubSpotSlackSink(cfg);
   return {
-    dryRun: false,
+    dryRun: mode === "dry-run",
     sink,
     label: sink.name,
   };

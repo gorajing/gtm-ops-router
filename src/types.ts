@@ -40,7 +40,10 @@ export type Stage =
 export const RawDealInput = z.object({
   id: z.string().min(1).optional(),
   company: z.string().min(1, "company is required"),
-  domain: z.string().min(3).optional(),
+  domain: z.preprocess(
+    (v) => (typeof v === "string" && v.trim().length === 0 ? undefined : v),
+    z.string().min(3).optional(),
+  ),
   contactName: z.string().min(1, "contactName is required"),
   contactEmail: z.string().email("contactEmail must be a valid email"),
   dealUSD: z.number().finite().nonnegative("dealUSD must be >= 0"),
@@ -105,6 +108,7 @@ export type QuarantineCode =
   | "enrichment_unresolved" // could not resolve the company — we do NOT guess
   | "insufficient_data" // cannot score safely
   | "store_error" // internal persistence failed — surfaced, not swallowed
+  | "pipeline_error" // unexpected per-record throw; batch keeps running
   | "sink_terminal" // downstream write rejected non-retryably (e.g. 4xx)
   | "sink_exhausted"; // downstream write retried to budget and still failed
 
@@ -129,7 +133,21 @@ export interface PipelineEvent {
   from: Stage | "-";
   to: Stage;
   detail: string;
+  meta?: PipelineEventMeta;
 }
+
+export type PipelineEventMeta =
+  | {
+      kind: "sink";
+      mode: "dry_run" | "live";
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    };
 
 export interface Metrics {
   intake: number;
@@ -144,7 +162,9 @@ export interface Metrics {
   latencyMsP95: number;
   // Business intuition: tie routing to money and to human-touch saved.
   routedArrUsd: number; // sum dealUSD of all routed deals
-  humanRoutedArrUsd: number; // sum dealUSD that needs a person (>= $10K gate)
+  humanRoutedArrUsd: number; // sum dealUSD on the human_assisted route
   arrByRoute: { nurture: number; self_serve: number; human_assisted: number };
   autoHandled: number; // routed without consuming a rep touch (nurture+self_serve)
+  partialSyncs: number; // routed rows where a secondary downstream handoff warned
+  externallySyncedStoreErrors: number; // live sink succeeded, local persistence failed
 }
