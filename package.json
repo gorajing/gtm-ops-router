@@ -11,6 +11,7 @@
     "demo": "tsx src/cli.ts demo",
     "run": "tsx src/cli.ts run",
     "serve": "tsx src/cli.ts serve",
+    "doctor": "tsx src/cli.ts doctor",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

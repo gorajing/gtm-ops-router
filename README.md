@@ -37,6 +37,7 @@ npm install
 npm run demo            # deterministic batch — no API keys, no ports (dry-run)
 npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
+npm run doctor          # live HubSpot/Slack setup check; no secrets printed
 npm test                # TypeScript suite, incl. every failure mode
 
 # Dashboard proof surface:
@@ -65,6 +66,8 @@ cp .env.example .env
 # fill HUBSPOT_ACCESS_TOKEN, HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY,
 # SLACK_BOT_TOKEN, and SLACK_CHANNEL_ID
 
+npm run doctor                 # checks env, HubSpot property uniqueness, Slack auth
+npm run doctor -- --send-test  # additionally posts one Slack test message
 npm run run -- data/inbound.seed.jsonl --live-integrations
 npm run serve -- --live-integrations
 ```
@@ -73,6 +76,13 @@ npm run serve -- --live-integrations
 HubSpot portal. That is not ceremony: it keeps retries and re-runs idempotent
 instead of creating duplicate deals. Slack messages include the router deal id
 and HubSpot receipt so a human can trace the handoff.
+
+If `npm run doctor` says `gtm_router_deal_id` already exists but is not
+unique, create a fresh unique text property instead (for example
+`gtm_router_unique_id`) and set `HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY` to that
+internal name. HubSpot cannot turn a non-unique property into a safe upsert
+key after the fact. If Slack says `not_in_channel`, invite the app/bot to the
+target channel and rerun `npm run doctor -- --send-test`.
 
 ---
 

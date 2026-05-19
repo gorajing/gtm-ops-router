@@ -38,6 +38,23 @@ export interface IntegrationBuild {
   label: string;
 }
 
+export type IntegrationCheckStatus = "pass" | "warn" | "fail";
+
+export interface IntegrationCheck {
+  system: "env" | "hubspot" | "slack";
+  name: string;
+  status: IntegrationCheckStatus;
+  detail: string;
+  hint?: string;
+}
+
+export interface IntegrationDoctorOptions {
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: FetchLike;
+  sendSlackTest?: boolean;
+  now?: () => Date;
+}
+
 interface HubSpotUpsertResponse {
   results?: Array<{
     id?: unknown;
@@ -51,6 +68,24 @@ interface SlackPostResponse {
   error?: unknown;
   ts?: unknown;
   channel?: unknown;
+}
+
+interface HubSpotPropertyResponse {
+  name?: unknown;
+  label?: unknown;
+  type?: unknown;
+  fieldType?: unknown;
+  hasUniqueValue?: unknown;
+}
+
+interface SlackAuthResponse {
+  ok?: unknown;
+  error?: unknown;
+  team?: unknown;
+  user?: unknown;
+  team_id?: unknown;
+  user_id?: unknown;
+  bot_id?: unknown;
 }
 
 interface HubSpotBatchUpsertPayload {
@@ -166,6 +201,10 @@ function resultId(v: unknown, fallback: string): string {
   return typeof v === "string" && v.length > 0 ? v : fallback;
 }
 
+function resultText(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
 function hubSpotUrl(
   cfg: IntegrationSinkConfig,
   id: string,
@@ -176,6 +215,336 @@ function hubSpotUrl(
     return `https://app.hubspot.com/contacts/${cfg.hubspotPortalId}/deal/${id}`;
   }
   return undefined;
+}
+
+function integrationConfigFromEnv(
+  mode: "dry-run" | "live",
+  env: NodeJS.ProcessEnv,
+  fetchImpl: FetchLike,
+): IntegrationSinkConfig {
+  return {
+    mode,
+    hubspotAccessToken: env.HUBSPOT_ACCESS_TOKEN,
+    hubspotExternalIdProperty:
+      env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY ?? "gtm_router_deal_id",
+    hubspotApiBase: env.HUBSPOT_API_BASE ?? "https://api.hubapi.com",
+    hubspotApiVersion: env.HUBSPOT_API_VERSION ?? "2026-03",
+    hubspotPipeline: env.HUBSPOT_PIPELINE ?? "default",
+    hubspotDealstage: env.HUBSPOT_DEALSTAGE ?? "appointmentscheduled",
+    hubspotPortalId: env.HUBSPOT_PORTAL_ID,
+    slackBotToken: env.SLACK_BOT_TOKEN,
+    slackChannelId: env.SLACK_CHANNEL_ID ?? "#gtm-ops-router-demo",
+    slackApiBase: env.SLACK_API_BASE ?? "https://slack.com",
+    fetchImpl,
+  };
+}
+
+function missingLiveEnv(
+  cfg: IntegrationSinkConfig,
+  env: NodeJS.ProcessEnv,
+): string[] {
+  return [
+    cfg.hubspotAccessToken ? "" : "HUBSPOT_ACCESS_TOKEN",
+    env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY
+      ? ""
+      : "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
+    cfg.slackBotToken ? "" : "SLACK_BOT_TOKEN",
+    env.SLACK_CHANNEL_ID ? "" : "SLACK_CHANNEL_ID",
+  ].filter(Boolean);
+}
+
+function authHeaders(token: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+  };
+}
+
+function slackApiErrorHint(code: string): string | undefined {
+  if (code === "not_in_channel" || code === "no_permission") {
+    return "Invite the Slack app/bot to the target channel, then rerun with --send-test.";
+  }
+  if (code === "channel_not_found") {
+    return "Use the channel ID (starts C/G/D), not the workspace URL or channel name.";
+  }
+  if (code === "missing_scope") {
+    return "Add the bot token scope chat:write, reinstall the app, then update SLACK_BOT_TOKEN if Slack rotated it.";
+  }
+  if (code === "invalid_auth" || code === "not_authed") {
+    return "Use the bot token that starts xoxb- from the installed Slack app.";
+  }
+  return undefined;
+}
+
+function checkLine(
+  system: IntegrationCheck["system"],
+  name: string,
+  status: IntegrationCheckStatus,
+  detail: string,
+  hint?: string,
+): IntegrationCheck {
+  return { system, name, status, detail, ...(hint ? { hint } : {}) };
+}
+
+async function checkHubSpotProperty(
+  cfg: IntegrationSinkConfig,
+): Promise<IntegrationCheck> {
+  const token = cfg.hubspotAccessToken;
+  if (!token) {
+    return checkLine(
+      "hubspot",
+      "unique deal property",
+      "fail",
+      "HUBSPOT_ACCESS_TOKEN is missing",
+    );
+  }
+  const property = encodeURIComponent(cfg.hubspotExternalIdProperty);
+  const url =
+    `${cfg.hubspotApiBase}/crm/properties/${cfg.hubspotApiVersion}` +
+    `/deals/${property}`;
+  let res: Response;
+  try {
+    res = await cfg.fetchImpl(url, {
+      method: "GET",
+      headers: authHeaders(token),
+    });
+  } catch (err) {
+    return checkLine(
+      "hubspot",
+      "unique deal property",
+      "fail",
+      `network error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const body = await parseBody(res);
+  if (!res.ok) {
+    const hint =
+      res.status === 404
+        ? "Create a custom deal property with hasUniqueValue=true, then set HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY to its internal name."
+        : undefined;
+    return checkLine(
+      "hubspot",
+      "unique deal property",
+      "fail",
+      `HTTP ${res.status}: ${bodyMessage(body)}`,
+      hint,
+    );
+  }
+  if (!isRecord(body)) {
+    return checkLine(
+      "hubspot",
+      "unique deal property",
+      "fail",
+      "property response was not an object",
+    );
+  }
+  const parsed = body as HubSpotPropertyResponse;
+  if (parsed.hasUniqueValue === true) {
+    const label = resultText(parsed.label) ?? cfg.hubspotExternalIdProperty;
+    return checkLine(
+      "hubspot",
+      "unique deal property",
+      "pass",
+      `${label} (${cfg.hubspotExternalIdProperty}) is unique`,
+    );
+  }
+  return checkLine(
+    "hubspot",
+    "unique deal property",
+    "fail",
+    `${cfg.hubspotExternalIdProperty} exists but is not unique`,
+    "HubSpot cannot batch upsert by a non-unique property. Create a new unique text property and set HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY to that internal name.",
+  );
+}
+
+async function checkSlackAuth(
+  cfg: IntegrationSinkConfig,
+): Promise<IntegrationCheck> {
+  const token = cfg.slackBotToken;
+  if (!token) {
+    return checkLine("slack", "bot auth", "fail", "SLACK_BOT_TOKEN is missing");
+  }
+  let res: Response;
+  try {
+    res = await cfg.fetchImpl(`${cfg.slackApiBase}/api/auth.test`, {
+      method: "POST",
+      headers: authHeaders(token),
+    });
+  } catch (err) {
+    return checkLine(
+      "slack",
+      "bot auth",
+      "fail",
+      `network error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const body = await parseBody(res);
+  if (!res.ok) {
+    return checkLine(
+      "slack",
+      "bot auth",
+      "fail",
+      `HTTP ${res.status}: ${bodyMessage(body)}`,
+    );
+  }
+  if (!isRecord(body)) {
+    return checkLine(
+      "slack",
+      "bot auth",
+      "fail",
+      "auth response was not an object",
+    );
+  }
+  const parsed = body as SlackAuthResponse;
+  if (parsed.ok !== true) {
+    const code = resultId(parsed.error, "unknown_error");
+    return checkLine(
+      "slack",
+      "bot auth",
+      "fail",
+      `Slack rejected auth: ${code}`,
+      slackApiErrorHint(code),
+    );
+  }
+  const team =
+    resultText(parsed.team) ?? resultText(parsed.team_id) ?? "workspace";
+  const user = resultText(parsed.user) ?? resultText(parsed.bot_id) ?? "bot";
+  return checkLine("slack", "bot auth", "pass", `${user} on ${team}`);
+}
+
+function checkSlackChannelId(channel: string): IntegrationCheck {
+  if (/^[CGD][A-Z0-9]{8,}$/.test(channel)) {
+    return checkLine("slack", "channel id", "pass", channel);
+  }
+  return checkLine(
+    "slack",
+    "channel id",
+    "warn",
+    `${channel} does not look like a Slack channel ID`,
+    "Use the channel ID from Slack's channel details panel. Public channels start with C.",
+  );
+}
+
+async function checkSlackPost(
+  cfg: IntegrationSinkConfig,
+  now: () => Date,
+): Promise<IntegrationCheck> {
+  const token = cfg.slackBotToken;
+  if (!token) {
+    return checkLine("slack", "test post", "fail", "SLACK_BOT_TOKEN is missing");
+  }
+  let res: Response;
+  try {
+    res = await cfg.fetchImpl(`${cfg.slackApiBase}/api/chat.postMessage`, {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify({
+        channel: cfg.slackChannelId,
+        text:
+          "gtm-ops-router integration check " +
+          now().toISOString().replace(/\.\d{3}Z$/, "Z"),
+      }),
+    });
+  } catch (err) {
+    return checkLine(
+      "slack",
+      "test post",
+      "fail",
+      `network error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const body = await parseBody(res);
+  if (!res.ok) {
+    return checkLine(
+      "slack",
+      "test post",
+      "fail",
+      `HTTP ${res.status}: ${bodyMessage(body)}`,
+    );
+  }
+  if (!isRecord(body)) {
+    return checkLine(
+      "slack",
+      "test post",
+      "fail",
+      "post response was not an object",
+    );
+  }
+  const parsed = body as SlackPostResponse;
+  if (parsed.ok !== true) {
+    const code = resultId(parsed.error, "unknown_error");
+    return checkLine(
+      "slack",
+      "test post",
+      "fail",
+      `Slack rejected post: ${code}`,
+      slackApiErrorHint(code),
+    );
+  }
+  return checkLine(
+    "slack",
+    "test post",
+    "pass",
+    `posted to ${resultId(parsed.channel, cfg.slackChannelId)}`,
+  );
+}
+
+export async function runIntegrationDoctor(
+  opts: IntegrationDoctorOptions = {},
+): Promise<IntegrationCheck[]> {
+  const env = opts.env ?? process.env;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const cfg = integrationConfigFromEnv("live", env, fetchImpl);
+  const checks: IntegrationCheck[] = [];
+
+  const missing = missingLiveEnv(cfg, env);
+  if (missing.length > 0) {
+    for (const name of missing) {
+      checks.push(
+        checkLine(
+          "env",
+          name,
+          "fail",
+          "missing",
+          "Set it in .env or export it before running live integrations.",
+        ),
+      );
+    }
+    return checks;
+  }
+  checks.push(checkLine("env", "required variables", "pass", "all present"));
+
+  checks.push(await checkHubSpotProperty(cfg));
+  checks.push(await checkSlackAuth(cfg));
+  checks.push(checkSlackChannelId(cfg.slackChannelId));
+  if (opts.sendSlackTest === true) {
+    checks.push(await checkSlackPost(cfg, opts.now ?? (() => new Date())));
+  } else {
+    checks.push(
+      checkLine(
+        "slack",
+        "test post",
+        "warn",
+        "skipped",
+        "Run npm run doctor -- --send-test to prove channel membership before a live demo.",
+      ),
+    );
+  }
+  return checks;
+}
+
+export function renderIntegrationChecks(checks: IntegrationCheck[]): string {
+  return checks
+    .map((check) => {
+      const line =
+        `[${check.status.toUpperCase()}] ${check.system} / ${check.name}: ` +
+        check.detail;
+      return check.hint ? `${line}\n        hint: ${check.hint}` : line;
+    })
+    .join("\n");
 }
 
 export class HubSpotSlackSink implements OpportunitySink {
@@ -305,31 +674,10 @@ export function integrationOptionsFromEnv(
   if (mode === "off") {
     throw new Error("integrationOptionsFromEnv cannot build mode=off");
   }
-  const cfg: IntegrationSinkConfig = {
-    mode,
-    hubspotAccessToken: env.HUBSPOT_ACCESS_TOKEN,
-    hubspotExternalIdProperty:
-      env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY ?? "gtm_router_deal_id",
-    hubspotApiBase: env.HUBSPOT_API_BASE ?? "https://api.hubapi.com",
-    hubspotApiVersion: env.HUBSPOT_API_VERSION ?? "2026-03",
-    hubspotPipeline: env.HUBSPOT_PIPELINE ?? "default",
-    hubspotDealstage: env.HUBSPOT_DEALSTAGE ?? "appointmentscheduled",
-    hubspotPortalId: env.HUBSPOT_PORTAL_ID,
-    slackBotToken: env.SLACK_BOT_TOKEN,
-    slackChannelId: env.SLACK_CHANNEL_ID ?? "#gtm-ops-router-demo",
-    slackApiBase: env.SLACK_API_BASE ?? "https://slack.com",
-    fetchImpl,
-  };
+  const cfg = integrationConfigFromEnv(mode, env, fetchImpl);
 
   if (mode === "live") {
-    const missing = [
-      cfg.hubspotAccessToken ? "" : "HUBSPOT_ACCESS_TOKEN",
-      env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY
-        ? ""
-        : "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
-      cfg.slackBotToken ? "" : "SLACK_BOT_TOKEN",
-      env.SLACK_CHANNEL_ID ? "" : "SLACK_CHANNEL_ID",
-    ].filter(Boolean);
+    const missing = missingLiveEnv(cfg, env);
     if (missing.length > 0) {
       throw new Error(`missing live integration env: ${missing.join(", ")}`);
     }

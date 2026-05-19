@@ -3,6 +3,7 @@ import {
   HubSpotSlackSink,
   hubSpotDealPayload,
   integrationOptionsFromEnv,
+  runIntegrationDoctor,
   slackHandoffPayload,
 } from "../src/integrations.js";
 import { RetryableSinkError } from "../src/sink.js";
@@ -166,6 +167,115 @@ describe("HubSpot + Slack integration sink", () => {
 
     await expect(sink.upsert(routed())).rejects.toBeInstanceOf(
       RetryableSinkError,
+    );
+  });
+
+  it("doctor reports missing live env without network", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+
+    const checks = await runIntegrationDoctor({ env: {}, fetchImpl });
+
+    expect(checks.map((check) => check.name)).toEqual([
+      "HUBSPOT_ACCESS_TOKEN",
+      "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
+      "SLACK_BOT_TOKEN",
+      "SLACK_CHANNEL_ID",
+    ]);
+    expect(checks.every((check) => check.status === "fail")).toBe(true);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("doctor catches non-unique HubSpot upsert properties", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes("/crm/properties/2026-03/deals/")) {
+        return new Response(
+          JSON.stringify({
+            name: "gtm_router_deal_id",
+            label: "GTM router deal id",
+            type: "string",
+            fieldType: "text",
+            hasUniqueValue: false,
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true, team: "Memric", user: "bot" }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+
+    const checks = await runIntegrationDoctor({
+      env: {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      },
+      fetchImpl,
+    });
+
+    expect(checks).toContainEqual(
+      expect.objectContaining({
+        system: "hubspot",
+        name: "unique deal property",
+        status: "fail",
+      }),
+    );
+    expect(checks).toContainEqual(
+      expect.objectContaining({
+        system: "slack",
+        name: "test post",
+        status: "warn",
+      }),
+    );
+  });
+
+  it("doctor can prove Slack channel membership with one test post", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      calls.push(String(url));
+      if (String(url).includes("/crm/properties/2026-03/deals/")) {
+        return new Response(
+          JSON.stringify({
+            name: "gtm_router_deal_id",
+            label: "GTM router deal id",
+            type: "string",
+            fieldType: "text",
+            hasUniqueValue: true,
+          }),
+          { status: 200 },
+        );
+      }
+      if (String(url).endsWith("/api/auth.test")) {
+        return new Response(JSON.stringify({ ok: true, team: "Memric", user: "bot" }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({ ok: false, error: "not_in_channel" }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+
+    const checks = await runIntegrationDoctor({
+      env: {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      },
+      fetchImpl,
+      sendSlackTest: true,
+      now: () => new Date("2026-05-19T12:00:00Z"),
+    });
+
+    expect(calls.some((url) => url.endsWith("/api/chat.postMessage"))).toBe(true);
+    expect(checks).toContainEqual(
+      expect.objectContaining({
+        system: "slack",
+        name: "test post",
+        status: "fail",
+        detail: "Slack rejected post: not_in_channel",
+      }),
     );
   });
 });

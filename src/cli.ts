@@ -8,11 +8,14 @@
  * `demo` binds no port and needs no API keys — clone, install, run, done.
  */
 
-import "./preflight.js"; // must run before any module that touches node:sqlite
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
-import { integrationOptionsFromEnv } from "./integrations.js";
+import {
+  integrationOptionsFromEnv,
+  renderIntegrationChecks,
+  runIntegrationDoctor,
+} from "./integrations.js";
 import { processBatch } from "./pipeline.js";
 import type { PipelineOptions } from "./pipeline.js";
 import {
@@ -22,7 +25,6 @@ import {
 } from "./observe.js";
 import { startServer } from "./server.js";
 import { FlakySink } from "./sink.js";
-import { Store } from "./store.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -62,6 +64,11 @@ function loadJsonl(path: string): unknown[] {
     });
 }
 
+async function loadStore(): Promise<typeof import("./store.js").Store> {
+  await import("./preflight.js"); // must run before store touches node:sqlite
+  return (await import("./store.js")).Store;
+}
+
 function integrationMode(args: string[]): "off" | "dry-run" | "live" {
   if (args.includes("--live-integrations")) return "live";
   if (args.includes("--integrations")) return "dry-run";
@@ -93,6 +100,7 @@ function pipelineOptions(
 }
 
 async function cmdDemo(args: string[]): Promise<void> {
+  const Store = await loadStore();
   const store = new Store(":memory:");
   const enricher = new FixtureEnricher(loadFixture());
   const seed = loadJsonl(`${ROOT}data/inbound.seed.jsonl`);
@@ -137,6 +145,7 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  const Store = await loadStore();
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
   await processBatch(
@@ -149,13 +158,14 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
   store.close();
 }
 
-function cmdServe(portArg: string | undefined, args: string[]): void {
+async function cmdServe(portArg: string | undefined, args: string[]): Promise<void> {
   const port = Number(portArg ?? 8787);
   if (!Number.isInteger(port) || port <= 0) {
     console.error(`invalid port: ${portArg}`);
     process.exitCode = 2;
     return;
   }
+  const Store = await loadStore();
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
   const { label, opts } = pipelineOptions(args);
@@ -168,6 +178,16 @@ function cmdServe(portArg: string | undefined, args: string[]): void {
   console.log(`  GET  /metrics     JSON metrics`);
   console.log(`  POST /deals       ingest (single object or array)`);
   console.log(`  sink              ${label}`);
+}
+
+async function cmdDoctor(args: string[]): Promise<void> {
+  const checks = await runIntegrationDoctor({
+    sendSlackTest: args.includes("--send-test"),
+  });
+  console.log(renderIntegrationChecks(checks));
+  if (checks.some((check) => check.status === "fail")) {
+    process.exitCode = 1;
+  }
 }
 
 async function main(): Promise<void> {
@@ -183,12 +203,15 @@ async function main(): Promise<void> {
       await cmdRun(positionals[1], args);
       return;
     case "serve":
-      cmdServe(positionals[1], args);
+      await cmdServe(positionals[1], args);
+      return;
+    case "doctor":
+      await cmdDoctor(args);
       return;
     default:
       console.error(
-        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve` +
-          ` (flags: --flaky | --integrations | --live-integrations)`,
+        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve | doctor` +
+          ` (flags: --flaky | --integrations | --live-integrations | --send-test)`,
       );
       process.exitCode = 2;
   }
