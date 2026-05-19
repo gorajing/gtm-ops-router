@@ -55,8 +55,9 @@ describe("withRetry — retryable vs terminal is the whole point", () => {
     const fn = vi.fn(async () => {
       n += 1;
       if (n < 3) throw new RetryableSinkError(`429 #${n}`);
+      return "ok";
     });
-    await expect(withRetry(fn, noSleep)).resolves.toBeUndefined();
+    await expect(withRetry(fn, noSleep)).resolves.toBe("ok");
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
@@ -74,14 +75,22 @@ describe("withRetry — retryable vs terminal is the whole point", () => {
 describe("sinks", () => {
   it("LoggingSink resolves and logs intent (dry-run default)", async () => {
     const lines: string[] = [];
-    await new LoggingSink((l) => lines.push(l)).upsert(routed());
+    const receipts = await new LoggingSink((l) => lines.push(l)).upsert(routed());
     expect(lines[0]).toContain("would upsert CRM opportunity D-1");
+    expect(receipts[0]?.system).toBe("dry_run");
   });
 
   it("FlakySink: retryableTimes then success", async () => {
     const s = new FlakySink({ retryableTimes: 2 });
-    await expect(withRetry(() => s.upsert(routed("D-2")), noSleep)).resolves
-      .toBeUndefined();
+    await expect(
+      withRetry(() => s.upsert(routed("D-2")), noSleep),
+    ).resolves.toEqual([
+      {
+        system: "flaky",
+        externalId: "D-2",
+        detail: "accepted Test Co after 3 attempt(s)",
+      },
+    ]);
   });
 
   it("FlakySink: terminalCompanies throws terminal (no retry)", async () => {

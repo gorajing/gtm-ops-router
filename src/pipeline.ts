@@ -21,6 +21,7 @@ import {
   withRetry,
   type OpportunitySink,
   type RetryOptions,
+  type SinkReceipt,
 } from "./sink.js";
 import type { Enricher } from "./enrich.js";
 import type { Store } from "./store.js";
@@ -44,6 +45,13 @@ export interface PipelineOptions {
 
 function defaults(): PipelineOptions {
   return { dryRun: true, sink: new LoggingSink(), retry: DEFAULT_RETRY };
+}
+
+function renderReceipts(receipts: SinkReceipt[]): string {
+  if (receipts.length === 0) return "sink: no downstream receipt";
+  return receipts
+    .map((r) => `${r.system}:${r.externalId} ${r.detail}`)
+    .join(" | ");
 }
 
 function syntheticId(raw: unknown): string {
@@ -162,16 +170,24 @@ export async function processOne(
 
   // ── Stage 5: downstream write (before persisting routed state) ───────────
   if (opts.dryRun) {
-    await opts.sink.upsert(routed); // LoggingSink: records intent only
-    store.appendEvent(deal.id, "scored", "scored", "sink: dry-run (skipped)");
+    const receipts = await opts.sink.upsert(routed); // LoggingSink records intent.
+    store.appendEvent(
+      deal.id,
+      "scored",
+      "scored",
+      `sink: dry-run ${renderReceipts(receipts)}`,
+    );
   } else {
     try {
-      await withRetry(() => opts.sink.upsert(routed), opts.retry);
+      const receipts = await withRetry(
+        () => opts.sink.upsert(routed),
+        opts.retry,
+      );
       store.appendEvent(
         deal.id,
         "scored",
         "scored",
-        `sink: upserted via ${opts.sink.name}`,
+        `sink: upserted via ${opts.sink.name} ${renderReceipts(receipts)}`,
       );
     } catch (err) {
       if (err instanceof TerminalSinkError) {

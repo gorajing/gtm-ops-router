@@ -20,11 +20,12 @@ reverse-engineer the boundary.
   warehouse adapter drops in without touching the pipeline. Unknown company →
   quarantined, never guessed — that behavior is real, the data source is not.
 - **The downstream write (sink)** defaults to `LoggingSink` and dry-run: it
-  logs the intended CRM upsert and writes nothing external. `FlakySink`
+  logs the intended CRM upsert and writes nothing external. `--integrations`
+  swaps in the HubSpot + Slack sink in dry-run mode, so the cross-system
+  handoff is visible without secrets. `--live-integrations` makes real HTTP
+  calls when the env vars in `.env.example` are present. `FlakySink`
   (`--flaky`) injects deterministic retryable/terminal faults so the failure
-  handling is demonstrable without a real CRM. A real `SalesforceSink` would
-  implement the same interface; the retry/terminal/idempotency contract is
-  already defined and tested.
+  handling is demonstrable without a real CRM.
 - **Seed corpus** is 14 hand-built records chosen to exercise every route and
   every quarantine code. It is illustrative, not sampled from real traffic.
 - **Scoring weights and the $10K / $50K gates** are reasoned policy defaults,
@@ -33,10 +34,10 @@ reverse-engineer the boundary.
 
 ## Not built (out of scope on purpose)
 
-No auth, no real HTTP integrations, no second workflow, no notifier, no
-multi-store. These are deliberately excluded to keep the prototype sharp; the
-extension points exist (interfaces) but unbuilt surface is not pretended to
-work.
+No auth, no second workflow, no multi-store. HubSpot and Slack adapters exist,
+but a production deployment would still add secret management, structured log
+shipping, alerting, and a dead-letter replay queue around them. That surface is
+not pretended to be complete.
 
 ## Runtime floor
 

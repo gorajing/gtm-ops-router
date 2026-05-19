@@ -1,5 +1,7 @@
 node_modules/
 *.log
+.env
+.env.local
 __pycache__/
 *.pyc
 data/*.db

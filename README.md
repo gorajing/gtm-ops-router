@@ -35,12 +35,13 @@ universal; claiming honest about its floor.
 ```bash
 npm install
 npm run demo            # deterministic batch — no API keys, no ports (dry-run)
+npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm test                # TypeScript suite, incl. every failure mode
 
 # Dashboard proof surface:
-npm run run -- data/inbound.seed.jsonl  # process seed data -> data/router.db
-npm run serve                           # open http://localhost:8787
+npm run run -- data/inbound.seed.jsonl --integrations  # seed SQLite with HubSpot + Slack receipts
+npm run serve -- --integrations                       # open http://localhost:8787
 
 # Python side (stdlib only — the JD names Python explicitly):
 python3 ops_audit.py --db data/router.db  # data-integrity + SLO gate; exit 1 on breach
@@ -52,6 +53,26 @@ as an operator view: KPIs, route mix, routed deals, quarantine ledger, and an
 event trail, all backed by the same SQLite store. Node prints one
 `ExperimentalWarning: SQLite ...` line — expected, the disclosed cost of zero
 native deps, not a defect.
+
+### Live HubSpot + Slack
+
+Dry-run integrations are the default proof path: they show the exact HubSpot
+upsert and Slack handoff in the event trail without needing secrets. To point
+the same flow at real systems:
+
+```bash
+cp .env.example .env
+# fill HUBSPOT_ACCESS_TOKEN, HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY,
+# SLACK_BOT_TOKEN, and SLACK_CHANNEL_ID
+
+npm run run -- data/inbound.seed.jsonl --live-integrations
+npm run serve -- --live-integrations
+```
+
+`HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY` must be a **unique deal property** in your
+HubSpot portal. That is not ceremony: it keeps retries and re-runs idempotent
+instead of creating duplicate deals. Slack messages include the router deal id
+and HubSpot receipt so a human can trace the handoff.
 
 ---
 
@@ -76,7 +97,9 @@ business       routed ARR $508,000 · auto-handled 3 (routed, no rep touch)
 double-counts. 9, not 10, is the point. The default run is dry-run (no
 external writes, zero `sink_*` quarantines); `--flaky` injects deterministic
 retryable and terminal sink faults so the retry/terminal taxonomy is visible
-in the quarantine table, not just asserted in tests.
+in the quarantine table, not just asserted in tests. `--integrations` swaps the
+sink to HubSpot + Slack dry-run mode, so the event trail shows the cross-system
+handoff without credentials.
 
 ---
 
@@ -97,7 +120,9 @@ Built to a production bar.
   ever dropped — `quarantined + routed == intake`, always.
 - **Observability is first-class.** Every stage transition is an event row;
   metrics (conversion, quarantine rate by code, route mix, p50/p95 latency)
-  are queryable and rendered on a live dashboard and a JSON endpoint.
+  are queryable and rendered on a live dashboard and a JSON endpoint. External
+  writes return receipts, so HubSpot and Slack outcomes appear in the same
+  audit trail as scoring and routing.
 - **Idempotency by construction.** Deterministic deal IDs → re-ingest is a
   safe no-op. Data accuracy is a property of the design, not a cron that
   cleans up later.
@@ -128,7 +153,7 @@ That boundary is a deliberate design output, not a missing feature.
 | Their "Must Have" | In this repo |
 |---|---|
 | Ship real systems, strong SWE fundamentals | runs end-to-end; `tsc` strict + `noUncheckedIndexedAccess`; TS + Python suites |
-| Automations/tools w/ **Python**, SQL, APIs, scripting | Python `ops_audit.py` (SLO gate, stdlib, tested); `node:sqlite` store; `node:http` API; cron-shaped `run` |
+| Automations/tools w/ **Python**, SQL, APIs, scripting | Python `ops_audit.py` (SLO gate, stdlib, tested); `node:sqlite` store; `node:http` API; HubSpot + Slack REST adapters; cron-shaped `run` |
 | Reason about edge cases, failure modes, maintainability | 6 typed quarantine codes incl. injected `store_error`; retryable-vs-terminal sink taxonomy w/ bounded backoff; dry-run |
 | Business intuition (cost, speed, scale) | routed/human ARR + auto-handled metrics; `$10K`/`$50K` gates are named policy |
 | Extreme ownership, ambiguity | scoped from a one-line JD bullet to a running system; `ASSUMPTIONS.md` + `RUNBOOK.md` |
@@ -136,10 +161,10 @@ That boundary is a deliberate design output, not a missing feature.
 
 ## What I'd build next (ownership beyond the demo)
 
-- Live `Enricher` / `OpportunitySink` adapters (Apollo, Salesforce) behind
-  the existing seams + a circuit breaker; dead-letter requeue after upstream
+- Live `Enricher` adapter (Apollo/Clearbit/internal warehouse) behind the
+  existing seam + a circuit breaker; dead-letter requeue after upstream
   recovery. (Retry/backoff, terminal-vs-retryable, dry-run, and the SLO gate
-  are already built — see `sink.ts` and `ops_audit.py`.)
+  are already built — see `sink.ts`, `integrations.ts`, and `ops_audit.py`.)
 - Auth on `POST /deals`; structured log shipping; alerting wired to the
   existing audit gate.
 - **The self-improving loop:** score routing decisions against closed-won
@@ -149,10 +174,10 @@ That boundary is a deliberate design output, not a missing feature.
 ## Architecture
 
 ```
-inbound ─► intake ─► enrich ─► score ─► route ─► sink ──► store ─► dashboard
-            (zod)    (seam,   (determ., (sales/  (retry/  (sqlite, /metrics
-                      no guess) audit)   fin/     terminal idempot. (http)
-              │          │        │       legal)   dry-run)  events)
+inbound ─► intake ─► enrich ─► score ─► route ─► sink ───► store ─► dashboard
+            (zod)    (seam,   (determ., (sales/  (HubSpot  (sqlite, /metrics
+                      no guess) audit)   fin/     upsert +  idempot. (http)
+              │          │        │       legal)   Slack)    events)
               └──────────┴────────┴───────┴── any failure ─► typed Quarantine (loud)
 
 data/router.db ─► ops_audit.py   (Python: invariant + SLO gate, exit 1 on breach)
@@ -166,9 +191,10 @@ an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
 
 1. (0:00) "HappyRobot sells autonomous ops. This is a working slice of the
    sales/finance/legal tooling bullet from the JD — built, not mocked."
-2. (0:10) `npm run run -- data/inbound.seed.jsonl && npm run serve`, then open
-   `http://localhost:8787` — point at the dashboard metrics: "13 in, 9 routed,
-   4 quarantined. Conversion and quarantine-by-code are asserted in tests."
+2. (0:10) `npm run run -- data/inbound.seed.jsonl --integrations && npm run serve -- --integrations`,
+   then open `http://localhost:8787` — point at the dashboard metrics: "13 in,
+   9 routed, 4 quarantined. Conversion and quarantine-by-code are asserted in
+   tests."
 3. (0:30) Routed deals: "Ryder, $120K, regulated → human + finance + legal,
    pre-flagged. Off-ICP → nurture, zero rep time. $8K → self-serve."
 4. (0:45) Quarantine ledger: "Unknown company is *not guessed* — quarantined
@@ -176,8 +202,9 @@ an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
    typed, none dropped."
 5. (1:05) `src/types.ts` + `pipeline.ts`: "Invalid states are
    unrepresentable; every failure path is typed and tested."
-6. (1:20) "What I didn't automate: the close, and finance/legal judgment.
-   That boundary is deliberate. Repo's yours to clone."
+6. (1:20) Recent event trail: "The same routed deal produces a HubSpot upsert
+   receipt and a Slack handoff receipt. In live mode those are real API calls;
+   in public demo mode they're deterministic dry-run receipts."
 
 ---
 

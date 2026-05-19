@@ -9,10 +9,12 @@
  */
 
 import "./preflight.js"; // must run before any module that touches node:sqlite
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
+import { integrationOptionsFromEnv } from "./integrations.js";
 import { processBatch } from "./pipeline.js";
+import type { PipelineOptions } from "./pipeline.js";
 import {
   renderMetricsTable,
   renderQuarantineTable,
@@ -23,6 +25,20 @@ import { FlakySink } from "./sink.js";
 import { Store } from "./store.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+function loadDotEnv(): void {
+  const path = `${ROOT}.env`;
+  if (!existsSync(path)) return;
+  for (const raw of readFileSync(path, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, "");
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
 
 function loadFixture(): Record<string, FixtureEntry> {
   return JSON.parse(
@@ -46,26 +62,55 @@ function loadJsonl(path: string): unknown[] {
     });
 }
 
-async function cmdDemo(flaky: boolean): Promise<void> {
-  const store = new Store(":memory:");
-  const enricher = new FixtureEnricher(loadFixture());
-  const seed = loadJsonl(`${ROOT}data/inbound.seed.jsonl`);
+function integrationMode(args: string[]): "off" | "dry-run" | "live" {
+  if (args.includes("--live-integrations")) return "live";
+  if (args.includes("--integrations")) return "dry-run";
+  return "off";
+}
 
-  const opts = flaky
-    ? {
+function pipelineOptions(
+  args: string[],
+): { label: string; opts: Partial<PipelineOptions> } {
+  const mode = integrationMode(args);
+  if (mode !== "off") {
+    const built = integrationOptionsFromEnv(mode);
+    return { label: built.label, opts: built };
+  }
+  if (args.includes("--flaky")) {
+    return {
+      label: "flaky",
+      opts: {
         dryRun: false,
         sink: new FlakySink({
           retryableTimes: 1,
           terminalCompanies: new Set(["EuroDist"]),
         }),
         retry: { maxAttempts: 3, baseDelayMs: 0, sleep: async () => {} },
-      }
-    : {};
-  if (flaky) {
+      },
+    };
+  }
+  return { label: "logging", opts: {} };
+}
+
+async function cmdDemo(args: string[]): Promise<void> {
+  const store = new Store(":memory:");
+  const enricher = new FixtureEnricher(loadFixture());
+  const seed = loadJsonl(`${ROOT}data/inbound.seed.jsonl`);
+  const { label, opts } = pipelineOptions(args);
+  if (label === "flaky") {
     console.log(
       "[--flaky] live sink: 1 retryable failure then success; " +
         "EuroDist → terminal (see QUARANTINED: sink_terminal)\n",
     );
+  }
+  if (label === "hubspot+slack:dry-run") {
+    console.log(
+      "[--integrations] dry-run HubSpot + Slack sink: no secrets, no network; " +
+        "event trail shows the cross-system handoff\n",
+    );
+  }
+  if (label === "hubspot+slack") {
+    console.log("[--live-integrations] writing to HubSpot and Slack\n");
   }
 
   const outcomes = await processBatch(seed, store, enricher, opts);
@@ -86,7 +131,7 @@ async function cmdDemo(flaky: boolean): Promise<void> {
   store.close();
 }
 
-async function cmdRun(file: string | undefined): Promise<void> {
+async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
   if (!file) {
     console.error("usage: npm run run -- <path-to.jsonl>");
     process.exitCode = 2;
@@ -94,12 +139,17 @@ async function cmdRun(file: string | undefined): Promise<void> {
   }
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
-  await processBatch(loadJsonl(file), store, enricher);
+  await processBatch(
+    loadJsonl(file),
+    store,
+    enricher,
+    pipelineOptions(args).opts,
+  );
   console.log(renderMetricsTable(store.metrics()));
   store.close();
 }
 
-function cmdServe(portArg: string | undefined): void {
+function cmdServe(portArg: string | undefined, args: string[]): void {
   const port = Number(portArg ?? 8787);
   if (!Number.isInteger(port) || port <= 0) {
     console.error(`invalid port: ${portArg}`);
@@ -108,35 +158,43 @@ function cmdServe(portArg: string | undefined): void {
   }
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
-  startServer(store, enricher, port);
+  const { label, opts } = pipelineOptions(args);
+  startServer(store, enricher, port, {
+    pipelineOptions: opts,
+    sinkLabel: label,
+  });
   console.log(`gtm-ops-router listening on http://localhost:${port}`);
   console.log(`  GET  /            dashboard`);
   console.log(`  GET  /metrics     JSON metrics`);
   console.log(`  POST /deals       ingest (single object or array)`);
+  console.log(`  sink              ${label}`);
 }
 
 async function main(): Promise<void> {
+  loadDotEnv();
   const args = process.argv.slice(2);
   const positionals = args.filter((a) => !a.startsWith("-"));
   const cmd = positionals[0];
-  const flaky = args.includes("--flaky");
   switch (cmd) {
     case "demo":
-      await cmdDemo(flaky);
+      await cmdDemo(args);
       return;
     case "run":
-      await cmdRun(positionals[1]);
+      await cmdRun(positionals[1], args);
       return;
     case "serve":
-      cmdServe(positionals[1]);
+      cmdServe(positionals[1], args);
       return;
     default:
       console.error(
         `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve` +
-          ` (flags: --flaky)`,
+          ` (flags: --flaky | --integrations | --live-integrations)`,
       );
       process.exitCode = 2;
   }
 }
 
-void main();
+void main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exitCode = 1;
+});

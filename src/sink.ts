@@ -39,7 +39,14 @@ export class SinkExhaustedError extends Error {
 export interface OpportunitySink {
   readonly name: string;
   /** Idempotent on deal.id. Throws Retryable/Terminal on failure. */
-  upsert(deal: RoutedDeal): Promise<void>;
+  upsert(deal: RoutedDeal): Promise<SinkReceipt[]>;
+}
+
+export interface SinkReceipt {
+  system: string;
+  externalId: string;
+  detail: string;
+  url?: string;
 }
 
 export interface RetryOptions {
@@ -62,15 +69,14 @@ export const DEFAULT_RETRY: RetryOptions = {
  *  - TerminalSinkError  -> rethrown immediately (no retry).
  *  - RetryableSinkError -> retried up to maxAttempts, then SinkExhaustedError.
  */
-export async function withRetry(
-  fn: () => Promise<void>,
+export async function withRetry<T>(
+  fn: () => Promise<T>,
   opts: RetryOptions = DEFAULT_RETRY,
-): Promise<void> {
+): Promise<T> {
   let lastReason = "";
   for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
     try {
-      await fn();
-      return;
+      return await fn();
     } catch (err) {
       if (err instanceof TerminalSinkError) throw err;
       if (err instanceof RetryableSinkError) {
@@ -84,6 +90,7 @@ export async function withRetry(
       throw err; // unknown error type — do not silently absorb
     }
   }
+  throw new SinkExhaustedError(opts.maxAttempts, lastReason);
 }
 
 /**
@@ -93,11 +100,12 @@ export async function withRetry(
 export class LoggingSink implements OpportunitySink {
   readonly name = "logging";
   constructor(private readonly log: (line: string) => void = () => {}) {}
-  async upsert(deal: RoutedDeal): Promise<void> {
-    this.log(
-      `[dry-run] would upsert CRM opportunity ${deal.id} ` +
-        `(${deal.company}, $${deal.dealUSD}, route=${deal.route.kind})`,
-    );
+  async upsert(deal: RoutedDeal): Promise<SinkReceipt[]> {
+    const detail =
+      `would upsert CRM opportunity ${deal.id} ` +
+      `(${deal.company}, $${deal.dealUSD}, route=${deal.route.kind})`;
+    this.log(`[dry-run] ${detail}`);
+    return [{ system: "dry_run", externalId: deal.id, detail }];
   }
 }
 
@@ -116,7 +124,7 @@ export class FlakySink implements OpportunitySink {
       terminalCompanies?: ReadonlySet<string>;
     },
   ) {}
-  async upsert(deal: RoutedDeal): Promise<void> {
+  async upsert(deal: RoutedDeal): Promise<SinkReceipt[]> {
     if (
       this.opts.terminalIds?.has(deal.id) ||
       this.opts.terminalCompanies?.has(deal.company)
@@ -128,5 +136,12 @@ export class FlakySink implements OpportunitySink {
     if (n <= this.opts.retryableTimes) {
       throw new RetryableSinkError(`429 rate limited (attempt ${n})`);
     }
+    return [
+      {
+        system: "flaky",
+        externalId: deal.id,
+        detail: `accepted ${deal.company} after ${n} attempt(s)`,
+      },
+    ];
   }
 }

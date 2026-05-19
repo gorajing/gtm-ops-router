@@ -10,6 +10,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { processBatch } from "./pipeline.js";
+import type { PipelineOptions } from "./pipeline.js";
 import type { Enricher } from "./enrich.js";
 import type { Store } from "./store.js";
 import type { Metrics, PipelineEvent, Quarantine, RoutedDeal } from "./types.js";
@@ -45,12 +46,13 @@ function dashboard(
   routed: RoutedDeal[],
   quarantined: Quarantine[],
   events: PipelineEvent[],
+  sinkLabel: string,
 ): string {
   const card = (label: string, value: string | number, detail = "") =>
     `<div class="card"><div class="v">${value}</div><div class="l">${label}</div>${detail ? `<div class="d">${detail}</div>` : ""}</div>`;
   const maxRoute = Math.max(...Object.values(m.routeMix), 1);
   const maxQuarantine = Math.max(...Object.values(m.quarantineByCode), 1);
-  const firstEvents = events.slice(0, 8);
+  const recentEvents = events.slice(-8);
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
 <title>GTM Ops Router</title>
@@ -88,7 +90,7 @@ function dashboard(
   <h1>GTM Ops Router</h1>
   <div class="sub">Inbound deals routed across sales, finance, and legal with quarantine instead of silent drops.</div>
  </div>
- <div class="stamp">LIVE SQLITE VIEW<br>auto-refresh 5s</div>
+ <div class="stamp">LIVE SQLITE VIEW<br>SINK ${escapeHtml(sinkLabel)}<br>auto-refresh 5s</div>
 </header>
 <div class="grid">
  ${card("routed ARR", money(m.routedArrUsd), `${money(m.humanRoutedArrUsd)} needs human ownership`)}
@@ -148,11 +150,11 @@ function dashboard(
   }
  </section>
  <section>
-  <h2>Event Trail</h2>
+  <h2>Recent Event Trail</h2>
   ${
-    firstEvents.length === 0
+    recentEvents.length === 0
       ? `<div class="empty">No events recorded.</div>`
-      : `<div class="events">${firstEvents
+      : `<div class="events">${recentEvents
           .map(
             (e) => `<div class="event"><span class="warn">${escapeHtml(e.from)} -> ${escapeHtml(e.to)}</span> ${escapeHtml(e.detail)}<br><span class="muted">${escapeHtml(e.ts)}</span></div>`,
           )
@@ -183,6 +185,10 @@ export function startServer(
   store: Store,
   enricher: Enricher,
   port: number,
+  options: {
+    pipelineOptions?: Partial<PipelineOptions>;
+    sinkLabel?: string;
+  } = {},
 ): ReturnType<typeof createServer> {
   const server = createServer(
     (req: IncomingMessage, res: ServerResponse): void => {
@@ -202,13 +208,13 @@ export function startServer(
       }
       if (req.method === "GET" && url === "/") {
         res.writeHead(200, { "content-type": "text/html" });
-        const firstRouted = store.routed()[0];
         res.end(
           dashboard(
             store.metrics(),
             store.routed(),
             store.quarantined(),
-            firstRouted ? store.events(firstRouted.id) : store.events(),
+            store.events(),
+            options.sinkLabel ?? "logging",
           ),
         );
         return;
@@ -224,7 +230,12 @@ export function startServer(
               return;
             }
             const list = Array.isArray(parsed) ? parsed : [parsed];
-            const outcomes = await processBatch(list, store, enricher);
+            const outcomes = await processBatch(
+              list,
+              store,
+              enricher,
+              options.pipelineOptions ?? {},
+            );
             json(res, 200, {
               processed: outcomes.length,
               routed: outcomes.filter((o) => o.ok).length,

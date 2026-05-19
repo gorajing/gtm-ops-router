@@ -6,6 +6,7 @@ What an owner needs to operate this, not just read it.
 
 ```bash
 npm run run -- data/inbound.seed.jsonl   # process a batch -> data/router.db
+npm run run -- data/inbound.seed.jsonl --integrations # HubSpot+Slack dry-run receipts
 python3 ops_audit.py --db data/router.db # SLO gate; exit 1 if breached
 npm run serve                            # live dashboard :8787
 ```
@@ -13,6 +14,11 @@ npm run serve                            # live dashboard :8787
 Nightly cron / CI: `npm run run -- <today.jsonl> && python3 ops_audit.py`.
 The audit exits non-zero on an SLO breach, so it fails the pipeline loudly
 instead of letting a regression ride along silently.
+
+Live integrations: copy `.env.example` to `.env`, fill HubSpot and Slack
+secrets, then run with `--live-integrations`. HubSpot requires a unique deal
+property named by `HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY`; without that, live mode
+refuses to run because retrying create-only writes would duplicate deals.
 
 ## Read the metrics
 
@@ -42,11 +48,11 @@ always safe.
 
 ## Change it safely
 
-- New enrichment/CRM provider: implement the `Enricher` / `OpportunitySink`
-  interface. The pipeline does not change.
-- Always test a real sink with **dry-run first** (`LoggingSink`) — it logs
-  intended writes and mutates nothing. Promote to live only after the log
-  looks right.
+- New enrichment/CRM/notification provider: implement the `Enricher` /
+  `OpportunitySink` interface. The pipeline does not change.
+- Always test a real sink with **dry-run first** (`--integrations`) — it logs
+  HubSpot and Slack receipts and mutates nothing. Promote to live only after
+  the event trail looks right.
 - Tune thresholds in `src/types.ts` (`HUMAN_GATE_USD`, `ICP_THRESHOLD`) and
   `src/route.ts` (`FINANCE_APPROVAL_USD`). They are named constants on purpose.
 
