@@ -6,7 +6,7 @@ import {
   runIntegrationDoctor,
   slackHandoffPayload,
 } from "../src/integrations.js";
-import { RetryableSinkError } from "../src/sink.js";
+import { RetryableSinkError, TerminalSinkError } from "../src/sink.js";
 import type { RoutedDeal } from "../src/types.js";
 
 function routed(id = "D-1", company = "Ryder Digital"): RoutedDeal {
@@ -170,6 +170,43 @@ describe("HubSpot + Slack integration sink", () => {
     );
   });
 
+  it("HubSpot batch errors stay terminal even when HTTP status is successful", async () => {
+    const fetchImpl = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          status: "COMPLETE",
+          results: [],
+          errors: [
+            {
+              category: "VALIDATION_ERROR",
+              message: "dealstage is not a valid pipeline stage ID",
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const sink = new HubSpotSlackSink({
+      mode: "live",
+      hubspotAccessToken: "hs-token",
+      hubspotExternalIdProperty: "gtm_router_deal_id",
+      hubspotApiBase: "https://api.hubapi.com",
+      hubspotApiVersion: "2026-03",
+      hubspotPipeline: "default",
+      hubspotDealstage: "appointmentscheduled",
+      hubspotPortalId: undefined,
+      slackBotToken: "xoxb-token",
+      slackChannelId: "C123",
+      slackApiBase: "https://slack.com",
+      fetchImpl,
+    });
+
+    await expect(sink.upsert(routed())).rejects.toBeInstanceOf(
+      TerminalSinkError,
+    );
+  });
+
   it("doctor reports missing live env without network", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
 
@@ -199,6 +236,20 @@ describe("HubSpot + Slack integration sink", () => {
           { status: 200 },
         );
       }
+      if (String(url).includes("/crm/v3/pipelines/deals")) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: "default",
+                label: "Sales Pipeline",
+                stages: [{ id: "3695885012", label: "Lead Identified" }],
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
       return new Response(JSON.stringify({ ok: true, team: "Memric", user: "bot" }), {
         status: 200,
       });
@@ -208,6 +259,7 @@ describe("HubSpot + Slack integration sink", () => {
       env: {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       },
@@ -246,6 +298,20 @@ describe("HubSpot + Slack integration sink", () => {
           { status: 200 },
         );
       }
+      if (String(url).includes("/crm/v3/pipelines/deals")) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: "default",
+                label: "Sales Pipeline",
+                stages: [{ id: "3695885012", label: "Lead Identified" }],
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
       if (String(url).endsWith("/api/auth.test")) {
         return new Response(JSON.stringify({ ok: true, team: "Memric", user: "bot" }), {
           status: 200,
@@ -260,6 +326,7 @@ describe("HubSpot + Slack integration sink", () => {
       env: {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       },

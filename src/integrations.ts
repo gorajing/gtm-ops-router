@@ -61,6 +61,7 @@ interface HubSpotUpsertResponse {
     new?: unknown;
     url?: unknown;
   }>;
+  errors?: unknown[];
 }
 
 interface SlackPostResponse {
@@ -76,6 +77,18 @@ interface HubSpotPropertyResponse {
   type?: unknown;
   fieldType?: unknown;
   hasUniqueValue?: unknown;
+}
+
+interface HubSpotPipelineResponse {
+  results?: Array<{
+    id?: unknown;
+    label?: unknown;
+    stages?: Array<{
+      id?: unknown;
+      label?: unknown;
+      archived?: unknown;
+    }>;
+  }>;
 }
 
 interface SlackAuthResponse {
@@ -358,6 +371,87 @@ async function checkHubSpotProperty(
   );
 }
 
+async function checkHubSpotPipelineStage(
+  cfg: IntegrationSinkConfig,
+): Promise<IntegrationCheck> {
+  const token = cfg.hubspotAccessToken;
+  if (!token) {
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      "HUBSPOT_ACCESS_TOKEN is missing",
+    );
+  }
+  const url = `${cfg.hubspotApiBase}/crm/v3/pipelines/deals`;
+  let res: Response;
+  try {
+    res = await cfg.fetchImpl(url, {
+      method: "GET",
+      headers: authHeaders(token),
+    });
+  } catch (err) {
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      `network error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const body = await parseBody(res);
+  if (!res.ok) {
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      `HTTP ${res.status}: ${bodyMessage(body)}`,
+    );
+  }
+  if (!isRecord(body)) {
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      "pipeline response was not an object",
+    );
+  }
+
+  const parsed = body as HubSpotPipelineResponse;
+  const pipeline = parsed.results?.find((p) => p.id === cfg.hubspotPipeline);
+  if (!pipeline) {
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      `pipeline ${cfg.hubspotPipeline} was not found`,
+      "Set HUBSPOT_PIPELINE to one of the pipeline IDs returned by HubSpot.",
+    );
+  }
+  const stage = pipeline.stages?.find(
+    (s) => s.id === cfg.hubspotDealstage && s.archived !== true,
+  );
+  if (!stage) {
+    const valid = (pipeline.stages ?? [])
+      .filter((s) => s.archived !== true)
+      .map((s) => `${resultText(s.label) ?? "stage"}=${resultText(s.id) ?? "?"}`)
+      .join(", ");
+    return checkLine(
+      "hubspot",
+      "pipeline stage",
+      "fail",
+      `${cfg.hubspotDealstage} is not a valid stage in ${cfg.hubspotPipeline}`,
+      valid ? `Valid stages: ${valid}` : "Check the Deals pipeline stage IDs in HubSpot.",
+    );
+  }
+  return checkLine(
+    "hubspot",
+    "pipeline stage",
+    "pass",
+    `${resultText(pipeline.label) ?? cfg.hubspotPipeline} / ${resultText(stage.label) ?? cfg.hubspotDealstage}`,
+  );
+}
+
 async function checkSlackAuth(
   cfg: IntegrationSinkConfig,
 ): Promise<IntegrationCheck> {
@@ -518,6 +612,7 @@ export async function runIntegrationDoctor(
   checks.push(checkLine("env", "required variables", "pass", "all present"));
 
   checks.push(await checkHubSpotProperty(cfg));
+  checks.push(await checkHubSpotPipelineStage(cfg));
   checks.push(await checkSlackAuth(cfg));
   checks.push(checkSlackChannelId(cfg.slackChannelId));
   if (opts.sendSlackTest === true) {
@@ -601,7 +696,15 @@ export class HubSpotSlackSink implements OpportunitySink {
       throw new TerminalSinkError("hubspot response was not an object");
     }
     const parsed = body as HubSpotUpsertResponse;
+    if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+      throw new TerminalSinkError(
+        `hubspot upsert errors: ${bodyMessage(parsed.errors)}`,
+      );
+    }
     const first = parsed.results?.[0] ?? {};
+    if (!first.id) {
+      throw new TerminalSinkError("hubspot upsert response had no result");
+    }
     const id = resultId(first.id, deal.id);
     const urlFromBody = hubSpotUrl(this.cfg, id, first.url);
     return {
