@@ -440,6 +440,7 @@ describe("Store external webhook leases", () => {
         retryLeaseAt ?? undefined,
       );
       expect(store.metrics().stageNotificationAuditGaps).toBe(0);
+      expect(store.externalNotificationLeaseAt("audit-failed-key")).toBeNull();
     } finally {
       store.close();
     }

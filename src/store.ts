@@ -48,6 +48,7 @@ const QUARANTINE_CODES: QuarantineCode[] = [
 // completed Slack posts.
 const NOTIFY_PENDING_LEASE_MS = STAGE_NOTIFICATION_LEASE_MS;
 const NOTIFICATION_LEASE_CHANGED = "notification lease changed before mark";
+const MAX_EVENT_TAIL = 1000;
 
 const SCHEMA: string[] = [
   "PRAGMA journal_mode = WAL",
@@ -650,7 +651,7 @@ export class Store {
 
   events(dealId?: string, limit?: number): PipelineEvent[] {
     const cappedLimit =
-      limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
+      limit === undefined ? undefined : Math.max(1, Math.min(MAX_EVENT_TAIL, limit));
     let rows: unknown[];
     if (dealId && cappedLimit !== undefined) {
       rows = this.db
@@ -662,9 +663,9 @@ export class Store {
     } else if (dealId) {
       rows = this.db
         .prepare(
-          "SELECT id, deal_id, ts, from_st, to_st, detail, meta FROM events WHERE deal_id = ? ORDER BY id DESC LIMIT 1000",
+          "SELECT id, deal_id, ts, from_st, to_st, detail, meta FROM events WHERE deal_id = ? ORDER BY id DESC LIMIT ?",
         )
-        .all(dealId)
+        .all(dealId, MAX_EVENT_TAIL)
         .reverse();
     } else if (cappedLimit !== undefined) {
       rows = this.db

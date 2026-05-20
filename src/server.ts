@@ -869,12 +869,14 @@ async function handleHubSpotWebhook(
   let malformed = 0;
   let noRouterId = 0;
   let resolveErrors = 0;
+  let terminalResolveErrors = 0;
   try {
     const resolved = await handler.resolve(parsed);
     changes = resolved.changes;
     malformed = resolved.droppedMalformed;
     noRouterId = resolved.droppedNoRouterId;
     resolveErrors = resolved.resolveErrors;
+    terminalResolveErrors = resolved.terminalResolveErrors;
   } catch (err) {
     json(res, err instanceof WebhookPayloadError ? 400 : 502, {
       error: err instanceof Error ? err.message : String(err),
@@ -996,12 +998,15 @@ async function handleHubSpotWebhook(
     malformed,
     noRouterId,
     resolveErrors,
+    terminalResolveErrors,
     ignored: Math.max(
       0,
       (Array.isArray(parsed) ? parsed.length : 0) -
         changes.length -
         malformed -
-        noRouterId,
+        noRouterId -
+        resolveErrors -
+        terminalResolveErrors,
     ),
     ...(changes.length === 0 ? { ignoredReason: "no dealstage events in payload" } : {}),
     results,

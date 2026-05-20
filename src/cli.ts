@@ -138,7 +138,7 @@ async function cmdDemo(args: string[]): Promise<void> {
 
   const firstRouted = outcomes.find((o) => o.ok);
   if (firstRouted && firstRouted.ok) {
-    console.log(`\nEVENT TRAIL — ${firstRouted.deal.id} (full observability)`);
+    console.log(`\nEVENT TRAIL — ${firstRouted.deal.id} (latest 1000 events)`);
     for (const e of store.events(firstRouted.deal.id)) {
       console.log(`  ${e.ts}  ${e.from} → ${e.to}  ${e.detail}`);
     }

@@ -8,7 +8,7 @@ import {
 import { startServer } from "../src/server.js";
 import type { OpportunitySink } from "../src/sink.js";
 import { Store } from "../src/store.js";
-import type { Deal, Enrichment } from "../src/types.js";
+import type { Deal, Enrichment, RoutedDeal } from "../src/types.js";
 
 const enricher: Enricher = {
   name: "test",
@@ -24,6 +24,42 @@ const enricher: Enricher = {
 };
 
 const open: Array<{ close(): Promise<void>; store: Store }> = [];
+
+function routedRecord(id: string): RoutedDeal {
+  return {
+    id,
+    company: "Partial Resolve Co",
+    domain: "example.com",
+    contactName: "Rae Ops",
+    contactEmail: "rae@example.com",
+    dealUSD: 60000,
+    region: "NA",
+    sourceChannel: "inbound_form",
+    statedNeed: "one webhook event should not block the rest",
+    enrichment: {
+      employees: 1200,
+      industry: "logistics",
+      techSignals: ["manual_ops", "enterprise"],
+      regulated: true,
+      confidence: 0.95,
+    },
+    score: {
+      icpFit: 1,
+      painSignal: 1,
+      sizeFit: 1,
+      regionFit: 1,
+      total: 1,
+      notes: [],
+    },
+    route: {
+      kind: "human_assisted",
+      salesOwner: "ae.morgan",
+      financeFlag: "pricing_approval",
+      legalFlag: "regulated_review",
+      slaHours: 4,
+    },
+  };
+}
 
 async function app(
   options?: Parameters<typeof startServer>[3],
@@ -615,7 +651,7 @@ describe("server dashboard", () => {
         routerDealId: "D-1",
       },
     ]);
-    const timestamp = String(new Date("2026-05-19T12:00:00Z").getTime());
+    const timestamp = String(Date.now());
     const signature = hubSpotV3Signature(
       "wrong-secret",
       "POST",
@@ -680,6 +716,110 @@ describe("server dashboard", () => {
 
     expect(body).toEqual(
       expect.objectContaining({ processed: 0, noRouterId: 1, ignored: 0 }),
+    );
+    stderr.mockRestore();
+  });
+
+  it("processes healthy webhook events but returns 502 when one HubSpot resolve is retryable", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    let routerDealId = "";
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      const textUrl = String(url);
+      if (textUrl.includes("/crm/v3/objects/deals/777")) {
+        return new Response(
+          JSON.stringify({
+            id: "777",
+            properties: { gtm_router_deal_id: routerDealId },
+          }),
+          { status: 200 },
+        );
+      }
+      if (textUrl.includes("/api/chat.postMessage")) {
+        return new Response(
+          JSON.stringify({ ok: true, channel: "C123", ts: "177.1" }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ message: "unavailable" }), {
+        status: 503,
+      });
+    }) as unknown as typeof fetch;
+    const built = integrationOptionsFromEnv(
+      "live",
+      {
+        HUBSPOT_ACCESS_TOKEN: "pat-na2-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C12345678",
+      },
+      fetchImpl,
+    );
+    const { baseUrl, store } = await app({
+      pipelineOptions: { ...built, dryRun: true },
+      stageChanges: built.stageChanges,
+    });
+    routerDealId = "D-partial-resolve";
+    store.recordRouted(routedRecord(routerDealId), 0, {
+      mode: "dry_run",
+      status: "dry_run",
+    });
+    const rawBody = JSON.stringify([
+      {
+        eventId: 1001,
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        occurredAt: 1779210000000,
+      },
+      {
+        eventId: 1002,
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 778,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        occurredAt: 1779210000001,
+      },
+    ]);
+    const timestamp = String(Date.now());
+    const signature = hubSpotV3Signature(
+      "client-secret",
+      "POST",
+      `${baseUrl}/webhooks/hubspot`,
+      rawBody,
+      timestamp,
+    );
+    const res = await fetch(`${baseUrl}/webhooks/hubspot`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-hubspot-signature-v3": signature,
+        "x-hubspot-request-timestamp": timestamp,
+      },
+      body: rawBody,
+    });
+    const body = (await res.json()) as {
+      processed: number;
+      resolveErrors: number;
+      terminalResolveErrors: number;
+      ignored: number;
+    };
+
+    expect(res.status).toBe(502);
+    expect(body).toEqual(
+      expect.objectContaining({
+        processed: 1,
+        resolveErrors: 1,
+        terminalResolveErrors: 0,
+        ignored: 0,
+      }),
     );
     stderr.mockRestore();
   });

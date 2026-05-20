@@ -124,6 +124,7 @@ export interface HubSpotStageResolveResult {
   droppedMalformed: number;
   droppedNoRouterId: number;
   resolveErrors: number;
+  terminalResolveErrors: number;
 }
 
 export interface HubSpotWebhookRequest {
@@ -1123,9 +1124,15 @@ export class HubSpotStageChangeHandler {
     );
     const resolved: ResolvedHubSpotStageChange[] = [];
     let resolveErrors = 0;
+    let terminalResolveErrors = 0;
     for (const event of stageEvents) {
       if (event instanceof Error) {
-        resolveErrors += 1;
+        console.error(`hubspot stage resolve failed: ${event.message}`);
+        if (event instanceof TerminalSinkError) {
+          terminalResolveErrors += 1;
+        } else {
+          resolveErrors += 1;
+        }
         continue;
       }
       if (!event) {
@@ -1155,6 +1162,7 @@ export class HubSpotStageChangeHandler {
       droppedMalformed: parsed.dropped,
       droppedNoRouterId,
       resolveErrors,
+      terminalResolveErrors,
     };
   }
 

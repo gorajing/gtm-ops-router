@@ -76,7 +76,12 @@ describe("pipeline — happy path", () => {
       store.appendEvent(out.deal.id, "scored", "scored", `operator note ${i}`);
     }
 
-    expect(store.events(out.deal.id)).toHaveLength(1000);
+    const events = store.events(out.deal.id);
+    expect(events).toHaveLength(1000);
+    expect(events.some((event) => event.detail === "intake: Ryder Digital")).toBe(
+      false,
+    );
+    expect(events.at(-1)?.detail).toBe("operator note 1000");
     store.close();
   });
 });

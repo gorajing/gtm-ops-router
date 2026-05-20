@@ -226,6 +226,7 @@ describe("HubSpot + Slack integration sink", () => {
   });
 
   it("resolves healthy HubSpot stage events even when one deal fetch fails", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
     const fetchImpl = vi.fn(async (url: string | URL | Request) => {
       if (String(url).includes("/crm/v3/objects/deals/777")) {
         return new Response(
@@ -280,6 +281,46 @@ describe("HubSpot + Slack integration sink", () => {
     expect(resolved.changes).toHaveLength(1);
     expect(resolved.changes[0]?.routerDealId).toBe("D-healthy");
     expect(resolved.resolveErrors).toBe(1);
+    expect(resolved.terminalResolveErrors).toBe(0);
+    stderr.mockRestore();
+  });
+
+  it("classifies terminal HubSpot stage deal fetch failures separately", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ message: "bad token" }), { status: 401 }),
+    ) as unknown as typeof fetch;
+    const built = integrationOptionsFromEnv(
+      "live",
+      {
+        HUBSPOT_ACCESS_TOKEN: "pat-na2-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "secret",
+        PUBLIC_BASE_URL: "https://example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C12345678",
+      },
+      fetchImpl,
+    );
+
+    const resolved = await built.stageChanges.resolve([
+      {
+        eventId: 1,
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        occurredAt: 1779210000000,
+      },
+    ]);
+
+    expect(resolved.changes).toHaveLength(0);
+    expect(resolved.resolveErrors).toBe(0);
+    expect(resolved.terminalResolveErrors).toBe(1);
+    stderr.mockRestore();
   });
 
   it("verifies HubSpot v3 webhook signatures against the raw body", () => {
@@ -349,6 +390,30 @@ describe("HubSpot + Slack integration sink", () => {
         now: () => new Date("2026-05-19T12:00:00Z"),
       }),
     ).toBe(false);
+
+    const encodedUrl =
+      "https://router.example.com/webhooks/hubspot?source=a%20b%26x%3D1%5F%7E";
+    const normalizedUrl =
+      "https://router.example.com/webhooks/hubspot?source=a b&x=1_~";
+    const encodedSignature = hubSpotV3Signature(
+      "client-secret",
+      "POST",
+      normalizedUrl,
+      rawBody,
+      timestamp,
+    );
+    expect(
+      built.stageChanges.verify({
+        method: "POST",
+        absoluteUrl: encodedUrl,
+        rawBody,
+        headers: {
+          "x-hubspot-signature-v3": encodedSignature,
+          "x-hubspot-request-timestamp": timestamp,
+        },
+        now: () => new Date("2026-05-19T12:00:00Z"),
+      }),
+    ).toBe(true);
   });
 
   it("live stage-change handling fetches the router id before posting Slack", async () => {
