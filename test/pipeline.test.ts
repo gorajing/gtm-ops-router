@@ -67,7 +67,7 @@ describe("pipeline — happy path", () => {
     store.close();
   });
 
-  it("plain event reads are explicit and uncapped", async () => {
+  it("plain deal event reads are capped", async () => {
     const store = new Store(":memory:");
     const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
     expect(out.ok).toBe(true);
@@ -76,7 +76,7 @@ describe("pipeline — happy path", () => {
       store.appendEvent(out.deal.id, "scored", "scored", `operator note ${i}`);
     }
 
-    expect(store.events(out.deal.id)).toHaveLength(1006);
+    expect(store.events(out.deal.id)).toHaveLength(1000);
     store.close();
   });
 });

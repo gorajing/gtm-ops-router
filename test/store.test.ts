@@ -421,6 +421,25 @@ describe("Store external webhook leases", () => {
           "audit-failed-key",
         ),
       ).toBe("notify_retry");
+      const retryLeaseAt = store.externalNotificationLeaseAt("audit-failed-key");
+      store.failNotificationAppend = false;
+      store.recordExternalNotificationEvent(
+        "D-lease",
+        "hubspot stage notification retry",
+        {
+          kind: "hubspot_stage_change",
+          mode: "dry_run",
+          hubspotDealId: "991",
+          eventKey: "audit-failed-key",
+          toStageId: "contact_made",
+          toStageLabel: "Contact Made",
+          receipts: [{ system: "slack", externalId: "C123", detail: "posted" }],
+        },
+        "audit-failed-key",
+        [{ detail: "posted" }],
+        retryLeaseAt ?? undefined,
+      );
+      expect(store.metrics().stageNotificationAuditGaps).toBe(0);
     } finally {
       store.close();
     }

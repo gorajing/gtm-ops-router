@@ -46,6 +46,9 @@ Webhook idempotency claims the HubSpot event in SQLite before posting Slack.
 That prevents duplicate Slack messages on HubSpot retries. If Slack fails, the
 event key is marked failed; HubSpot's next retry re-attempts only the Slack
 notification without reapplying the stage movement.
+If the process crashes after the event key is claimed but before Slack returns,
+HubSpot retries inside the 60-second lease window are treated as duplicates;
+after the lease expires, the next retry can reclaim and post the notification.
 Legacy SQLite files created before the notification-lease migration may still
 have a `notify_attempts` column; it is frozen historical data. Use
 `notify_leases` for the current lease-acquisition count.

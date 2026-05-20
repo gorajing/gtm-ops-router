@@ -124,6 +124,9 @@ export class Store {
     this.ensureColumn(
       "external_event_keys",
       "notify_status",
+      // Existing event-key rows predate stage notifications, so the ALTER path
+      // defaults them to terminal-ok. Fresh stage rows still start pending in
+      // SCHEMA and are explicitly leased before Slack is posted.
       "TEXT NOT NULL DEFAULT 'ok'",
     );
     this.ensureColumn(
@@ -609,7 +612,9 @@ export class Store {
       }
       // Slack may already have accepted the post. If the audit append failed,
       // make a best-effort lease release so a later HubSpot retry does not
-      // duplicate the user-visible notification.
+      // duplicate the user-visible notification. The rollback restored the
+      // pre-transaction notify_pending_at, so expectedLeaseAt still identifies
+      // this caller's claim.
       try {
         this.markExternalNotification(eventKey, receipts, err, expectedLeaseAt);
       } catch (releaseErr) {
@@ -657,9 +662,10 @@ export class Store {
     } else if (dealId) {
       rows = this.db
         .prepare(
-          "SELECT id, deal_id, ts, from_st, to_st, detail, meta FROM events WHERE deal_id = ? ORDER BY id",
+          "SELECT id, deal_id, ts, from_st, to_st, detail, meta FROM events WHERE deal_id = ? ORDER BY id DESC LIMIT 1000",
         )
-        .all(dealId);
+        .all(dealId)
+        .reverse();
     } else if (cappedLimit !== undefined) {
       rows = this.db
         .prepare(

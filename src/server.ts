@@ -868,11 +868,13 @@ async function handleHubSpotWebhook(
   let changes: ResolvedHubSpotStageChange[];
   let malformed = 0;
   let noRouterId = 0;
+  let resolveErrors = 0;
   try {
     const resolved = await handler.resolve(parsed);
     changes = resolved.changes;
     malformed = resolved.droppedMalformed;
     noRouterId = resolved.droppedNoRouterId;
+    resolveErrors = resolved.resolveErrors;
   } catch (err) {
     json(res, err instanceof WebhookPayloadError ? 400 : 502, {
       error: err instanceof Error ? err.message : String(err),
@@ -985,7 +987,7 @@ async function handleHubSpotWebhook(
     });
   }
 
-  json(res, 200, {
+  json(res, resolveErrors > 0 ? 502 : 200, {
     processed: results.filter((r) => r.status === "recorded").length,
     notificationRetries: results.filter((r) => r.status === "notify_retry").length,
     duplicates: results.filter((r) => r.status === "duplicate").length,
@@ -993,6 +995,7 @@ async function handleHubSpotWebhook(
     stale: results.filter((r) => r.status === "stale").length,
     malformed,
     noRouterId,
+    resolveErrors,
     ignored: Math.max(
       0,
       (Array.isArray(parsed) ? parsed.length : 0) -

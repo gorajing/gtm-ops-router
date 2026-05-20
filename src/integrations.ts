@@ -123,6 +123,7 @@ export interface HubSpotStageResolveResult {
   changes: ResolvedHubSpotStageChange[];
   droppedMalformed: number;
   droppedNoRouterId: number;
+  resolveErrors: number;
 }
 
 export interface HubSpotWebhookRequest {
@@ -310,6 +311,10 @@ const HUBSPOT_V3_URI_DECODES: Array<[RegExp, string]> = [
   [/%2F/gi, "/"],
   [/%3F/gi, "?"],
   [/%40/gi, "@"],
+  [/%23/gi, "#"],
+  [/%26/gi, "&"],
+  [/%3D/gi, "="],
+  [/%20/gi, " "],
   [/%21/gi, "!"],
   [/%24/gi, "$"],
   [/%27/gi, "'"],
@@ -318,6 +323,9 @@ const HUBSPOT_V3_URI_DECODES: Array<[RegExp, string]> = [
   [/%2A/gi, "*"],
   [/%2C/gi, ","],
   [/%3B/gi, ";"],
+  [/%2D/gi, "-"],
+  [/%5F/gi, "_"],
+  [/%7E/gi, "~"],
 ];
 
 function normalizeHubSpotV3Uri(uri: string): string {
@@ -1109,12 +1117,17 @@ export class HubSpotStageChangeHandler {
           return event.routerDealId ? event : await this.fetchHubSpotDeal(event);
         } catch (err) {
           if (err instanceof HubSpotDealUnmappedError) return null;
-          throw err;
+          return err instanceof Error ? err : new Error(String(err));
         }
       },
     );
     const resolved: ResolvedHubSpotStageChange[] = [];
+    let resolveErrors = 0;
     for (const event of stageEvents) {
+      if (event instanceof Error) {
+        resolveErrors += 1;
+        continue;
+      }
       if (!event) {
         droppedNoRouterId += 1;
         continue;
@@ -1141,6 +1154,7 @@ export class HubSpotStageChangeHandler {
       changes: resolved,
       droppedMalformed: parsed.dropped,
       droppedNoRouterId,
+      resolveErrors,
     };
   }
 
