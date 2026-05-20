@@ -8,6 +8,7 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { HUBSPOT_WEBHOOK_FETCH_TIMEOUT_CAP_MS } from "./constants.js";
 import {
   DEFAULT_RETRY,
   RetryableSinkError,
@@ -68,6 +69,7 @@ export interface IntegrationDoctorOptions {
 interface HubSpotUpsertResponse {
   results?: Array<{
     id?: unknown;
+    new?: unknown;
     url?: unknown;
   }>;
   errors?: unknown[];
@@ -173,7 +175,9 @@ function fetchTimeoutMs(env: NodeJS.ProcessEnv): number {
 
 function webhookFetchTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = Number(env.HUBSPOT_WEBHOOK_FETCH_TIMEOUT_MS);
-  if (Number.isFinite(raw) && raw > 0) return Math.min(Math.round(raw), 4_500);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(Math.round(raw), HUBSPOT_WEBHOOK_FETCH_TIMEOUT_CAP_MS);
+  }
   return 3_000;
 }
 
@@ -268,22 +272,28 @@ export function slackHandoffPayload(
   hubspot: SinkReceipt,
 ): { channel: string; text: string } {
   const lines = [
-    `GTM routed deal: ${escapeSlackMrkdwn(deal.company)}`,
-    `ARR: ${money(deal.dealUSD)} | score: ${deal.score.total.toFixed(2)} | route: ${escapeSlackMrkdwn(routeSummary(deal))}`,
-    `HubSpot: ${escapeSlackMrkdwn(hubspot.externalId)}${
-      hubspot.url ? ` (${escapeSlackMrkdwn(hubspot.url)})` : ""
+    `GTM routed deal: ${escapeSlackLinkChars(deal.company)}`,
+    `ARR: ${money(deal.dealUSD)} | score: ${deal.score.total.toFixed(2)} | route: ${escapeSlackLinkChars(routeSummary(deal))}`,
+    `HubSpot: ${escapeSlackLinkChars(hubspot.externalId)}${
+      hubspot.url ? ` (${escapeSlackLinkChars(hubspot.url)})` : ""
     }`,
-    `Router id: ${escapeSlackMrkdwn(deal.id)}`,
+    `Router id: ${escapeSlackLinkChars(deal.id)}`,
   ];
   return { channel, text: lines.join("\n") };
 }
 
-function escapeSlackMrkdwn(s: string): string {
+// Escape Slack's link/control delimiters. This intentionally leaves styling
+// markers readable for trusted operator-controlled deal text; exposing /deals
+// publicly would need auth or stricter mrkdwn escaping. Escaping <, >, and &
+// blocks Slack mentions/links, while escaping backticks prevents code spans
+// from bleeding across the rest of a line.
+// If intake becomes public-facing, escape *_~ here too.
+function escapeSlackLinkChars(s: string): string {
   return s
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replace(/([*_~`])/g, "\\$1");
+    .replaceAll("`", "\\`");
 }
 
 function headerValue(
@@ -492,7 +502,9 @@ function missingLiveEnv(
       : "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
     env.HUBSPOT_WEBHOOK_SECRET ? "" : "HUBSPOT_WEBHOOK_SECRET",
     env.PUBLIC_BASE_URL ? "" : "PUBLIC_BASE_URL",
-    env.HUBSPOT_NOTIFY_STAGE_IDS ? "" : "HUBSPOT_NOTIFY_STAGE_IDS",
+    env.HUBSPOT_NOTIFY_STAGE_IDS === undefined
+      ? "HUBSPOT_NOTIFY_STAGE_IDS"
+      : "",
     cfg.slackBotToken ? "" : "SLACK_BOT_TOKEN",
     env.SLACK_CHANNEL_ID ? "" : "SLACK_CHANNEL_ID",
   ].filter(Boolean);
@@ -523,6 +535,11 @@ function invalidLiveEnv(
   }
   if (invalidPublicBaseUrl(env.PUBLIC_BASE_URL)) {
     invalid.push("PUBLIC_BASE_URL");
+  }
+  if (
+    csvEnv(env.HUBSPOT_NOTIFY_STAGE_IDS).length === 0
+  ) {
+    invalid.push("HUBSPOT_NOTIFY_STAGE_IDS (must list at least one stage id)");
   }
   if (!/^[CGD][A-Z0-9]{8,}$/.test(cfg.slackChannelId)) {
     invalid.push("SLACK_CHANNEL_ID");
@@ -1058,13 +1075,13 @@ export function slackStageChangePayload(
     ? `https://app.hubspot.com/contacts/${hubspotPortalId}/deal/${change.hubspotDealId}`
     : undefined;
   const lines = [
-    `HubSpot deal stage changed: ${escapeSlackMrkdwn(change.dealName ?? change.routerDealId)}`,
-    `Stage: ${escapeSlackMrkdwn(stage)}`,
-    `HubSpot deal: ${escapeSlackMrkdwn(change.hubspotDealId)}${
-      hubspotUrl ? ` (${escapeSlackMrkdwn(hubspotUrl)})` : ""
+    `HubSpot deal stage changed: ${escapeSlackLinkChars(change.dealName ?? change.routerDealId)}`,
+    `Stage: ${escapeSlackLinkChars(stage)}`,
+    `HubSpot deal: ${escapeSlackLinkChars(change.hubspotDealId)}${
+      hubspotUrl ? ` (${escapeSlackLinkChars(hubspotUrl)})` : ""
     }`,
-    `Router id: ${escapeSlackMrkdwn(change.routerDealId)}`,
-    `When: ${escapeSlackMrkdwn(change.occurredAt)}`,
+    `Router id: ${escapeSlackLinkChars(change.routerDealId)}`,
+    `When: ${escapeSlackLinkChars(change.occurredAt)}`,
   ];
   return { channel, text: lines.join("\n") };
 }
@@ -1352,7 +1369,10 @@ export class HubSpotSlackSink implements OpportunitySink {
     return {
       system: "hubspot",
       externalId: id,
-      detail: "upserted deal",
+      // HubSpot batch upsert returns boolean { new: true } for newly created
+      // records. Keep this strict so string/number-shaped API drift does not
+      // invent "created" semantics.
+      detail: first.new === true ? "created deal" : "upserted deal",
       ...(urlFromBody ? { url: urlFromBody } : {}),
     };
   }

@@ -73,6 +73,10 @@ npm run run -- data/inbound.seed.jsonl --live-integrations
 npm run serve -- --live-integrations
 ```
 
+The HTTP surface binds `127.0.0.1` by default. Keep `/deals` on localhost, a
+trusted internal network, or an authenticated reverse proxy; Slack rendering
+assumes deal text is operator-controlled rather than public attacker input.
+
 `HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY` must be a **unique deal property** in your
 HubSpot portal. That is not ceremony: it keeps retries and re-runs idempotent
 instead of creating duplicate deals. Slack messages include the router deal id
@@ -91,7 +95,9 @@ HubSpot signed; only use `TRUST_PROXY=1` when your proxy owns the
 a comma-separated allowlist of HubSpot dealstage IDs (for example the internal
 ID for "Contact Made") so enabling Slack cannot accidentally alert on every
 stage movement in the portal. Dry-run mode may leave it empty to demonstrate
-all router-owned stage changes.
+all router-owned stage changes. The allowlist is not retroactive: events
+suppressed before a stage ID is allowed stay suppressed unless an operator
+deliberately resets or replays that event.
 
 If `npm run doctor` says `gtm_router_deal_id` already exists but is not
 unique, create a fresh unique text property instead (for example

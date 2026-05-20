@@ -11,6 +11,10 @@ python3 ops_audit.py --db data/router.db # SLO gate; exit 1 if breached
 npm run serve                            # live dashboard :8787
 ```
 
+The HTTP server binds `127.0.0.1` by default. Keep `/deals` behind localhost,
+a trusted internal network, or an authenticated reverse proxy; Slack messages
+assume deal text is operator-controlled, not public-form attacker input.
+
 Nightly cron / CI: `npm run run -- <today.jsonl> && python3 ops_audit.py`.
 The audit exits non-zero on an SLO breach, so it fails the pipeline loudly
 instead of letting a regression ride along silently.
@@ -32,12 +36,32 @@ should alert Slack, for example only the ID for "Contact Made"; live mode
 refuses to run without this allowlist so a first setup cannot create a Slack
 firehose. HubSpot may retry webhook deliveries, so the router stores a
 composite event key and skips duplicate successful Slack posts.
+Suppressed stage notifications are intentionally sticky: if a stage was not in
+`HUBSPOT_NOTIFY_STAGE_IDS` when the webhook arrived, adding it later does not
+retroactively post old webhook events. Move the deal again or reset the event
+key deliberately if you want a replay.
 For local curl-only testing of the dry-run webhook, set
 `ALLOW_UNSIGNED_WEBHOOKS=1`; do not use that on a public URL.
 Webhook idempotency claims the HubSpot event in SQLite before posting Slack.
 That prevents duplicate Slack messages on HubSpot retries. If Slack fails, the
 event key is marked failed; HubSpot's next retry re-attempts only the Slack
 notification without reapplying the stage movement.
+Legacy SQLite files created before the notification-lease migration may still
+have a `notify_attempts` column; it is frozen historical data. Use
+`notify_leases` for the current lease-acquisition count.
+If `stageNotificationAuditGaps` is non-zero, Slack may have posted while the
+deal event timeline missed the notification row. In that case
+`notify_status='ok'` does not imply `notify_error IS NULL`; inspect
+`external_event_keys.notify_error` for the affected event keys.
+After confirming the Slack message and deal state manually, clear a reviewed
+audit gap with:
+
+```sql
+UPDATE external_event_keys
+SET notify_error = NULL
+WHERE key = '<event key>'
+  AND notify_error LIKE '%audit_append_failed:%';
+```
 
 ## Read the metrics
 

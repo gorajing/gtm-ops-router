@@ -360,6 +360,7 @@ function renderKpis(){
     ["Auto-handled", m.autoHandled, "nurture + self-serve"],
     ["Partial Syncs", m.partialSyncs, "routed with downstream warning"],
     ["Sync Gaps", m.externallySyncedStoreErrors, "external sync succeeded, local store failed"],
+    ["Audit Gaps", m.stageNotificationAuditGaps, "stage notification audit rows needing attention"],
     ["p95 Latency", m.latencyMsP95 + "ms", state.sinkLabel]
   ];
   const root = qs("#kpis");
@@ -921,6 +922,8 @@ async function handleHubSpotWebhook(
       });
       continue;
     }
+    const notificationLeaseAt =
+      store.externalNotificationLeaseAt(change.eventKey) ?? undefined;
 
     let receipts: Array<{
       system: string;
@@ -964,10 +967,11 @@ async function handleHubSpotWebhook(
         },
         change.eventKey,
         receipts,
+        notificationLeaseAt,
       );
     } catch (err) {
       console.error(
-        `hubspot webhook could not append notification event: ${
+        `hubspot webhook could not append notification event for eventKey=${change.eventKey} dealId=${change.routerDealId}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

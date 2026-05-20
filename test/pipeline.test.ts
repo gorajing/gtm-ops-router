@@ -228,6 +228,7 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
     expect(m.autoHandled).toBe(3);
     expect(m.partialSyncs).toBe(0);
     expect(m.externallySyncedStoreErrors).toBe(0);
+    expect(m.stageNotificationAuditGaps).toBe(0);
     expect(m.arrByRoute).toEqual({
       nurture: 40000,
       self_serve: 11000,

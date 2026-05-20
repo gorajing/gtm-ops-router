@@ -47,6 +47,7 @@ export function renderMetricsTable(m: Metrics): string {
     `    auto-handled ...... ${m.autoHandled} deals (routed with no rep touch)`,
     `    partial syncs ..... ${m.partialSyncs}`,
     `    sync gaps ......... ${m.externallySyncedStoreErrors} external/local mismatches`,
+    `    audit gaps ........ ${m.stageNotificationAuditGaps} stage-notify rows needing attention`,
     "",
     `  latency  p50 ${m.latencyMsP50}ms   p95 ${m.latencyMsP95}ms`,
     rule(),

@@ -80,25 +80,25 @@ describe("HubSpot + Slack integration sink", () => {
     expect(payload.channel).toBe("C123");
     expect(payload.text).toContain("Ryder Digital");
     expect(payload.text).toContain("HubSpot: 12345");
-    expect(payload.text).toContain("pricing\\_approval");
+    expect(payload.text).toContain("pricing_approval");
   });
 
-  it("escapes Slack mrkdwn in operator-controlled text", () => {
+  it("escapes Slack link-control chars while leaving readable identifiers intact", () => {
     const payload = slackHandoffPayload(
-      routed("D-<danger>", "ACME <@U123|ops> & *Co*"),
+      routed("D-<danger>`", "ACME <@U123|ops> & *Co* `prod`"),
       "C123",
       {
         system: "hubspot",
-        externalId: "123<bad>",
+        externalId: "123<bad>`",
         detail: "created deal",
-        url: "https://hubspot.test/deal/123?x=<bad>&y=1",
+        url: "https://hubspot.test/deal/123?x=<bad>&y=1&env=`prod`",
       },
     );
 
-    expect(payload.text).toContain("ACME &lt;@U123|ops&gt; &amp; \\*Co\\*");
-    expect(payload.text).toContain("123&lt;bad&gt;");
-    expect(payload.text).toContain("x=&lt;bad&gt;&amp;y=1");
-    expect(payload.text).toContain("D-&lt;danger&gt;");
+    expect(payload.text).toContain("ACME &lt;@U123|ops&gt; &amp; *Co* \\`prod\\`");
+    expect(payload.text).toContain("123&lt;bad&gt;\\`");
+    expect(payload.text).toContain("x=&lt;bad&gt;&amp;y=1&amp;env=\\`prod\\`");
+    expect(payload.text).toContain("D-&lt;danger&gt;\\`");
   });
 
   it("dry-run mode emits HubSpot and Slack receipts without network", async () => {
@@ -351,7 +351,7 @@ describe("HubSpot + Slack integration sink", () => {
       "properties=gtm_router_deal_id%2Cdealstage%2Cdealname%2Camount",
     );
     expect(slackBody.text).toContain("Ryder Digital");
-    expect(slackBody.text).toContain("Stage: contact\\_made");
+    expect(slackBody.text).toContain("Stage: contact_made");
     expect(receipts[0]?.detail).toContain("posted stage change");
   });
 
@@ -374,7 +374,7 @@ describe("HubSpot + Slack integration sink", () => {
     );
 
     expect(payload.channel).toBe("C123");
-    expect(payload.text).toContain("Contact Made (contact\\_made)");
+    expect(payload.text).toContain("Contact Made (contact_made)");
     expect(payload.text).toContain("Router id: D-1");
     expect(payload.text).toContain(
       "https://app.hubspot.com/contacts/246238162/deal/777",
@@ -517,6 +517,81 @@ describe("HubSpot + Slack integration sink", () => {
     expect(calls[1]?.url).toBe("https://slack.com/api/chat.postMessage");
     expect(slackBody.text).toContain("HubSpot: 12345");
     expect(receipts.map((r) => r.externalId)).toEqual(["12345", "171.0001"]);
+    expect(receipts[0]?.detail).toBe("created deal");
+  });
+
+  it("labels existing HubSpot upserts when the response says new is false", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(
+          JSON.stringify({
+            results: [{ id: "12345", new: false }],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ ok: true, channel: "C123", ts: "171.0001" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const sink = new HubSpotSlackSink({
+      mode: "live",
+      hubspotAccessToken: "hs-token",
+      hubspotExternalIdProperty: "gtm_router_deal_id",
+      hubspotApiBase: "https://api.hubapi.com",
+      hubspotPipeline: "default",
+      hubspotDealstage: "appointmentscheduled",
+      hubspotPortalId: undefined,
+      slackBotToken: "xoxb-token",
+      slackChannelId: "C123",
+      slackApiBase: "https://slack.com",
+      fetchImpl,
+      slackRetry: { maxAttempts: 1, baseDelayMs: 0, sleep: async () => {} },
+    });
+
+    const receipts = await sink.upsert(routed());
+
+    expect(receipts[0]?.detail).toBe("upserted deal");
+  });
+
+  it("does not treat string-shaped HubSpot new values as created deals", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(
+          JSON.stringify({
+            results: [{ id: "12345", new: "true" }],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ ok: true, channel: "C123", ts: "171.0001" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const sink = new HubSpotSlackSink({
+      mode: "live",
+      hubspotAccessToken: "hs-token",
+      hubspotExternalIdProperty: "gtm_router_deal_id",
+      hubspotApiBase: "https://api.hubapi.com",
+      hubspotPipeline: "default",
+      hubspotDealstage: "appointmentscheduled",
+      hubspotPortalId: undefined,
+      slackBotToken: "xoxb-token",
+      slackChannelId: "C123",
+      slackApiBase: "https://slack.com",
+      fetchImpl,
+      slackRetry: { maxAttempts: 1, baseDelayMs: 0, sleep: async () => {} },
+    });
+
+    const receipts = await sink.upsert(routed());
+
+    expect(receipts[0]?.detail).toBe("upserted deal");
   });
 
   it("live mode refuses missing env instead of creating duplicate-prone writes", () => {
@@ -536,6 +611,48 @@ describe("HubSpot + Slack integration sink", () => {
         SLACK_CHANNEL_ID: "C0123456789",
       }),
     ).toThrow("missing live integration env: HUBSPOT_NOTIFY_STAGE_IDS");
+  });
+
+  it("live mode rejects an empty HubSpot stage notification allowlist", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: " , ,, ",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      }),
+    ).toThrow("invalid live integration env: HUBSPOT_NOTIFY_STAGE_IDS");
+  });
+
+  it("live mode rejects an explicitly empty HubSpot stage notification allowlist", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      }),
+    ).toThrow("invalid live integration env: HUBSPOT_NOTIFY_STAGE_IDS");
+  });
+
+  it("live mode accepts whitespace around concrete HubSpot stage ids", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: " , contact_made , ",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      }),
+    ).not.toThrow();
   });
 
   it("live mode rejects Slack channel names before first send", () => {

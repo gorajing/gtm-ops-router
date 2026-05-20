@@ -13,6 +13,7 @@
 
 import { createRequire } from "node:module";
 import type { DatabaseSync as DatabaseSyncT } from "node:sqlite";
+import { STAGE_NOTIFICATION_LEASE_MS } from "./constants.js";
 import type {
   ExternalStageState,
   Metrics,
@@ -41,6 +42,12 @@ const QUARANTINE_CODES: QuarantineCode[] = [
   "sink_terminal",
   "sink_exhausted",
 ];
+
+// Stage-change Slack posts are single-attempt and bounded by the shared webhook
+// fetch cap in constants.ts. notify_leases counts lease acquisitions, not only
+// completed Slack posts.
+const NOTIFY_PENDING_LEASE_MS = STAGE_NOTIFICATION_LEASE_MS;
+const NOTIFICATION_LEASE_CHANGED = "notification lease changed before mark";
 
 const SCHEMA: string[] = [
   "PRAGMA journal_mode = WAL",
@@ -76,7 +83,8 @@ const SCHEMA: string[] = [
      system      TEXT NOT NULL,
      recorded_at TEXT NOT NULL,
      notify_status TEXT NOT NULL DEFAULT 'pending',
-     notify_attempts INTEGER NOT NULL DEFAULT 0,
+     notify_leases INTEGER NOT NULL DEFAULT 0,
+     notify_pending_at TEXT,
      notified_at TEXT,
      notify_error TEXT
    )`,
@@ -120,11 +128,13 @@ export class Store {
     );
     this.ensureColumn(
       "external_event_keys",
-      "notify_attempts",
+      "notify_leases",
       "INTEGER NOT NULL DEFAULT 0",
     );
+    this.ensureColumn("external_event_keys", "notify_pending_at", "TEXT");
     this.ensureColumn("external_event_keys", "notified_at", "TEXT");
     this.ensureColumn("external_event_keys", "notify_error", "TEXT");
+    this.backfillExternalNotificationLeases();
     this.backfillDerivedColumns();
     this.backfillSinkColumns();
   }
@@ -280,6 +290,17 @@ export class Store {
     });
   }
 
+  private backfillExternalNotificationLeases(): void {
+    this.db
+      .prepare(
+        `UPDATE external_event_keys
+         SET notify_pending_at = ?
+         WHERE notify_status='pending'
+           AND notify_pending_at IS NULL`,
+      )
+      .run(new Date().toISOString());
+  }
+
   /** Idempotent on deal id — re-ingesting the same id updates, never dupes. */
   upsertRouted(
     deal: RoutedDeal,
@@ -419,40 +440,56 @@ export class Store {
         existingDeal.external_stage_updated_at !== null &&
         existingDeal.external_stage_updated_at > stage.updatedAt;
       const existingEvent = this.db
-        .prepare("SELECT key, notify_status FROM external_event_keys WHERE key = ?")
-        .get(eventKey) as { key: string; notify_status: string | null } | undefined;
+        .prepare(
+          "SELECT key FROM external_event_keys WHERE key = ?",
+        )
+        .get(eventKey) as { key: string } | undefined;
       if (existingEvent) {
-        if (existingEvent.notify_status === "failed") {
-          if (stale) return "stale";
-          const now = new Date().toISOString();
-          this.db
-            .prepare(
-              "UPDATE external_event_keys SET notify_status='pending' WHERE key = ?",
-            )
-            .run(eventKey);
-          this.db
-            .prepare(
-              `UPDATE deals
-               SET external_system=?,
-                   external_id=?,
-                   external_stage_id=?,
-                   external_stage_label=?,
-                   external_stage_updated_at=?,
-                   updated_at=?
-               WHERE id=?`,
-            )
-            .run(
-              stage.system,
-              stage.externalId,
-              stage.stageId,
-              stage.stageLabel,
-              stage.updatedAt,
-              now,
-              dealId,
-            );
-          return "notify_retry";
-        }
-        return "duplicate";
+        if (stale) return "stale";
+        const now = new Date().toISOString();
+        const cutoff = new Date(Date.now() - NOTIFY_PENDING_LEASE_MS).toISOString();
+        const lease = this.db
+          .prepare(
+            `UPDATE external_event_keys
+             SET notify_status='pending',
+                 notify_pending_at=?,
+                 notify_leases=notify_leases + 1
+             WHERE key=?
+               AND (
+                 notify_status='failed'
+                 OR (
+                   notify_status='pending'
+                   AND (
+                     notify_pending_at IS NULL
+                     OR notify_pending_at <= ?
+                     OR notify_pending_at NOT GLOB '????-??-??T??:??:??*'
+                   )
+                 )
+               )`,
+          )
+          .run(now, eventKey, cutoff) as { changes?: number };
+        if ((lease.changes ?? 0) === 0) return "duplicate";
+        this.db
+          .prepare(
+            `UPDATE deals
+             SET external_system=?,
+                 external_id=?,
+                 external_stage_id=?,
+                 external_stage_label=?,
+                 external_stage_updated_at=?,
+                 updated_at=?
+             WHERE id=?`,
+          )
+          .run(
+            stage.system,
+            stage.externalId,
+            stage.stageId,
+            stage.stageLabel,
+            stage.updatedAt,
+            now,
+            dealId,
+          );
+        return "notify_retry";
       }
 
       if (stale) return "stale";
@@ -460,9 +497,9 @@ export class Store {
       const now = new Date().toISOString();
       this.db
         .prepare(
-          "INSERT INTO external_event_keys (key, system, recorded_at, notify_status, notify_attempts) VALUES (?, ?, ?, 'pending', 0)",
+          "INSERT INTO external_event_keys (key, system, recorded_at, notify_status, notify_leases, notify_pending_at) VALUES (?, ?, ?, 'pending', 1, ?)",
         )
-        .run(eventKey, stage.system, now);
+        .run(eventKey, stage.system, now, now);
       this.db
         .prepare(
           `UPDATE deals
@@ -491,26 +528,61 @@ export class Store {
   private markExternalNotification(
     eventKey: string,
     receipts: Array<{ detail: string; status?: "ok" | "warning" }>,
+    auditFailure?: unknown,
+    expectedLeaseAt?: string,
   ): void {
     const failed = receipts.some((receipt) => receipt.status === "warning");
     const status = receipts.length === 0 ? "suppressed" : failed ? "failed" : "ok";
-    const error = failed
+    const notificationError = failed
       ? receipts
           .filter((receipt) => receipt.status === "warning")
           .map((receipt) => receipt.detail)
-          .join("; ")
-          .slice(0, 500)
+          .join("; ") || "stage notification failed"
       : null;
-    this.db
-      .prepare(
-        `UPDATE external_event_keys
-         SET notify_status = ?,
-             notify_attempts = notify_attempts + 1,
-             notified_at = ?,
-             notify_error = ?
-         WHERE key = ?`,
-      )
-      .run(status, new Date().toISOString(), error, eventKey);
+    const auditError =
+      auditFailure === undefined
+        ? null
+        : `audit_append_failed: ${
+            auditFailure instanceof Error ? auditFailure.message : String(auditFailure)
+          }`;
+    const error = [auditError, notificationError]
+      .filter((part): part is string => Boolean(part))
+      .join("; ")
+      .slice(0, 500) || null;
+    const sql =
+      expectedLeaseAt === undefined
+        ? `UPDATE external_event_keys
+           SET notify_status = ?,
+               notify_pending_at = NULL,
+               notified_at = ?,
+               notify_error = ?
+           WHERE key = ?`
+        : `UPDATE external_event_keys
+           SET notify_status = ?,
+               notify_pending_at = NULL,
+               notified_at = ?,
+               notify_error = ?
+           WHERE key = ?
+             AND notify_pending_at = ?`;
+    const result = this.db
+      .prepare(sql)
+      .run(
+        status,
+        new Date().toISOString(),
+        error,
+        eventKey,
+        ...(expectedLeaseAt === undefined ? [] : [expectedLeaseAt]),
+      ) as { changes?: number };
+    if (expectedLeaseAt !== undefined && (result.changes ?? 0) === 0) {
+      throw new Error(NOTIFICATION_LEASE_CHANGED);
+    }
+  }
+
+  externalNotificationLeaseAt(eventKey: string): string | null {
+    const row = this.db
+      .prepare("SELECT notify_pending_at FROM external_event_keys WHERE key = ?")
+      .get(eventKey) as { notify_pending_at: string | null } | undefined;
+    return row?.notify_pending_at ?? null;
   }
 
   recordExternalNotificationEvent(
@@ -519,11 +591,36 @@ export class Store {
     meta: PipelineEventMeta,
     eventKey: string,
     receipts: Array<{ detail: string; status?: "ok" | "warning" }>,
+    expectedLeaseAt?: string,
   ): void {
-    this.transaction(() => {
-      this.markExternalNotification(eventKey, receipts);
-      this.appendEvent(dealId, "routed", "routed", detail, meta);
-    });
+    try {
+      this.transaction(() => {
+        this.markExternalNotification(
+          eventKey,
+          receipts,
+          undefined,
+          expectedLeaseAt,
+        );
+        this.appendEvent(dealId, "routed", "routed", detail, meta);
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === NOTIFICATION_LEASE_CHANGED) {
+        throw err;
+      }
+      // Slack may already have accepted the post. If the audit append failed,
+      // make a best-effort lease release so a later HubSpot retry does not
+      // duplicate the user-visible notification.
+      try {
+        this.markExternalNotification(eventKey, receipts, err, expectedLeaseAt);
+      } catch (releaseErr) {
+        throw new Error(
+          `notification audit append failed and lease release also failed: ${
+            releaseErr instanceof Error ? releaseErr.message : String(releaseErr)
+          }; original failure: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      throw err;
+    }
   }
 
   private eventFromRow(r: Record<string, unknown>): PipelineEvent {
@@ -827,6 +924,9 @@ export class Store {
     const partialSyncs = count(
       "SELECT COUNT(*) n FROM deals WHERE stage='routed' AND sink_status='partial'",
     );
+    const stageNotificationAuditGaps = count(
+      "SELECT COUNT(*) n FROM external_event_keys WHERE notify_error LIKE '%audit_append_failed:%'",
+    );
 
     const quarantineByCode = Object.fromEntries(
       QUARANTINE_CODES.map((c) => [c, 0]),
@@ -873,6 +973,7 @@ export class Store {
       autoHandled: routeMix.nurture + routeMix.self_serve,
       partialSyncs,
       externallySyncedStoreErrors,
+      stageNotificationAuditGaps,
     };
   }
 

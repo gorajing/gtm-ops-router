@@ -198,4 +198,5 @@ export interface Metrics {
   autoHandled: number; // routed without consuming a rep touch (nurture+self_serve)
   partialSyncs: number; // routed rows where a secondary downstream handoff warned
   externallySyncedStoreErrors: number; // live sink succeeded, local persistence failed
+  stageNotificationAuditGaps: number; // current rows where Slack lease released but audit append failed
 }
