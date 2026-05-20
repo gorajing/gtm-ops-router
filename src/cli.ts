@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
 import {
+  type IntegrationBuild,
   integrationOptionsFromEnv,
   renderIntegrationChecks,
   runIntegrationDoctor,
@@ -40,7 +41,7 @@ function loadDotEnv(): void {
     const rawValue = line.slice(eq + 1).trim();
     const quoted = rawValue.match(/^(['"])(.*)\1$/);
     const value = quoted ? quoted[2] ?? "" : rawValue;
-    if (!process.env[key]) process.env[key] = value;
+    if (!(key in process.env)) process.env[key] = value;
   }
 }
 
@@ -79,11 +80,15 @@ function integrationMode(args: string[]): "off" | "dry-run" | "live" {
 
 function pipelineOptions(
   args: string[],
-): { label: string; opts: Partial<PipelineOptions> } {
+): {
+  label: string;
+  opts: Partial<PipelineOptions>;
+  stageChanges?: IntegrationBuild["stageChanges"];
+} {
   const mode = integrationMode(args);
   if (mode !== "off") {
     const built = integrationOptionsFromEnv(mode);
-    return { label: built.label, opts: built };
+    return { label: built.label, opts: built, stageChanges: built.stageChanges };
   }
   if (args.includes("--flaky")) {
     return {
@@ -171,11 +176,12 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
   const mode = integrationMode(args);
-  const { label, opts } = pipelineOptions(args);
+  const { label, opts, stageChanges } = pipelineOptions(args);
   const server = startServer(store, enricher, port, {
     pipelineOptions: opts,
     sinkLabel: label,
     liveIntegrations: mode === "live",
+    ...(stageChanges ? { stageChanges } : {}),
   });
   let closed = false;
   const closeStore = (): void => {
@@ -189,6 +195,7 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
       closeStore();
       process.exit(0);
     }, 2_000);
+    timer.unref();
     server.close(() => {
       clearTimeout(timer);
       closeStore();
@@ -205,6 +212,7 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   console.log(`  GET  /metrics     JSON metrics`);
   console.log(`  POST /preview     dry-run route preview`);
   console.log(`  POST /deals       ingest (single object or array)`);
+  console.log(`  POST /webhooks/hubspot  HubSpot dealstage webhook`);
   console.log(`  sink              ${label}`);
 }
 

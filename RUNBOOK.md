@@ -22,6 +22,23 @@ refuses to run because retrying create-only writes would duplicate deals.
 The local `.env` loader is intentionally simple: one `KEY=value` per line,
 optional quotes, no multiline values or inline comments.
 
+HubSpot reverse-sync: expose the server through a secure public URL for the
+demo/deployment, subscribe HubSpot to the deal `dealstage` property change
+event, and point it at `/webhooks/hubspot`. Set `HUBSPOT_WEBHOOK_SECRET` and
+`PUBLIC_BASE_URL` before using a public endpoint. If a reverse proxy must supply
+the public origin, set `TRUST_PROXY=1` only when it controls `X-Forwarded-*`
+headers. Set `HUBSPOT_NOTIFY_STAGE_IDS` to the internal HubSpot stage IDs that
+should alert Slack, for example only the ID for "Contact Made"; live mode
+refuses to run without this allowlist so a first setup cannot create a Slack
+firehose. HubSpot may retry webhook deliveries, so the router stores a
+composite event key and skips duplicate successful Slack posts.
+For local curl-only testing of the dry-run webhook, set
+`ALLOW_UNSIGNED_WEBHOOKS=1`; do not use that on a public URL.
+Webhook idempotency claims the HubSpot event in SQLite before posting Slack.
+That prevents duplicate Slack messages on HubSpot retries. If Slack fails, the
+event key is marked failed; HubSpot's next retry re-attempts only the Slack
+notification without reapplying the stage movement.
+
 ## Read the metrics
 
 - **conversion %** — routed / intake. A sudden drop = upstream lead-quality
@@ -57,6 +74,9 @@ always safe.
 - Always test a real sink with **dry-run first** (`--integrations`) — it logs
   HubSpot and Slack receipts and mutates nothing. Promote to live only after
   the event trail looks right.
+- Test HubSpot stage-change webhooks with a known router-owned deal before a
+  live walkthrough. The expected result is: dashboard HubSpot stage updates,
+  deal event trail gains `hubspot stage changed`, Slack receives one message.
 - Tune thresholds in `src/types.ts` (`HUMAN_GATE_USD`, `ICP_THRESHOLD`) and
   `src/route.ts` (`FINANCE_APPROVAL_USD`). They are named constants on purpose.
 

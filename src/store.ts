@@ -14,6 +14,7 @@
 import { createRequire } from "node:module";
 import type { DatabaseSync as DatabaseSyncT } from "node:sqlite";
 import type {
+  ExternalStageState,
   Metrics,
   PipelineEvent,
   PipelineEventMeta,
@@ -44,6 +45,7 @@ const QUARANTINE_CODES: QuarantineCode[] = [
 const SCHEMA: string[] = [
   "PRAGMA journal_mode = WAL",
   "PRAGMA foreign_keys = ON",
+  "PRAGMA busy_timeout = 5000",
   `CREATE TABLE IF NOT EXISTS deals (
      id          TEXT PRIMARY KEY,
      stage       TEXT NOT NULL,
@@ -69,6 +71,15 @@ const SCHEMA: string[] = [
      detail    TEXT NOT NULL,
      meta      TEXT
    )`,
+  `CREATE TABLE IF NOT EXISTS external_event_keys (
+     key         TEXT PRIMARY KEY,
+     system      TEXT NOT NULL,
+     recorded_at TEXT NOT NULL,
+     notify_status TEXT NOT NULL DEFAULT 'pending',
+     notify_attempts INTEGER NOT NULL DEFAULT 0,
+     notified_at TEXT,
+     notify_error TEXT
+   )`,
   "CREATE INDEX IF NOT EXISTS idx_events_deal ON events(deal_id)",
   "CREATE INDEX IF NOT EXISTS idx_events_deal_id ON events(deal_id, id DESC)",
   "CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage)",
@@ -85,8 +96,6 @@ function percentile(sorted: number[], p: number): number {
 
 export class Store {
   private db: DatabaseSyncT;
-  private txDepth = 0;
-  private savepointSeq = 0;
 
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
@@ -99,11 +108,32 @@ export class Store {
     this.ensureColumn("deals", "quarantine_code", "TEXT");
     this.ensureColumn("deals", "sink_mode", "TEXT");
     this.ensureColumn("deals", "sink_status", "TEXT");
+    this.ensureColumn("deals", "external_system", "TEXT");
+    this.ensureColumn("deals", "external_id", "TEXT");
+    this.ensureColumn("deals", "external_stage_id", "TEXT");
+    this.ensureColumn("deals", "external_stage_label", "TEXT");
+    this.ensureColumn("deals", "external_stage_updated_at", "TEXT");
+    this.ensureColumn(
+      "external_event_keys",
+      "notify_status",
+      "TEXT NOT NULL DEFAULT 'ok'",
+    );
+    this.ensureColumn(
+      "external_event_keys",
+      "notify_attempts",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    this.ensureColumn("external_event_keys", "notified_at", "TEXT");
+    this.ensureColumn("external_event_keys", "notify_error", "TEXT");
     this.backfillDerivedColumns();
     this.backfillSinkColumns();
   }
 
-  private ensureColumn(table: "deals" | "events", name: string, type: string): void {
+  private ensureColumn(
+    table: "deals" | "events" | "external_event_keys",
+    name: string,
+    type: string,
+  ): void {
     const columns = this.db
       .prepare(`PRAGMA table_info(${table})`)
       .all() as Array<{ name: string }>;
@@ -118,33 +148,17 @@ export class Store {
   }
 
   private transaction<T>(fn: () => T): T {
-    if (this.txDepth > 0) {
-      const name = `sp_${++this.savepointSeq}`;
-      this.db.prepare(`SAVEPOINT ${name}`).run();
-      this.txDepth += 1;
-      try {
-        const result = fn();
-        this.db.prepare(`RELEASE ${name}`).run();
-        return result;
-      } catch (err) {
-        this.db.prepare(`ROLLBACK TO ${name}`).run();
-        this.db.prepare(`RELEASE ${name}`).run();
-        throw err;
-      } finally {
-        this.txDepth -= 1;
-      }
-    }
     this.db.prepare("BEGIN").run();
-    this.txDepth = 1;
     try {
       const result = fn();
+      if (result instanceof Promise) {
+        throw new Error("Store.transaction callback must be synchronous");
+      }
       this.db.prepare("COMMIT").run();
       return result;
     } catch (err) {
       this.db.prepare("ROLLBACK").run();
       throw err;
-    } finally {
-      this.txDepth = 0;
     }
   }
 
@@ -163,8 +177,7 @@ export class Store {
       quarantine: string | null;
     }>;
     if (rows.length === 0) return;
-    this.db.prepare("BEGIN").run();
-    try {
+    this.transaction(() => {
       for (const row of rows) {
         try {
           this.backfillDerivedRow(row);
@@ -176,11 +189,7 @@ export class Store {
           );
         }
       }
-      this.db.prepare("COMMIT").run();
-    } catch (err) {
-      this.db.prepare("ROLLBACK").run();
-      throw err;
-    }
+    });
   }
 
   private backfillDerivedRow(row: {
@@ -261,19 +270,14 @@ export class Store {
       )
       .all() as Array<{ id: string }>;
     if (rows.length === 0) return;
-    this.db.prepare("BEGIN").run();
-    try {
+    this.transaction(() => {
       for (const row of rows) {
         const sink = this.sinkStateFromEvents(row.id);
         this.db
           .prepare("UPDATE deals SET sink_mode=?, sink_status=? WHERE id=?")
           .run(sink.mode, sink.status, row.id);
       }
-      this.db.prepare("COMMIT").run();
-    } catch (err) {
-      this.db.prepare("ROLLBACK").run();
-      throw err;
-    }
+    });
   }
 
   /** Idempotent on deal id — re-ingesting the same id updates, never dupes. */
@@ -319,10 +323,7 @@ export class Store {
 
   upsertQuarantine(q: Quarantine, latencyMs: number): void {
     const now = new Date().toISOString();
-    const sink =
-      q.code === "store_error"
-        ? this.sinkStateFromEvents(q.dealId)
-        : { mode: null, status: null };
+    const sink = this.sinkStateFromEvents(q.dealId);
     this.db
       .prepare(
         `INSERT INTO deals (
@@ -394,7 +395,146 @@ export class Store {
       );
   }
 
+  recordExternalStageChange(
+    dealId: string,
+    stage: ExternalStageState,
+    detail: string,
+    meta: PipelineEventMeta,
+    eventKey: string,
+  ): "recorded" | "duplicate" | "not_routed" | "stale" | "notify_retry" {
+    return this.transaction(() => {
+      const existingDeal = this.db
+        .prepare(
+          `SELECT id, external_stage_updated_at
+           FROM deals
+           WHERE id = ?
+             AND (stage='routed' OR sink_mode IS NOT NULL)`,
+        )
+        .get(dealId) as
+        | { id: string; external_stage_updated_at: string | null }
+        | undefined;
+      if (!existingDeal) return "not_routed";
+
+      const stale =
+        existingDeal.external_stage_updated_at !== null &&
+        existingDeal.external_stage_updated_at > stage.updatedAt;
+      const existingEvent = this.db
+        .prepare("SELECT key, notify_status FROM external_event_keys WHERE key = ?")
+        .get(eventKey) as { key: string; notify_status: string | null } | undefined;
+      if (existingEvent) {
+        if (existingEvent.notify_status === "failed") {
+          if (stale) return "stale";
+          const now = new Date().toISOString();
+          this.db
+            .prepare(
+              "UPDATE external_event_keys SET notify_status='pending' WHERE key = ?",
+            )
+            .run(eventKey);
+          this.db
+            .prepare(
+              `UPDATE deals
+               SET external_system=?,
+                   external_id=?,
+                   external_stage_id=?,
+                   external_stage_label=?,
+                   external_stage_updated_at=?,
+                   updated_at=?
+               WHERE id=?`,
+            )
+            .run(
+              stage.system,
+              stage.externalId,
+              stage.stageId,
+              stage.stageLabel,
+              stage.updatedAt,
+              now,
+              dealId,
+            );
+          return "notify_retry";
+        }
+        return "duplicate";
+      }
+
+      if (stale) return "stale";
+
+      const now = new Date().toISOString();
+      this.db
+        .prepare(
+          "INSERT INTO external_event_keys (key, system, recorded_at, notify_status, notify_attempts) VALUES (?, ?, ?, 'pending', 0)",
+        )
+        .run(eventKey, stage.system, now);
+      this.db
+        .prepare(
+          `UPDATE deals
+           SET external_system=?,
+               external_id=?,
+               external_stage_id=?,
+               external_stage_label=?,
+               external_stage_updated_at=?,
+               updated_at=?
+           WHERE id=?`,
+        )
+        .run(
+          stage.system,
+          stage.externalId,
+          stage.stageId,
+          stage.stageLabel,
+          stage.updatedAt,
+          now,
+          dealId,
+        );
+      this.appendEvent(dealId, "routed", "routed", detail, meta);
+      return "recorded";
+    });
+  }
+
+  private markExternalNotification(
+    eventKey: string,
+    receipts: Array<{ detail: string; status?: "ok" | "warning" }>,
+  ): void {
+    const failed = receipts.some((receipt) => receipt.status === "warning");
+    const status = receipts.length === 0 ? "suppressed" : failed ? "failed" : "ok";
+    const error = failed
+      ? receipts
+          .filter((receipt) => receipt.status === "warning")
+          .map((receipt) => receipt.detail)
+          .join("; ")
+          .slice(0, 500)
+      : null;
+    this.db
+      .prepare(
+        `UPDATE external_event_keys
+         SET notify_status = ?,
+             notify_attempts = notify_attempts + 1,
+             notified_at = ?,
+             notify_error = ?
+         WHERE key = ?`,
+      )
+      .run(status, new Date().toISOString(), error, eventKey);
+  }
+
+  recordExternalNotificationEvent(
+    dealId: string,
+    detail: string,
+    meta: PipelineEventMeta,
+    eventKey: string,
+    receipts: Array<{ detail: string; status?: "ok" | "warning" }>,
+  ): void {
+    this.transaction(() => {
+      this.markExternalNotification(eventKey, receipts);
+      this.appendEvent(dealId, "routed", "routed", detail, meta);
+    });
+  }
+
   private eventFromRow(r: Record<string, unknown>): PipelineEvent {
+    let meta: PipelineEventMeta | undefined;
+    if (typeof r.meta === "string" && r.meta.length > 0) {
+      try {
+        meta = JSON.parse(r.meta) as PipelineEventMeta;
+      } catch {
+        meta = undefined;
+      }
+    }
     return {
       id: Number(r.id),
       dealId: String(r.deal_id),
@@ -402,9 +542,7 @@ export class Store {
       from: r.from_st as Stage | "-",
       to: r.to_st as Stage,
       detail: String(r.detail),
-      ...(typeof r.meta === "string" && r.meta.length > 0
-        ? { meta: JSON.parse(r.meta) as PipelineEventMeta }
-        : {}),
+      ...(meta ? { meta } : {}),
     };
   }
 
@@ -486,6 +624,7 @@ export class Store {
     deal: RoutedDeal;
     updatedAt: string;
     sinkStatus: "synced" | "partial" | "dry_run" | "needs_review";
+    externalStage: ExternalStageState | null;
   }> {
     const cappedLimit =
       limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
@@ -493,14 +632,43 @@ export class Store {
       cappedLimit === undefined
         ? (this.db
             .prepare(
-              "SELECT payload, updated_at, sink_status FROM deals WHERE stage='routed' ORDER BY updated_at",
+              `SELECT payload, updated_at, sink_status, external_system,
+                      external_id, external_stage_id, external_stage_label,
+                      external_stage_updated_at
+               FROM deals
+               WHERE stage='routed'
+               ORDER BY updated_at DESC`,
             )
-            .all() as { payload: string; updated_at: string; sink_status: string | null }[])
+            .all() as Array<{
+            payload: string;
+            updated_at: string;
+            sink_status: string | null;
+            external_system: string | null;
+            external_id: string | null;
+            external_stage_id: string | null;
+            external_stage_label: string | null;
+            external_stage_updated_at: string | null;
+          }>)
         : (this.db
             .prepare(
-              "SELECT payload, updated_at, sink_status FROM deals WHERE stage='routed' ORDER BY updated_at DESC LIMIT ?",
+              `SELECT payload, updated_at, sink_status, external_system,
+                      external_id, external_stage_id, external_stage_label,
+                      external_stage_updated_at
+               FROM deals
+               WHERE stage='routed'
+               ORDER BY updated_at DESC
+               LIMIT ?`,
             )
-            .all(cappedLimit) as { payload: string; updated_at: string; sink_status: string | null }[]);
+            .all(cappedLimit) as Array<{
+            payload: string;
+            updated_at: string;
+            sink_status: string | null;
+            external_system: string | null;
+            external_id: string | null;
+            external_stage_id: string | null;
+            external_stage_label: string | null;
+            external_stage_updated_at: string | null;
+          }>);
     return rows.map((r) => ({
       deal: JSON.parse(r.payload) as RoutedDeal,
       updatedAt: r.updated_at,
@@ -510,7 +678,29 @@ export class Store {
         r.sink_status === "dry_run"
           ? r.sink_status
           : "needs_review",
+      externalStage: this.externalStageFromRow(r),
     }));
+  }
+
+  private externalStageFromRow(r: {
+    external_system: string | null;
+    external_id: string | null;
+    external_stage_id: string | null;
+    external_stage_label: string | null;
+    external_stage_updated_at: string | null;
+  }): ExternalStageState | null {
+    return r.external_system === "hubspot" &&
+      r.external_id &&
+      r.external_stage_id &&
+      r.external_stage_updated_at
+      ? {
+          system: "hubspot",
+          externalId: r.external_id,
+          stageId: r.external_stage_id,
+          stageLabel: r.external_stage_label,
+          updatedAt: r.external_stage_updated_at,
+        }
+      : null;
   }
 
   quarantined(limit?: number): Quarantine[] {
@@ -519,24 +709,51 @@ export class Store {
 
   quarantinedRecords(
     limit?: number,
-  ): Array<{ quarantine: Quarantine; updatedAt: string }> {
+  ): Array<{
+    quarantine: Quarantine;
+    updatedAt: string;
+    externalStage: ExternalStageState | null;
+  }> {
     const cappedLimit =
       limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
     const rows =
       cappedLimit === undefined
         ? (this.db
             .prepare(
-              "SELECT quarantine, updated_at FROM deals WHERE stage='quarantined' ORDER BY updated_at",
+              `SELECT quarantine, updated_at, external_system, external_id,
+                      external_stage_id, external_stage_label,
+                      external_stage_updated_at
+               FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC`,
             )
-            .all() as { quarantine: string; updated_at: string }[])
+            .all() as Array<{
+            quarantine: string;
+            updated_at: string;
+            external_system: string | null;
+            external_id: string | null;
+            external_stage_id: string | null;
+            external_stage_label: string | null;
+            external_stage_updated_at: string | null;
+          }>)
         : (this.db
             .prepare(
-              "SELECT quarantine, updated_at FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC LIMIT ?",
+              `SELECT quarantine, updated_at, external_system, external_id,
+                      external_stage_id, external_stage_label,
+                      external_stage_updated_at
+               FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC LIMIT ?`,
             )
-            .all(cappedLimit) as { quarantine: string; updated_at: string }[]);
+            .all(cappedLimit) as Array<{
+            quarantine: string;
+            updated_at: string;
+            external_system: string | null;
+            external_id: string | null;
+            external_stage_id: string | null;
+            external_stage_label: string | null;
+            external_stage_updated_at: string | null;
+          }>);
     return rows.map((r) => ({
       quarantine: JSON.parse(r.quarantine) as Quarantine,
       updatedAt: r.updated_at,
+      externalStage: this.externalStageFromRow(r),
     }));
   }
 

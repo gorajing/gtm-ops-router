@@ -36,6 +36,14 @@ export type Stage =
   | "routed"
   | "quarantined";
 
+export interface ExternalStageState {
+  system: "hubspot";
+  externalId: string;
+  stageId: string;
+  stageLabel: string | null;
+  updatedAt: string;
+}
+
 // ── Intake: validated at the boundary, never trusted raw ────────────────────
 export const RawDealInput = z.object({
   id: z.string().min(1).optional(),
@@ -140,6 +148,29 @@ export type PipelineEventMeta =
   | {
       kind: "sink";
       mode: "dry_run" | "live";
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | {
+      kind: "hubspot_stage_claim";
+      mode: "dry_run" | "live";
+      hubspotDealId: string;
+      eventKey: string;
+      toStageId: string;
+      toStageLabel: string | null;
+    }
+  | {
+      kind: "hubspot_stage_change";
+      mode: "dry_run" | "live";
+      hubspotDealId: string;
+      eventKey: string;
+      toStageId: string;
+      toStageLabel: string | null;
       receipts: Array<{
         system: string;
         externalId: string;

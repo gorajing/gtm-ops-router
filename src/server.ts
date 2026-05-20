@@ -8,6 +8,7 @@
  *   GET  /healthz             liveness
  *   POST /preview             validate/enrich/score/route without persistence
  *   POST /deals               ingest one deal or an array
+ *   POST /webhooks/hubspot    receive HubSpot dealstage changes
  *
  * This is a local/operator-console surface. Put auth in front of it before
  * exposing it beyond localhost or a trusted internal network.
@@ -20,7 +21,10 @@ import {
 } from "node:http";
 import type { Enricher } from "./enrich.js";
 import {
+  type HubSpotStageChangeHandler,
   type IntegrationCheck,
+  type ResolvedHubSpotStageChange,
+  WebhookPayloadError,
   runIntegrationDoctor,
 } from "./integrations.js";
 import { normalize } from "./intake.js";
@@ -40,7 +44,8 @@ const STATE_EVENTS_PER_DEAL = 50;
 const HEALTH_TTL_MS = 35_000;
 const MAX_BATCH_DEALS = 250;
 const MAX_LIVE_BATCH_DEALS = 5;
-const HEALTH_FAILURE_TTL_MS = 5_000;
+// Failed checks back off longer to avoid hammering Slack/HubSpot during an outage.
+const HEALTH_FAILURE_TTL_MS = 120_000;
 
 function money(n: number): string {
   return "$" + Math.round(n).toLocaleString("en-US");
@@ -81,7 +86,14 @@ interface ConsoleDeal {
   route: string;
   reason: string;
   status: "synced" | "partial" | "dry_run" | "needs_review" | "quarantined";
-  updatedAt: string | null;
+  updatedAt: string;
+  externalStage?: {
+    system: "hubspot";
+    externalId: string;
+    stageId: string;
+    stageLabel: string | null;
+    updatedAt: string;
+  } | null;
   scoreTotal?: number;
   scoreNotes?: string[];
   sourceChannel?: string;
@@ -119,7 +131,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     quarantined.map((record) => record.quarantine.dealId),
   );
 
-  const routedQueue: ConsoleDeal[] = routed.map(({ deal, updatedAt, sinkStatus }) => {
+  const routedQueue: ConsoleDeal[] = routed.map(({ deal, updatedAt, sinkStatus, externalStage }) => {
     return {
       id: deal.id,
       company: deal.company,
@@ -129,27 +141,31 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
       reason: routeReason(deal),
       status: sinkStatus,
       updatedAt,
+      externalStage,
       scoreTotal: deal.score.total,
       scoreNotes: deal.score.notes,
       sourceChannel: deal.sourceChannel,
       statedNeed: deal.statedNeed,
     };
   });
-  const quarantinedQueue: ConsoleDeal[] = quarantined.map(({ quarantine, updatedAt }) => {
-    return {
-      id: quarantine.dealId,
-      company: quarantineCompany(quarantine, quarantineLabels),
-      stage: "quarantined",
-      amount: 0,
-      route: "-",
-      reason: quarantine.code,
-      status: "quarantined",
-      updatedAt,
-      quarantine,
-    };
-  });
+  const quarantinedQueue: ConsoleDeal[] = quarantined.map(
+    ({ quarantine, updatedAt, externalStage }) => {
+      return {
+        id: quarantine.dealId,
+        company: quarantineCompany(quarantine, quarantineLabels),
+        stage: "quarantined",
+        amount: 0,
+        route: "-",
+        reason: quarantine.code,
+        status: "quarantined",
+        updatedAt,
+        quarantine,
+        externalStage,
+      };
+    },
+  );
   const queue = [...routedQueue, ...quarantinedQueue].sort((a, b) =>
-    (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
+    b.updatedAt.localeCompare(a.updatedAt),
   );
   const integrity = store.integrity();
 
@@ -280,7 +296,6 @@ function consoleHtml(sinkLabel: string): string {
 const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 let state = null;
 let selectedId = null;
-const eventCache = new Map();
 let stateRequestSeq = 0;
 let healthRequestSeq = 0;
 let detailRequestSeq = 0;
@@ -378,16 +393,20 @@ function renderQueue(){
   }
   const table = el("table");
   const head = document.createElement("tr");
-  ["Status", "Company", "ARR", "Route", "Reason"].forEach((h) => head.append(el("th", null, h)));
+  ["Status", "Company", "ARR", "Route", "HubSpot Stage", "Reason"].forEach((h) => head.append(el("th", null, h)));
   table.append(head);
   for (const deal of state.queue) {
     const row = el("tr", "selectable" + (deal.id === selectedId ? " selected" : ""));
     row.addEventListener("click", () => { selectedId = deal.id; renderQueue(); renderDetail(); });
+    const hubspotStage = deal.externalStage
+      ? (deal.externalStage.stageLabel || deal.externalStage.stageId)
+      : "-";
     row.append(
       cell(deal.status, statusClass(deal.status)),
       cell(deal.company),
       cell(deal.amount ? fmtMoney.format(deal.amount) : "-"),
       cell(routeText(deal)),
+      cell(hubspotStage),
       cell(deal.reason || "-")
     );
     table.append(row);
@@ -395,10 +414,7 @@ function renderQueue(){
   root.replaceChildren(table);
 }
 async function dealEvents(dealId){
-  if (eventCache.has(dealId)) return eventCache.get(dealId);
-  const loaded = await fetchJson("/deals/" + encodeURIComponent(dealId) + "/events");
-  eventCache.set(dealId, loaded);
-  return loaded;
+  return fetchJson("/deals/" + encodeURIComponent(dealId) + "/events");
 }
 function cell(text, className){
   const td = el("td", className, text);
@@ -421,25 +437,14 @@ function receiptBadges(events){
       }
       continue;
     }
-    // Legacy rows written before structured sink metadata carried receipt data
-    // only in the event detail string.
-    const hub = event.detail.match(/hubspot:([^ ]+) ([^|]+)/);
-    const slack = event.detail.match(/slack:([^ ]+) ([^|]+)/);
-    const url = event.detail.match(/https:\\/\\/[^ )]+/);
-    if (hub) {
-      const badge = el("span", "receipt pass", "HubSpot " + hub[1]);
-      if (url) {
-        const link = el("a", "receipt pass", "Open HubSpot");
-        link.href = url[0];
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        wrap.append(badge);
-        wrap.append(link);
-      } else {
-        wrap.append(badge);
+    if (event.meta && event.meta.kind === "hubspot_stage_change") {
+      if (!event.meta.receipts.length) continue;
+      wrap.append(el("span", "receipt pass", "HubSpot stage " + (event.meta.toStageLabel || event.meta.toStageId)));
+      for (const receipt of event.meta.receipts) {
+        wrap.append(el("span", receipt.status === "warning" ? "receipt warn" : "receipt violet", receipt.system + " " + receipt.externalId));
       }
+      continue;
     }
-    if (slack) wrap.append(el("span", "receipt violet", "Slack " + slack[1]));
   }
   return wrap;
 }
@@ -495,6 +500,11 @@ async function renderDetail(){
     ["Reason", deal.reason || "-"],
     ["ARR", deal.amount ? fmtMoney.format(deal.amount) : "-"]
   ];
+  if (deal.externalStage) {
+    fields.push(["HubSpot ID", deal.externalStage.externalId]);
+    fields.push(["HubSpot Stage", deal.externalStage.stageLabel || deal.externalStage.stageId]);
+    fields.push(["Stage Updated", deal.externalStage.updatedAt]);
+  }
   if (deal.scoreTotal !== undefined) {
     fields.push(["Score", deal.scoreTotal.toFixed(2)]);
     fields.push(["Source", deal.sourceChannel || "-"]);
@@ -533,13 +543,12 @@ async function loadState(){
     const next = await fetchJson("/state");
     if (seq !== stateRequestSeq) return;
     state = next;
-    eventCache.clear();
     if (!selectedId && state.queue[0]) selectedId = state.queue[0].id;
     qs("#last-refresh").textContent = new Date().toLocaleTimeString();
     renderKpis();
     renderQueue();
     renderExceptions();
-  void renderDetail();
+    void renderDetail();
   } catch (err) {
     if (seq !== stateRequestSeq) return;
     qs("#last-refresh").textContent = "state error " + new Date().toLocaleTimeString();
@@ -605,7 +614,6 @@ qs("#deal-form").addEventListener("submit", async (event) => {
     const first = body.outcomes && body.outcomes[0];
     if (first && first.ok) {
       selectedId = first.deal.id;
-      eventCache.delete(first.deal.id);
     }
     root.textContent = "Processed " + body.processed + " | routed " + body.routed + " | quarantined " + body.quarantined;
     await loadState();
@@ -665,20 +673,10 @@ function parseJsonBody(raw: string): unknown {
   return JSON.parse(raw);
 }
 
-function bodyErrorStatus(err: unknown): 400 | 413 {
-  return err instanceof Error && err.message === "request body too large"
-    ? 413
-    : 400;
-}
-
-function bodyErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : "body is not valid JSON";
-}
-
 function sendBodyError(res: ServerResponse, err: unknown): void {
-  const msg = bodyErrorMessage(err);
-  json(res, bodyErrorStatus(err), {
-    error: msg === "request body too large" ? msg : "body is not valid JSON",
+  const tooLarge = err instanceof Error && err.message === "request body too large";
+  json(res, tooLarge ? 413 : 400, {
+    error: tooLarge ? "request body too large" : "body is not valid JSON",
   });
 }
 
@@ -703,15 +701,23 @@ function safeDecodeURIComponent(value: string): string | null {
 
 type HealthLoader = () => Promise<IntegrationCheck[]>;
 
+interface ServerOptions {
+  pipelineOptions?: Partial<PipelineOptions>;
+  sinkLabel?: string;
+  liveIntegrations?: boolean;
+  stageChanges?: HubSpotStageChangeHandler;
+}
+
+interface RequestUrlOptions {
+  publicBaseUrl: string | undefined;
+  trustProxy: boolean;
+}
+
 export function startServer(
   store: Store,
   enricher: Enricher,
   port: number,
-  options: {
-    pipelineOptions?: Partial<PipelineOptions>;
-    sinkLabel?: string;
-    liveIntegrations?: boolean;
-  } = {},
+  options: ServerOptions = {},
 ): ReturnType<typeof createServer> {
   const sinkLabel = options.sinkLabel ?? "logging";
   const integrationHealthEnabled = options.liveIntegrations === true;
@@ -719,6 +725,10 @@ export function startServer(
     | { at: number; ttlMs: number; checks: IntegrationCheck[] }
     | undefined;
   let healthInFlight: Promise<IntegrationCheck[]> | undefined;
+  const requestUrlOptions: RequestUrlOptions = {
+    publicBaseUrl: process.env.PUBLIC_BASE_URL,
+    trustProxy: process.env.TRUST_PROXY === "1",
+  };
   const loadHealth: HealthLoader = async () => {
     if (!integrationHealthEnabled) {
       return [
@@ -751,7 +761,16 @@ export function startServer(
   const html = consoleHtml(sinkLabel);
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handleRequest(req, res, store, enricher, loadHealth, html, options).catch(
+    void handleRequest(
+      req,
+      res,
+      store,
+      enricher,
+      loadHealth,
+      html,
+      options,
+      requestUrlOptions,
+    ).catch(
       (err: unknown) => {
         if (!res.headersSent) {
           json(res, 500, {
@@ -767,6 +786,221 @@ export function startServer(
   return server;
 }
 
+function incomingHeader(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name.toLowerCase()];
+  const first = Array.isArray(value) ? value[0] : value;
+  return typeof first === "string" && first.length > 0 ? first : undefined;
+}
+
+function requestAbsoluteUrl(
+  req: IncomingMessage,
+  options: RequestUrlOptions,
+): string {
+  if (options.publicBaseUrl) {
+    const base = new URL(options.publicBaseUrl);
+    base.pathname = "/";
+    base.search = "";
+    base.hash = "";
+    return new URL(req.url ?? "/", base).toString();
+  }
+  const proto = options.trustProxy
+    ? incomingHeader(req, "x-forwarded-proto") ?? "http"
+    : "http";
+  const host = options.trustProxy
+    ? incomingHeader(req, "x-forwarded-host") ?? incomingHeader(req, "host") ?? "localhost"
+    : incomingHeader(req, "host") ?? "localhost";
+  return `${proto}://${host}${req.url ?? "/"}`;
+}
+
+function stageName(change: ResolvedHubSpotStageChange): string {
+  return change.toStageLabel
+    ? `${change.toStageLabel} (${change.toStageId})`
+    : change.toStageId;
+}
+
+async function handleHubSpotWebhook(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  handler: HubSpotStageChangeHandler | undefined,
+  urlOptions: RequestUrlOptions,
+): Promise<void> {
+  if (!handler) {
+    json(res, 404, {
+      error:
+        "HubSpot webhooks are disabled; start the server with --integrations or --live-integrations",
+    });
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let rawBody: string;
+  try {
+    rawBody = await readBody(req);
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const request = {
+    method: req.method ?? "POST",
+    absoluteUrl: requestAbsoluteUrl(req, urlOptions),
+    rawBody,
+    headers: req.headers,
+  };
+  if (!handler.verify(request)) {
+    json(res, 401, { error: "invalid HubSpot signature" });
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(rawBody);
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  let changes: ResolvedHubSpotStageChange[];
+  let malformed = 0;
+  let noRouterId = 0;
+  try {
+    const resolved = await handler.resolve(parsed);
+    changes = resolved.changes;
+    malformed = resolved.droppedMalformed;
+    noRouterId = resolved.droppedNoRouterId;
+  } catch (err) {
+    json(res, err instanceof WebhookPayloadError ? 400 : 502, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  if (malformed > 0) {
+    console.error(`hubspot webhook dropped ${malformed} malformed dealstage event(s)`);
+  }
+
+  const results: Array<{
+    status: "recorded" | "duplicate" | "not_routed" | "stale" | "notify_retry";
+    routerDealId: string;
+    hubspotDealId: string;
+    toStage: string;
+    receipts: number;
+  }> = [];
+
+  for (const change of changes) {
+    const recorded = store.recordExternalStageChange(
+      change.routerDealId,
+      {
+        system: "hubspot",
+        externalId: change.hubspotDealId,
+        stageId: change.toStageId,
+        stageLabel: change.toStageLabel,
+        updatedAt: change.occurredAt,
+      },
+      `hubspot stage changed: ${stageName(change)}`,
+      {
+        kind: "hubspot_stage_claim",
+        mode: handler.eventMode,
+        hubspotDealId: change.hubspotDealId,
+        eventKey: change.eventKey,
+        toStageId: change.toStageId,
+        toStageLabel: change.toStageLabel,
+      },
+      change.eventKey,
+    );
+    if (recorded !== "recorded" && recorded !== "notify_retry") {
+      results.push({
+        status: recorded,
+        routerDealId: change.routerDealId,
+        hubspotDealId: change.hubspotDealId,
+        toStage: stageName(change),
+        receipts: 0,
+      });
+      continue;
+    }
+
+    let receipts: Array<{
+      system: string;
+      externalId: string;
+      detail: string;
+      status?: "ok" | "warning";
+      url?: string;
+    }>;
+    try {
+      receipts = await handler.notify(change);
+    } catch (err) {
+      receipts = [
+        {
+          system: "slack",
+          externalId: "stage-change",
+          detail: `stage-change notification failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          status: "warning",
+        },
+      ];
+    }
+    const notificationDetail =
+      recorded === "notify_retry"
+        ? "hubspot stage notification retry"
+        : receipts.length > 0
+          ? "hubspot stage notification"
+          : "hubspot stage notification suppressed by HUBSPOT_NOTIFY_STAGE_IDS";
+    try {
+      store.recordExternalNotificationEvent(
+        change.routerDealId,
+        notificationDetail,
+        {
+          kind: "hubspot_stage_change",
+          mode: handler.eventMode,
+          hubspotDealId: change.hubspotDealId,
+          eventKey: change.eventKey,
+          toStageId: change.toStageId,
+          toStageLabel: change.toStageLabel,
+          receipts,
+        },
+        change.eventKey,
+        receipts,
+      );
+    } catch (err) {
+      console.error(
+        `hubspot webhook could not append notification event: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    results.push({
+      status: recorded,
+      routerDealId: change.routerDealId,
+      hubspotDealId: change.hubspotDealId,
+      toStage: stageName(change),
+      receipts: receipts.length,
+    });
+  }
+
+  json(res, 200, {
+    processed: results.filter((r) => r.status === "recorded").length,
+    notificationRetries: results.filter((r) => r.status === "notify_retry").length,
+    duplicates: results.filter((r) => r.status === "duplicate").length,
+    notRouted: results.filter((r) => r.status === "not_routed").length,
+    stale: results.filter((r) => r.status === "stale").length,
+    malformed,
+    noRouterId,
+    ignored: Math.max(
+      0,
+      (Array.isArray(parsed) ? parsed.length : 0) -
+        changes.length -
+        malformed -
+        noRouterId,
+    ),
+    ...(changes.length === 0 ? { ignoredReason: "no dealstage events in payload" } : {}),
+    results,
+  });
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -774,11 +1008,8 @@ async function handleRequest(
   enricher: Enricher,
   loadHealth: HealthLoader,
   html: string,
-  options: {
-    pipelineOptions?: Partial<PipelineOptions>;
-    sinkLabel?: string;
-    liveIntegrations?: boolean;
-  },
+  options: ServerOptions,
+  requestUrlOptions: RequestUrlOptions,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost").pathname;
   const method = req.method === "HEAD" ? "GET" : req.method;
@@ -811,6 +1042,10 @@ async function handleRequest(
     return;
   }
   if (method === "GET" && url === "/integration-health") {
+    if (head) {
+      json(res, 200, [], true);
+      return;
+    }
     json(res, 200, await loadHealth(), head);
     return;
   }
@@ -835,6 +1070,16 @@ async function handleRequest(
       return;
     }
     json(res, 200, await previewDeal(parsed, enricher));
+    return;
+  }
+  if (method === "POST" && url === "/webhooks/hubspot") {
+    await handleHubSpotWebhook(
+      req,
+      res,
+      store,
+      options.stageChanges,
+      requestUrlOptions,
+    );
     return;
   }
   if (method === "POST" && url === "/deals") {

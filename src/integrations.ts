@@ -7,6 +7,7 @@
  * real HTTP writes.
  */
 
+import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   DEFAULT_RETRY,
   RetryableSinkError,
@@ -21,6 +22,9 @@ import type { RoutedDeal } from "./types.js";
 
 type FetchLike = typeof fetch;
 const DEFAULT_FETCH_TIMEOUT_MS = 8_000;
+
+export class WebhookPayloadError extends Error {}
+class HubSpotDealUnmappedError extends Error {}
 
 export interface IntegrationSinkConfig {
   mode: "dry-run" | "live";
@@ -41,6 +45,7 @@ export interface IntegrationBuild {
   dryRun: boolean;
   sink: OpportunitySink;
   label: string;
+  stageChanges: HubSpotStageChangeHandler;
 }
 
 export type IntegrationCheckStatus = "pass" | "warn" | "fail";
@@ -63,7 +68,6 @@ export interface IntegrationDoctorOptions {
 interface HubSpotUpsertResponse {
   results?: Array<{
     id?: unknown;
-    new?: unknown;
     url?: unknown;
   }>;
   errors?: unknown[];
@@ -74,6 +78,72 @@ interface SlackPostResponse {
   error?: unknown;
   ts?: unknown;
   channel?: unknown;
+}
+
+interface HubSpotDealResponse {
+  id?: unknown;
+  properties?: Record<string, unknown>;
+}
+
+export interface HubSpotStageWebhookEvent {
+  eventKey: string;
+  hubspotDealId: string;
+  portalId: string | null;
+  eventId: string;
+  propertyName: string;
+  toStageId: string;
+  toStageLabel: string | null;
+  routerDealId: string | null;
+  dealName: string | null;
+  occurredAt: string;
+  source: string | null;
+}
+
+interface HubSpotStageParseResult {
+  events: HubSpotStageWebhookEvent[];
+  dropped: number;
+}
+
+export interface ResolvedHubSpotStageChange {
+  eventKey: string;
+  routerDealId: string;
+  hubspotDealId: string;
+  portalId: string | null;
+  eventId: string;
+  toStageId: string;
+  toStageLabel: string | null;
+  dealName: string | null;
+  occurredAt: string;
+  source: string | null;
+}
+
+export interface HubSpotStageResolveResult {
+  changes: ResolvedHubSpotStageChange[];
+  droppedMalformed: number;
+  droppedNoRouterId: number;
+}
+
+export interface HubSpotWebhookRequest {
+  method: string;
+  absoluteUrl: string;
+  rawBody: string;
+  headers: NodeJS.Dict<string | string[] | undefined>;
+  now?: () => Date;
+}
+
+interface HubSpotStageChangeConfig {
+  mode: "dry-run" | "live";
+  hubspotAccessToken: string | undefined;
+  hubspotExternalIdProperty: string;
+  hubspotApiBase: string;
+  hubspotPortalId: string | undefined;
+  hubspotWebhookSecret: string | undefined;
+  hubspotNotifyStageIds: string[];
+  slackBotToken: string | undefined;
+  slackChannelId: string;
+  slackApiBase: string;
+  fetchImpl: FetchLike;
+  allowUnsignedWebhooks: boolean;
 }
 
 interface HubSpotPropertyResponse {
@@ -99,6 +169,12 @@ interface HubSpotPipelineResponse {
 function fetchTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = Number(env.INTEGRATION_FETCH_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+function webhookFetchTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = Number(env.HUBSPOT_WEBHOOK_FETCH_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw > 0) return Math.min(Math.round(raw), 4_500);
+  return 3_000;
 }
 
 function withFetchTimeout(fetchImpl: FetchLike, timeoutMs: number): FetchLike {
@@ -206,15 +282,98 @@ function escapeSlackMrkdwn(s: string): string {
   return s
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replace(/([*_~`])/g, "\\$1");
+}
+
+function headerValue(
+  headers: NodeJS.Dict<string | string[] | undefined>,
+  name: string,
+): string | undefined {
+  const direct = headers[name] ?? headers[name.toLowerCase()];
+  const value = Array.isArray(direct) ? direct[0] : direct;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+const HUBSPOT_V3_URI_DECODES: Array<[RegExp, string]> = [
+  [/%3A/gi, ":"],
+  [/%2F/gi, "/"],
+  [/%3F/gi, "?"],
+  [/%40/gi, "@"],
+  [/%21/gi, "!"],
+  [/%24/gi, "$"],
+  [/%27/gi, "'"],
+  [/%28/gi, "("],
+  [/%29/gi, ")"],
+  [/%2A/gi, "*"],
+  [/%2C/gi, ","],
+  [/%3B/gi, ";"],
+];
+
+function normalizeHubSpotV3Uri(uri: string): string {
+  let normalized = uri;
+  for (const [pattern, value] of HUBSPOT_V3_URI_DECODES) {
+    normalized = normalized.replace(pattern, value);
+  }
+  return normalized;
+}
+
+export function hubSpotV3Signature(
+  secret: string,
+  method: string,
+  absoluteUrl: string,
+  rawBody: string,
+  timestamp: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(
+      method.toUpperCase() +
+        normalizeHubSpotV3Uri(absoluteUrl) +
+        rawBody +
+        timestamp,
+    )
+    .digest("base64");
+}
+
+export function verifyHubSpotV3Signature(
+  secret: string,
+  request: HubSpotWebhookRequest,
+): boolean {
+  const signature = headerValue(request.headers, "x-hubspot-signature-v3");
+  const timestamp = headerValue(request.headers, "x-hubspot-request-timestamp");
+  if (!signature || !timestamp) return false;
+  const timestampMs = Number(timestamp);
+  if (!Number.isInteger(timestampMs)) return false;
+  const now = request.now?.() ?? new Date();
+  const skewMs = timestampMs - now.getTime();
+  if (Math.abs(skewMs) > 300_000) return false;
+
+  const expected = hubSpotV3Signature(
+    secret,
+    request.method,
+    request.absoluteUrl,
+    request.rawBody,
+    timestamp,
+  );
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const receivedBytes = Buffer.from(signature, "utf8");
+  return (
+    expectedBytes.length === receivedBytes.length &&
+    timingSafeEqual(expectedBytes, receivedBytes)
+  );
 }
 
 function bodyMessage(body: unknown): string {
-  if (typeof body === "string") return body.slice(0, 500);
+  const scrub = (s: string): string =>
+    s
+      .replace(/xox[baprs]-[A-Za-z0-9-]+/g, "[redacted-slack-token]")
+      .replace(/\bpat-[A-Za-z0-9_-]{20,}\b/g, "[redacted-hubspot-token]")
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]");
+  if (typeof body === "string") return scrub(body).slice(0, 500);
   try {
-    return JSON.stringify(body).slice(0, 500);
+    return scrub(JSON.stringify(body)).slice(0, 500);
   } catch {
-    return String(body);
+    return scrub(String(body));
   }
 }
 
@@ -293,6 +452,35 @@ function integrationConfigFromEnv(
   };
 }
 
+function csvEnv(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
+function stageChangeConfigFromEnv(
+  mode: "dry-run" | "live",
+  env: NodeJS.ProcessEnv,
+  fetchImpl: FetchLike,
+): HubSpotStageChangeConfig {
+  const sink = integrationConfigFromEnv(mode, env, fetchImpl);
+  return {
+    mode,
+    hubspotAccessToken: sink.hubspotAccessToken,
+    hubspotExternalIdProperty: sink.hubspotExternalIdProperty,
+    hubspotApiBase: sink.hubspotApiBase,
+    hubspotPortalId: sink.hubspotPortalId,
+    hubspotWebhookSecret: env.HUBSPOT_WEBHOOK_SECRET,
+    hubspotNotifyStageIds: csvEnv(env.HUBSPOT_NOTIFY_STAGE_IDS),
+    slackBotToken: sink.slackBotToken,
+    slackChannelId: sink.slackChannelId,
+    slackApiBase: sink.slackApiBase,
+    fetchImpl: withFetchTimeout(fetchImpl, webhookFetchTimeoutMs(env)),
+    allowUnsignedWebhooks: env.ALLOW_UNSIGNED_WEBHOOKS === "1",
+  };
+}
+
 function missingLiveEnv(
   cfg: IntegrationSinkConfig,
   env: NodeJS.ProcessEnv,
@@ -302,17 +490,41 @@ function missingLiveEnv(
     env.HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY
       ? ""
       : "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
+    env.HUBSPOT_WEBHOOK_SECRET ? "" : "HUBSPOT_WEBHOOK_SECRET",
+    env.PUBLIC_BASE_URL ? "" : "PUBLIC_BASE_URL",
+    env.HUBSPOT_NOTIFY_STAGE_IDS ? "" : "HUBSPOT_NOTIFY_STAGE_IDS",
     cfg.slackBotToken ? "" : "SLACK_BOT_TOKEN",
     env.SLACK_CHANNEL_ID ? "" : "SLACK_CHANNEL_ID",
   ].filter(Boolean);
 }
 
-function invalidLiveEnv(cfg: IntegrationSinkConfig): string[] {
+function invalidPublicBaseUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol !== "https:" ||
+      url.pathname !== "/" ||
+      url.search.length > 0 ||
+      url.hash.length > 0
+    );
+  } catch {
+    return true;
+  }
+}
+
+function invalidLiveEnv(
+  cfg: IntegrationSinkConfig,
+  env: NodeJS.ProcessEnv,
+): string[] {
   const invalid: string[] = [];
   if (!/^[a-z][a-z0-9_]*$/i.test(cfg.hubspotExternalIdProperty)) {
     invalid.push("HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY");
   }
-  if (!/^[CGD][A-Z0-9]{2,}$/.test(cfg.slackChannelId)) {
+  if (invalidPublicBaseUrl(env.PUBLIC_BASE_URL)) {
+    invalid.push("PUBLIC_BASE_URL");
+  }
+  if (!/^[CGD][A-Z0-9]{8,}$/.test(cfg.slackChannelId)) {
     invalid.push("SLACK_CHANNEL_ID");
   }
   return invalid;
@@ -661,9 +873,12 @@ export async function runIntegrationDoctor(
   }
   checks.push(checkLine("env", "required variables", "pass", "all present"));
 
-  checks.push(await checkHubSpotProperty(cfg));
-  checks.push(await checkHubSpotPipelineStage(cfg));
-  checks.push(await checkSlackAuth(cfg));
+  const [propertyCheck, pipelineCheck, slackAuthCheck] = await Promise.all([
+    checkHubSpotProperty(cfg),
+    checkHubSpotPipelineStage(cfg),
+    checkSlackAuth(cfg),
+  ]);
+  checks.push(propertyCheck, pipelineCheck, slackAuthCheck);
   checks.push(checkSlackChannelId(cfg.slackChannelId));
   if (opts.sendSlackTest === true) {
     checks.push(await checkSlackPost(cfg, opts.now ?? (() => new Date())));
@@ -692,6 +907,358 @@ export function renderIntegrationChecks(checks: IntegrationCheck[]): string {
     .join("\n");
 }
 
+function optionalText(v: unknown): string | null {
+  if (typeof v === "string" && v.length > 0) return v;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  return null;
+}
+
+function requiredText(v: unknown, name: string): string {
+  const text = optionalText(v);
+  if (text) return text;
+  throw new TerminalSinkError(`HubSpot webhook event missing ${name}`);
+}
+
+function isoFromHubSpotMillis(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  if (Number.isFinite(n) && n > 0) return new Date(n).toISOString();
+  throw new TerminalSinkError("HubSpot webhook event missing valid occurredAt");
+}
+
+function hubSpotStageEventKey(
+  event: Pick<
+    HubSpotStageWebhookEvent,
+    | "portalId"
+    | "eventId"
+    | "hubspotDealId"
+    | "propertyName"
+    | "toStageId"
+    | "occurredAt"
+  >,
+): string {
+  return JSON.stringify([
+    "hubspot",
+    event.portalId ?? "unknown_portal",
+    event.eventId,
+    event.hubspotDealId,
+    event.propertyName,
+    event.toStageId,
+    event.occurredAt,
+  ]);
+}
+
+function parseHubSpotStageEventBatch(body: unknown): HubSpotStageParseResult {
+  if (!Array.isArray(body)) {
+    throw new WebhookPayloadError("HubSpot webhook body must be an array");
+  }
+  const events: HubSpotStageWebhookEvent[] = [];
+  let dropped = 0;
+  for (const item of body) {
+    if (!isRecord(item)) continue;
+    const propertyName = optionalText(item.propertyName);
+    const subscriptionType =
+      optionalText(item.subscriptionType) ?? optionalText(item.eventType);
+    const objectTypeId = optionalText(item.objectTypeId);
+    const isDealStage =
+      propertyName === "dealstage" &&
+      (subscriptionType === "deal.propertyChange" ||
+        (subscriptionType === "object.propertyChange" && objectTypeId === "0-3"));
+    if (!isDealStage) continue;
+    try {
+      const hubspotDealId = requiredText(item.objectId, "objectId");
+      const portalId = optionalText(item.portalId);
+      const eventId = requiredText(item.eventId, "eventId");
+      const toStageId = requiredText(item.propertyValue, "propertyValue");
+      const occurredAt = isoFromHubSpotMillis(item.occurredAt);
+      const event: HubSpotStageWebhookEvent = {
+        eventKey: hubSpotStageEventKey({
+          portalId,
+          eventId,
+          hubspotDealId,
+          propertyName,
+          toStageId,
+          occurredAt,
+        }),
+        hubspotDealId,
+        portalId,
+        eventId,
+        propertyName,
+        toStageId,
+        toStageLabel:
+          optionalText(item.toStageLabel) ??
+          optionalText(item.stageLabel),
+        routerDealId:
+          optionalText(item.routerDealId) ??
+          optionalText(item.gtmRouterDealId) ??
+          optionalText(item.gtm_router_deal_id),
+        dealName: optionalText(item.dealName) ?? optionalText(item.dealname),
+        occurredAt,
+        source: optionalText(item.changeSource) ?? optionalText(item.sourceId),
+      };
+      events.push(event);
+    } catch {
+      // HubSpot retries non-2xx webhook responses. A malformed item should not
+      // poison the whole batch and create a retry storm for the valid items.
+      dropped += 1;
+      continue;
+    }
+  }
+  return { events, dropped };
+}
+
+async function mapWithConcurrency<T, U>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T) => Promise<U>,
+): Promise<U[]> {
+  const limit = Math.max(1, Math.floor(concurrency));
+  const results = new Array<U>(items.length);
+  let next = 0;
+  let aborted = false;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      for (;;) {
+        if (aborted) return;
+        const index = next;
+        next += 1;
+        if (index >= items.length) return;
+        try {
+          results[index] = await fn(items[index] as T);
+        } catch (err) {
+          aborted = true;
+          throw err;
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+export function parseHubSpotStageEvents(body: unknown): HubSpotStageWebhookEvent[] {
+  return parseHubSpotStageEventBatch(body).events;
+}
+
+export function parseHubSpotStageWebhookBatch(
+  body: unknown,
+): HubSpotStageParseResult {
+  return parseHubSpotStageEventBatch(body);
+}
+
+export function slackStageChangePayload(
+  change: ResolvedHubSpotStageChange,
+  channel: string,
+  hubspotPortalId: string | undefined,
+): { channel: string; text: string } {
+  const stage = change.toStageLabel
+    ? `${change.toStageLabel} (${change.toStageId})`
+    : change.toStageId;
+  const hubspotUrl = hubspotPortalId
+    ? `https://app.hubspot.com/contacts/${hubspotPortalId}/deal/${change.hubspotDealId}`
+    : undefined;
+  const lines = [
+    `HubSpot deal stage changed: ${escapeSlackMrkdwn(change.dealName ?? change.routerDealId)}`,
+    `Stage: ${escapeSlackMrkdwn(stage)}`,
+    `HubSpot deal: ${escapeSlackMrkdwn(change.hubspotDealId)}${
+      hubspotUrl ? ` (${escapeSlackMrkdwn(hubspotUrl)})` : ""
+    }`,
+    `Router id: ${escapeSlackMrkdwn(change.routerDealId)}`,
+    `When: ${escapeSlackMrkdwn(change.occurredAt)}`,
+  ];
+  return { channel, text: lines.join("\n") };
+}
+
+export class HubSpotStageChangeHandler {
+  constructor(private readonly cfg: HubSpotStageChangeConfig) {}
+
+  get eventMode(): "dry_run" | "live" {
+    return this.cfg.mode === "dry-run" ? "dry_run" : "live";
+  }
+
+  verify(request: HubSpotWebhookRequest): boolean {
+    if (!this.cfg.hubspotWebhookSecret) return this.cfg.allowUnsignedWebhooks;
+    return verifyHubSpotV3Signature(this.cfg.hubspotWebhookSecret, request);
+  }
+
+  async resolve(body: unknown): Promise<HubSpotStageResolveResult> {
+    const parsed = parseHubSpotStageEventBatch(body);
+    let droppedNoRouterId = 0;
+    const stageEvents = await mapWithConcurrency(
+      parsed.events,
+      5,
+      async (event) => {
+        try {
+          return event.routerDealId ? event : await this.fetchHubSpotDeal(event);
+        } catch (err) {
+          if (err instanceof HubSpotDealUnmappedError) return null;
+          throw err;
+        }
+      },
+    );
+    const resolved: ResolvedHubSpotStageChange[] = [];
+    for (const event of stageEvents) {
+      if (!event) {
+        droppedNoRouterId += 1;
+        continue;
+      }
+      const hydrated = event;
+      if (!hydrated.routerDealId) {
+        droppedNoRouterId += 1;
+        continue;
+      }
+      resolved.push({
+        eventKey: hydrated.eventKey,
+        routerDealId: hydrated.routerDealId,
+        hubspotDealId: hydrated.hubspotDealId,
+        portalId: hydrated.portalId,
+        eventId: hydrated.eventId,
+        toStageId: hydrated.toStageId,
+        toStageLabel: hydrated.toStageLabel,
+        dealName: hydrated.dealName,
+        occurredAt: hydrated.occurredAt,
+        source: hydrated.source,
+      });
+    }
+    return {
+      changes: resolved,
+      droppedMalformed: parsed.dropped,
+      droppedNoRouterId,
+    };
+  }
+
+  shouldNotify(change: ResolvedHubSpotStageChange): boolean {
+    return (
+      (this.cfg.mode === "dry-run" && this.cfg.hubspotNotifyStageIds.length === 0) ||
+      this.cfg.hubspotNotifyStageIds.includes(change.toStageId)
+    );
+  }
+
+  async notify(change: ResolvedHubSpotStageChange): Promise<SinkReceipt[]> {
+    if (!this.shouldNotify(change)) return [];
+    const payload = slackStageChangePayload(
+      change,
+      this.cfg.slackChannelId,
+      this.cfg.hubspotPortalId ?? change.portalId ?? undefined,
+    );
+    try {
+      const receipt = await this.postSlack(payload, change);
+      return [receipt];
+    } catch (err) {
+      return [
+        {
+          system: "slack",
+          externalId: this.cfg.slackChannelId,
+          detail: `stage-change notification failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          status: "warning",
+        },
+      ];
+    }
+  }
+
+  private async fetchHubSpotDeal(
+    event: HubSpotStageWebhookEvent,
+  ): Promise<HubSpotStageWebhookEvent> {
+    if (this.cfg.mode === "dry-run") return event;
+    const token = this.cfg.hubspotAccessToken;
+    if (!token) throw new TerminalSinkError("HUBSPOT_ACCESS_TOKEN is missing");
+    const url = new URL(
+      `${this.cfg.hubspotApiBase}/crm/v3/objects/deals/${encodeURIComponent(
+        event.hubspotDealId,
+      )}`,
+    );
+    url.searchParams.set(
+      "properties",
+      [
+        this.cfg.hubspotExternalIdProperty,
+        "dealstage",
+        "dealname",
+        "amount",
+      ].join(","),
+    );
+    let res: Response;
+    try {
+      res = await this.cfg.fetchImpl(url, {
+        method: "GET",
+        headers: authHeaders(token),
+      });
+    } catch (err) {
+      throw new RetryableSinkError(
+        `hubspot deal fetch network error: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const body = await parseBody(res);
+    if (res.status === 404) throw new HubSpotDealUnmappedError("hubspot deal not found");
+    if (!res.ok) throw httpFailure("hubspot", res, body);
+    if (!isRecord(body)) {
+      throw new TerminalSinkError("hubspot deal response was not an object");
+    }
+    const parsed = body as HubSpotDealResponse;
+    const properties = isRecord(parsed.properties) ? parsed.properties : {};
+    return {
+      ...event,
+      routerDealId: optionalText(properties[this.cfg.hubspotExternalIdProperty]),
+      dealName: event.dealName ?? optionalText(properties.dealname),
+    };
+  }
+
+  private async postSlack(
+    payload: { channel: string; text: string },
+    change: ResolvedHubSpotStageChange,
+  ): Promise<SinkReceipt> {
+    if (this.cfg.mode === "dry-run") {
+      return {
+        system: "slack",
+        externalId: this.cfg.slackChannelId,
+        detail: `would post HubSpot stage change for ${change.routerDealId}`,
+      };
+    }
+
+    const token = this.cfg.slackBotToken;
+    if (!token) throw new TerminalSinkError("SLACK_BOT_TOKEN is missing");
+    let res: Response;
+    try {
+      res = await this.cfg.fetchImpl(
+        `${this.cfg.slackApiBase}/api/chat.postMessage`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+    } catch (err) {
+      throw new RetryableSinkError(
+        `slack network error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const body = await parseBody(res);
+    if (!res.ok) throw httpFailure("slack", res, body);
+    if (!isRecord(body)) {
+      throw new TerminalSinkError("slack response was not an object");
+    }
+    const parsed = body as SlackPostResponse;
+    if (parsed.ok !== true) {
+      const code = resultId(parsed.error, "unknown_error");
+      const msg = `slack API error: ${code}`;
+      if (isRetryableSlackError(code)) throw new RetryableSinkError(msg);
+      throw new TerminalSinkError(msg);
+    }
+    return {
+      system: "slack",
+      externalId: resultId(parsed.ts, this.cfg.slackChannelId),
+      detail: `posted stage change to ${resultId(parsed.channel, this.cfg.slackChannelId)}`,
+    };
+  }
+}
+
 export class HubSpotSlackSink implements OpportunitySink {
   readonly name: string;
 
@@ -703,6 +1270,10 @@ export class HubSpotSlackSink implements OpportunitySink {
   async upsert(deal: RoutedDeal): Promise<SinkReceipt[]> {
     const hubspot = await this.upsertHubSpot(deal);
     try {
+      // Slack chat.postMessage has no request-level idempotency key. If Slack
+      // accepts the post but the response is lost, retrying can duplicate a
+      // notification. We keep retries because a missed handoff is worse for
+      // this ops channel; webhook stage changes claim the event before Slack.
       const slack = await withRetry(
         () => this.postSlack(deal, hubspot),
         this.cfg.slackRetry ?? DEFAULT_RETRY,
@@ -710,7 +1281,6 @@ export class HubSpotSlackSink implements OpportunitySink {
       return [hubspot, slack];
     } catch (err) {
       if (
-        err instanceof RetryableSinkError ||
         err instanceof SinkExhaustedError ||
         err instanceof TerminalSinkError
       ) {
@@ -782,7 +1352,7 @@ export class HubSpotSlackSink implements OpportunitySink {
     return {
       system: "hubspot",
       externalId: id,
-      detail: `${first.new === true ? "created" : "upserted"} deal`,
+      detail: "upserted deal",
       ...(urlFromBody ? { url: urlFromBody } : {}),
     };
   }
@@ -850,13 +1420,14 @@ export function integrationOptionsFromEnv(
     throw new Error("integrationOptionsFromEnv cannot build mode=off");
   }
   const cfg = integrationConfigFromEnv(mode, env, fetchImpl);
+  const stageCfg = stageChangeConfigFromEnv(mode, env, fetchImpl);
 
   if (mode === "live") {
     const missing = missingLiveEnv(cfg, env);
     if (missing.length > 0) {
       throw new Error(`missing live integration env: ${missing.join(", ")}`);
     }
-    const invalid = invalidLiveEnv(cfg);
+    const invalid = invalidLiveEnv(cfg, env);
     if (invalid.length > 0) {
       throw new Error(`invalid live integration env: ${invalid.join(", ")}`);
     }
@@ -867,5 +1438,6 @@ export function integrationOptionsFromEnv(
     dryRun: mode === "dry-run",
     sink,
     label: sink.name,
+    stageChanges: new HubSpotStageChangeHandler(stageCfg),
   };
 }

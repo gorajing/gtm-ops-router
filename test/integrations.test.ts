@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   HubSpotSlackSink,
+  hubSpotV3Signature,
   hubSpotDealPayload,
   integrationOptionsFromEnv,
+  parseHubSpotStageEvents,
+  parseHubSpotStageWebhookBatch,
   runIntegrationDoctor,
   slackHandoffPayload,
+  slackStageChangePayload,
 } from "../src/integrations.js";
 import { FixtureEnricher } from "../src/enrich.js";
 import { processOne } from "../src/pipeline.js";
@@ -76,12 +80,12 @@ describe("HubSpot + Slack integration sink", () => {
     expect(payload.channel).toBe("C123");
     expect(payload.text).toContain("Ryder Digital");
     expect(payload.text).toContain("HubSpot: 12345");
-    expect(payload.text).toContain("pricing_approval");
+    expect(payload.text).toContain("pricing\\_approval");
   });
 
   it("escapes Slack mrkdwn in operator-controlled text", () => {
     const payload = slackHandoffPayload(
-      routed("D-<danger>", "ACME <@U123|ops> & Co"),
+      routed("D-<danger>", "ACME <@U123|ops> & *Co*"),
       "C123",
       {
         system: "hubspot",
@@ -91,7 +95,7 @@ describe("HubSpot + Slack integration sink", () => {
       },
     );
 
-    expect(payload.text).toContain("ACME &lt;@U123|ops&gt; &amp; Co");
+    expect(payload.text).toContain("ACME &lt;@U123|ops&gt; &amp; \\*Co\\*");
     expect(payload.text).toContain("123&lt;bad&gt;");
     expect(payload.text).toContain("x=&lt;bad&gt;&amp;y=1");
     expect(payload.text).toContain("D-&lt;danger&gt;");
@@ -108,6 +112,315 @@ describe("HubSpot + Slack integration sink", () => {
     expect(receipts[0]?.detail).toContain("would upsert deal");
     expect(receipts[1]?.detail).toContain("would post handoff");
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("parses only HubSpot dealstage webhook events", () => {
+    const events = parseHubSpotStageEvents([
+      {
+        eventId: 1,
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        toStageLabel: "Contact Made",
+        routerDealId: "D-1",
+        occurredAt: 1779210000000,
+        changeSource: "CRM_UI",
+      },
+      {
+        eventId: 2,
+        objectTypeId: "0-1",
+        objectId: 888,
+        propertyName: "firstname",
+        propertyValue: "Dana",
+      },
+    ]);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual(
+      expect.objectContaining({
+        hubspotDealId: "777",
+        routerDealId: "D-1",
+        toStageId: "contact_made",
+        toStageLabel: "Contact Made",
+      }),
+    );
+    expect(events[0]?.eventKey).toBe(
+      JSON.stringify([
+        "hubspot",
+        "246238162",
+        "1",
+        "777",
+        "dealstage",
+        "contact_made",
+        "2026-05-19T17:00:00.000Z",
+      ]),
+    );
+  });
+
+  it("drops malformed dealstage webhooks without an event id", () => {
+    const parsed = parseHubSpotStageWebhookBatch([
+      {
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        routerDealId: "D-1",
+        occurredAt: 1779210000000,
+      },
+    ]);
+
+    expect(parsed.events).toHaveLength(0);
+    expect(parsed.dropped).toBe(1);
+  });
+
+  it("bounds HubSpot deal hydration concurrency for webhook batches", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const fetchImpl = vi.fn(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return new Response(
+        JSON.stringify({
+          id: "hubspot-deal",
+          properties: { gtm_router_deal_id: "D-hydrated" },
+        }),
+        { status: 200 },
+      );
+    });
+    const built = integrationOptionsFromEnv(
+      "live",
+      {
+        HUBSPOT_ACCESS_TOKEN: "pat-na2-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "secret",
+        PUBLIC_BASE_URL: "https://example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C12345678",
+      },
+      fetchImpl,
+    );
+
+    const resolved = await built.stageChanges.resolve(
+      Array.from({ length: 12 }, (_, i) => ({
+        eventId: i + 1,
+        portalId: 246238162,
+        subscriptionType: "object.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 10_000 + i,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        occurredAt: 1779210000000 + i,
+      })),
+    );
+
+    expect(resolved.changes).toHaveLength(12);
+    expect(maxActive).toBeLessThanOrEqual(5);
+  });
+
+  it("verifies HubSpot v3 webhook signatures against the raw body", () => {
+    const rawBody = JSON.stringify([
+      {
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+      },
+    ]);
+    const timestamp = String(new Date("2026-05-19T12:00:00Z").getTime());
+    const signature = hubSpotV3Signature(
+      "client-secret",
+      "POST",
+      "https://router.example.com/webhooks/hubspot",
+      rawBody,
+      timestamp,
+    );
+    const built = integrationOptionsFromEnv("dry-run", {
+      HUBSPOT_WEBHOOK_SECRET: "client-secret",
+    });
+
+    expect(
+      built.stageChanges.verify({
+        method: "POST",
+        absoluteUrl: "https://router.example.com/webhooks/hubspot",
+        rawBody,
+        headers: {
+          "x-hubspot-signature-v3": signature,
+          "x-hubspot-request-timestamp": timestamp,
+        },
+        now: () => new Date("2026-05-19T12:00:00Z"),
+      }),
+    ).toBe(true);
+    expect(
+      built.stageChanges.verify({
+        method: "POST",
+        absoluteUrl: "https://router.example.com/webhooks/hubspot",
+        rawBody: rawBody + "\n",
+        headers: {
+          "x-hubspot-signature-v3": signature,
+          "x-hubspot-request-timestamp": timestamp,
+        },
+        now: () => new Date("2026-05-19T12:00:00Z"),
+      }),
+    ).toBe(false);
+
+    const futureTimestamp = String(
+      new Date("2026-05-19T12:06:00Z").getTime(),
+    );
+    const futureSignature = hubSpotV3Signature(
+      "client-secret",
+      "POST",
+      "https://router.example.com/webhooks/hubspot",
+      rawBody,
+      futureTimestamp,
+    );
+    expect(
+      built.stageChanges.verify({
+        method: "POST",
+        absoluteUrl: "https://router.example.com/webhooks/hubspot",
+        rawBody,
+        headers: {
+          "x-hubspot-signature-v3": futureSignature,
+          "x-hubspot-request-timestamp": futureTimestamp,
+        },
+        now: () => new Date("2026-05-19T12:00:00Z"),
+      }),
+    ).toBe(false);
+  });
+
+  it("live stage-change handling fetches the router id before posting Slack", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      if (String(url).includes("/crm/v3/objects/deals/777")) {
+        return new Response(
+          JSON.stringify({
+            id: "777",
+            properties: {
+              gtm_router_deal_id: "D-1",
+              dealname: "Ryder Digital",
+              dealstage: "contact_made",
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ ok: true, channel: "C123", ts: "177.0001" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const built = integrationOptionsFromEnv(
+      "live",
+      {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C12345678",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+      },
+      fetchImpl,
+    );
+
+    const resolved = await built.stageChanges.resolve([
+      {
+        eventId: 1,
+        portalId: 246238162,
+        subscriptionType: "deal.propertyChange",
+        objectTypeId: "0-3",
+        objectId: 777,
+        propertyName: "dealstage",
+        propertyValue: "contact_made",
+        occurredAt: 1779210000000,
+      },
+    ]);
+    const receipts = await built.stageChanges.notify(resolved.changes[0]!);
+    const slackBody = JSON.parse(String(calls[1]?.init.body));
+
+    expect(resolved.changes[0]?.routerDealId).toBe("D-1");
+    expect(resolved.droppedNoRouterId).toBe(0);
+    expect(calls[0]?.url).toContain(
+      "properties=gtm_router_deal_id%2Cdealstage%2Cdealname%2Camount",
+    );
+    expect(slackBody.text).toContain("Ryder Digital");
+    expect(slackBody.text).toContain("Stage: contact\\_made");
+    expect(receipts[0]?.detail).toContain("posted stage change");
+  });
+
+  it("builds a Slack stage-change message with traceable ids", () => {
+    const payload = slackStageChangePayload(
+      {
+        eventKey: "hubspot:1",
+        routerDealId: "D-1",
+        hubspotDealId: "777",
+        portalId: "246238162",
+        eventId: "1",
+        toStageId: "contact_made",
+        toStageLabel: "Contact Made",
+        dealName: "Ryder Digital",
+        occurredAt: "2026-05-19T12:00:00.000Z",
+        source: "CRM_UI",
+      },
+      "C123",
+      "246238162",
+    );
+
+    expect(payload.channel).toBe("C123");
+    expect(payload.text).toContain("Contact Made (contact\\_made)");
+    expect(payload.text).toContain("Router id: D-1");
+    expect(payload.text).toContain(
+      "https://app.hubspot.com/contacts/246238162/deal/777",
+    );
+  });
+
+  it("does not retry stage-change Slack posts after the webhook event is claimed", async () => {
+    const fetchImpl = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: false, error: "ratelimited" }), {
+        status: 200,
+      });
+    });
+    const built = integrationOptionsFromEnv(
+      "live",
+      {
+        HUBSPOT_ACCESS_TOKEN: "pat-na2-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "secret",
+        PUBLIC_BASE_URL: "https://example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C12345678",
+      },
+      fetchImpl,
+    );
+
+    const receipts = await built.stageChanges.notify({
+      eventKey: "event-1",
+      routerDealId: "D-1",
+      hubspotDealId: "777",
+      portalId: "246238162",
+      eventId: "1",
+      toStageId: "contact_made",
+      toStageLabel: "Contact Made",
+      dealName: "Ryder Digital",
+      occurredAt: "2026-05-19T17:00:00.000Z",
+      source: "CRM_UI",
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(receipts[0]).toEqual(
+      expect.objectContaining({
+        system: "slack",
+        status: "warning",
+      }),
+    );
   });
 
   it("dry-run mode stays network-silent through the full pipeline", async () => {
@@ -212,15 +525,45 @@ describe("HubSpot + Slack integration sink", () => {
     );
   });
 
+  it("live mode requires an explicit HubSpot stage notification allowlist", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      }),
+    ).toThrow("missing live integration env: HUBSPOT_NOTIFY_STAGE_IDS");
+  });
+
   it("live mode rejects Slack channel names before first send", () => {
     expect(() =>
       integrationOptionsFromEnv("live", {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "#ops",
       }),
     ).toThrow("invalid live integration env: SLACK_CHANNEL_ID");
+  });
+
+  it("live mode requires PUBLIC_BASE_URL to be an HTTPS origin", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com/prefix",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+      }),
+    ).toThrow("invalid live integration env: PUBLIC_BASE_URL");
   });
 
   it("Slack rate limits become loud warning receipts after HubSpot succeeds", async () => {
@@ -346,6 +689,9 @@ describe("HubSpot + Slack integration sink", () => {
       {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
         INTEGRATION_FETCH_TIMEOUT_MS: "1",
@@ -577,6 +923,9 @@ describe("HubSpot + Slack integration sink", () => {
     expect(checks.map((check) => check.name)).toEqual([
       "HUBSPOT_ACCESS_TOKEN",
       "HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY",
+      "HUBSPOT_WEBHOOK_SECRET",
+      "PUBLIC_BASE_URL",
+      "HUBSPOT_NOTIFY_STAGE_IDS",
       "SLACK_BOT_TOKEN",
       "SLACK_CHANNEL_ID",
     ]);
@@ -621,6 +970,9 @@ describe("HubSpot + Slack integration sink", () => {
       env: {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
         HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
@@ -688,6 +1040,9 @@ describe("HubSpot + Slack integration sink", () => {
       env: {
         HUBSPOT_ACCESS_TOKEN: "hs-token",
         HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
         HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",

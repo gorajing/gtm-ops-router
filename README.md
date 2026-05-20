@@ -64,6 +64,7 @@ the same flow at real systems:
 ```bash
 cp .env.example .env
 # fill HUBSPOT_ACCESS_TOKEN, HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY,
+# HUBSPOT_WEBHOOK_SECRET, PUBLIC_BASE_URL, HUBSPOT_NOTIFY_STAGE_IDS,
 # SLACK_BOT_TOKEN, and SLACK_CHANNEL_ID
 
 npm run doctor                 # checks env, HubSpot property uniqueness, Slack auth
@@ -76,6 +77,21 @@ npm run serve -- --live-integrations
 HubSpot portal. That is not ceremony: it keeps retries and re-runs idempotent
 instead of creating duplicate deals. Slack messages include the router deal id
 and HubSpot receipt so a human can trace the handoff.
+
+The server also accepts HubSpot deal-stage webhooks at
+`POST /webhooks/hubspot`. Subscribe the HubSpot app to the deal `dealstage`
+property change event and point the target URL at that path. When a router-owned
+deal is moved in HubSpot, the router records the external stage on the same
+SQLite row, dedupes HubSpot retry deliveries, updates the dashboard, and posts a
+Slack stage-change message. Live mode requires `HUBSPOT_WEBHOOK_SECRET` so the
+webhook endpoint fails closed once exposed. Set `PUBLIC_BASE_URL` to the public
+HTTPS origin HubSpot calls so signature verification hashes the same URL
+HubSpot signed; only use `TRUST_PROXY=1` when your proxy owns the
+`X-Forwarded-*` headers. Live mode also requires `HUBSPOT_NOTIFY_STAGE_IDS`,
+a comma-separated allowlist of HubSpot dealstage IDs (for example the internal
+ID for "Contact Made") so enabling Slack cannot accidentally alert on every
+stage movement in the portal. Dry-run mode may leave it empty to demonstrate
+all router-owned stage changes.
 
 If `npm run doctor` says `gtm_router_deal_id` already exists but is not
 unique, create a fresh unique text property instead (for example
@@ -109,7 +125,9 @@ external writes, zero `sink_*` quarantines); `--flaky` injects deterministic
 retryable and terminal sink faults so the retry/terminal taxonomy is visible
 in the quarantine table, not just asserted in tests. `--integrations` swaps the
 sink to HubSpot + Slack dry-run mode, so the event trail shows the cross-system
-handoff without credentials.
+handoff without credentials. `POST /webhooks/hubspot` completes the loop in the
+other direction: manual HubSpot stage movement becomes router state and Slack
+signal, rather than a static CRM board.
 
 ---
 
