@@ -29,6 +29,363 @@ export const SOURCE_CHANNELS = [
 ] as const;
 export type SourceChannel = (typeof SOURCE_CHANNELS)[number];
 
+// ── Phase 1 commercial/deployment lifecycle vocabulary ─────────────────────
+export const COMMERCIAL_STATES = [
+  "open",
+  "proposal_sent",
+  "negotiating",
+  "closed_won",
+  "closed_lost",
+] as const;
+export const CommercialState = z.enum(COMMERCIAL_STATES);
+export type CommercialState = z.infer<typeof CommercialState>;
+
+export const TERMINAL_COMMERCIAL_STATES = ["closed_won", "closed_lost"] as const;
+export type TerminalCommercialState = (typeof TERMINAL_COMMERCIAL_STATES)[number];
+
+export function isTerminalCommercialState(
+  state: CommercialState,
+): state is TerminalCommercialState {
+  return (TERMINAL_COMMERCIAL_STATES as readonly CommercialState[]).includes(state);
+}
+
+export const DEPLOYMENT_READINESS = [
+  "not_required",
+  "pending",
+  "ready",
+  "blocked",
+] as const;
+export const DeploymentReadiness = z.enum(DEPLOYMENT_READINESS);
+export type DeploymentReadiness = z.infer<typeof DeploymentReadiness>;
+
+export const DEPLOYMENT_FACT_STATUSES = [
+  "not_applicable",
+  "missing",
+  "fresh",
+  "stale",
+] as const;
+export type DeploymentFactStatus = (typeof DEPLOYMENT_FACT_STATUSES)[number];
+
+export const DEPLOYMENT_BLOCKERS = [
+  "deployment_use_case_unclear",
+  "deployment_integration_unknown",
+  "deployment_data_unavailable",
+] as const;
+export const DeploymentBlocker = z.enum(DEPLOYMENT_BLOCKERS);
+export type DeploymentBlocker = z.infer<typeof DeploymentBlocker>;
+
+type NonBlockedDeploymentReadiness = Exclude<DeploymentReadiness, "blocked">;
+
+export type DeploymentReadinessRecord =
+  | {
+      readiness: NonBlockedDeploymentReadiness;
+      blockerCode: null;
+      secondaryBlockerCodes: null;
+      blockerEnteredAt: null;
+      reason: string | null;
+    }
+  | {
+      readiness: "blocked";
+      blockerCode: DeploymentBlocker;
+      secondaryBlockerCodes: DeploymentBlocker[] | null;
+      blockerEnteredAt: string;
+      reason: string | null;
+    };
+
+export interface LocalCommercialStateInput {
+  dealId: string;
+  commercialState: CommercialState;
+  sourceEventId: string;
+  occurredAt: string;
+  reason: string | null;
+  expectedRedPath: boolean;
+}
+
+export interface CommercialStateRecord {
+  dealId: string;
+  commercialState: CommercialState;
+  source: "local" | "hubspot";
+  sourceEventId: string;
+  occurredAt: string;
+  stateEnteredAt: string;
+  updatedAt: string;
+  terminalProjectedAt: string | null;
+  projectedViaTerminalTie: boolean;
+  terminalTieOccurredAt: string | null;
+  terminalTieResolvedAt: string | null;
+  terminalTieWinnerState: TerminalCommercialState | null;
+  terminalTieLoserState: TerminalCommercialState | null;
+}
+
+export type LocalCommercialStateWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_routed"
+  | "stale"
+  | "same_state_tie"
+  | "same_state_newer"
+  | "tie_ignored"
+  | "regression"
+  | "terminal_drift";
+
+export interface LocalCommercialStateWriteResult {
+  status: LocalCommercialStateWriteStatus;
+  eventKey: string;
+  dealId: string;
+  commercialState: CommercialState;
+  projected: boolean;
+  current: CommercialStateRecord | null;
+  readinessNotification: ReadinessNotificationClaim | null;
+  terminalDriftAlert: CommercialTerminalDriftAlertClaim | null;
+}
+
+export interface LocalDeploymentFactsInput {
+  dealId: string;
+  sourceEventId: string;
+  useCaseClear: boolean;
+  integrationsKnown: boolean;
+  dataReady: boolean;
+  operator: string;
+  occurredAt: string;
+}
+
+export interface DeploymentFactsRecord {
+  dealId: string;
+  useCaseClear: boolean;
+  integrationsKnown: boolean;
+  dataReady: boolean;
+  source: "local";
+  sourceEventId: string;
+  operator: string;
+  operatorSource: "self_reported";
+  occurredAt: string;
+  updatedAt: string;
+}
+
+export type DeploymentReadinessNotifyStatus =
+  | "pending"
+  | "ok"
+  | "failed"
+  | "max_attempts_exceeded";
+
+export type PreviousDeploymentReadiness = DeploymentReadiness | "none";
+
+export interface ReadinessNotificationClaim {
+  dealId: string;
+  fingerprint: string;
+  previousReadiness: PreviousDeploymentReadiness;
+  readiness: Exclude<DeploymentReadiness, "not_required">;
+  blockerCode: DeploymentBlocker | null;
+  reason: string | null;
+  leaseAcquiredAt: string;
+  attempt: number;
+}
+
+export interface ReadinessFallbackNotificationClaim {
+  dealId: string;
+  fingerprint: string;
+  fallbackKey: string;
+  readiness: Exclude<DeploymentReadiness, "not_required">;
+  errorClass: string;
+  leaseAcquiredAt: string;
+  leaseGeneration: number;
+}
+
+export type ReadinessNotificationRecordStatus =
+  | "ok"
+  | "failed"
+  | "max_attempts_exceeded"
+  | "lost_race";
+
+export type ReadinessFallbackNotificationRecordStatus =
+  | "ok"
+  | "failed"
+  | "fallback_max_attempts_exceeded"
+  | "lost_race";
+
+export type ReadinessFallbackNotificationClaimMissStatus =
+  | "already_delivered"
+  | "lease_held"
+  | "fallback_max_attempts_exceeded"
+  | "superseded_by_new_readiness"
+  | "missing"
+  | "lost_race";
+
+export interface ReadinessNotificationDeliveryResult {
+  status: ReadinessNotificationRecordStatus;
+  fallbackClaim: ReadinessFallbackNotificationClaim | null;
+}
+
+export interface ReadinessFallbackNotificationDeliveryResult {
+  status: ReadinessFallbackNotificationRecordStatus;
+}
+
+export interface CommercialTerminalDriftAlertClaim {
+  dealId: string;
+  alertKey: string;
+  source: "local" | "hubspot";
+  sourceEventId: string;
+  incomingCommercialState: CommercialState;
+  currentCommercialState: CommercialState;
+  incomingOccurredAt: string;
+  currentOccurredAt: string;
+  driftKind: "terminal_regression";
+  tieResolutionDrift: boolean;
+  expectedRedPath: boolean;
+  leaseAcquiredAt: string;
+  leaseGeneration: number;
+}
+
+export type CommercialTerminalDriftAlertRecordStatus =
+  | "ok"
+  | "failed"
+  | "max_attempts_exceeded"
+  | "lost_race";
+
+export interface CommercialTerminalDriftAlertDeliveryResult {
+  status: CommercialTerminalDriftAlertRecordStatus;
+}
+
+export interface CommercialTerminalDriftAlertRetryCandidate {
+  type: "terminal_drift";
+  dealId: string;
+  alertKey: string;
+}
+
+export interface DeploymentReadinessState {
+  dealId: string;
+  readiness: DeploymentReadiness;
+  blockerCode: DeploymentBlocker | null;
+  secondaryBlockerCodes: DeploymentBlocker[] | null;
+  reason: string | null;
+  stateEnteredAt: string;
+  blockerEnteredAt: string | null;
+  updatedAt: string;
+  notifyStatus: DeploymentReadinessNotifyStatus | null;
+  factsStatus: DeploymentFactStatus;
+  factsFresh: boolean | null;
+  factsStaleAt: string | null;
+}
+
+export type LocalDeploymentFactsWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "stale_age"
+  | "stale_ordering"
+  | "same_values_tie"
+  | "tie_conflict";
+
+export interface LocalDeploymentFactsWriteResult {
+  status: LocalDeploymentFactsWriteStatus;
+  eventKey: string;
+  dealId: string;
+  sourceEventId: string;
+  accepted: boolean;
+  current: DeploymentFactsRecord | null;
+  readinessNotification: ReadinessNotificationClaim | null;
+}
+
+// -- Phase 2 outcome loop vocabulary ---------------------------------------
+export const OUTCOME_STATES = [
+  "deployment_started",
+  "deployed",
+  "landed",
+  "expanded",
+  "churned",
+] as const;
+export const OutcomeState = z.enum(OUTCOME_STATES);
+export type OutcomeState = z.infer<typeof OutcomeState>;
+
+export const OUTCOME_REASON_CATEGORIES = [
+  "customer_ready",
+  "technical_blocker_resolved",
+  "scope_expanded",
+  "budget_lost",
+  "no_show",
+  "other",
+] as const;
+export const OutcomeReasonCategory = z.enum(OUTCOME_REASON_CATEGORIES);
+export type OutcomeReasonCategory = z.infer<typeof OutcomeReasonCategory>;
+
+export const OUTCOME_REJECTION_KINDS = [
+  "duplicate_semantic_outcome",
+  "missing_prior_outcome",
+  "post_churn_outcome",
+  "invalid_arr_delta",
+] as const;
+export const OutcomeRejectionKind = z.enum(OUTCOME_REJECTION_KINDS);
+export type OutcomeRejectionKind = z.infer<typeof OutcomeRejectionKind>;
+
+export type OutcomeSource = "local";
+export type OutcomeOperatorSource = "self_reported";
+type NonExpandedOutcomeState = Exclude<OutcomeState, "expanded">;
+
+export interface LocalOutcomeInput {
+  dealId: string;
+  sourceEventId: string;
+  outcome: OutcomeState;
+  occurredAt: string;
+  operator: string;
+  arrDeltaUsd: number | null;
+  reasonCategory: OutcomeReasonCategory | null;
+}
+
+interface OutcomeEventRecordBase {
+  id: string;
+  dealId: string;
+  source: OutcomeSource;
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  occurredAt: string;
+  operator: string;
+  operatorSource: OutcomeOperatorSource;
+  reasonCategory: OutcomeReasonCategory | null;
+  createdAt: string;
+}
+
+export type OutcomeEventRecord =
+  | (OutcomeEventRecordBase & {
+      outcome: "expanded";
+      arrDeltaUsd: number;
+    })
+  | (OutcomeEventRecordBase & {
+      outcome: NonExpandedOutcomeState;
+      arrDeltaUsd: null;
+    });
+
+export interface OutcomeRejectionRecord {
+  id: string;
+  dealId: string;
+  source: OutcomeSource;
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  rejectionKind: OutcomeRejectionKind;
+  outcome: OutcomeState;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export type LocalOutcomeWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "not_closed_won"
+  | OutcomeRejectionKind;
+
+export interface LocalOutcomeWriteResult {
+  status: LocalOutcomeWriteStatus;
+  eventKey: string;
+  dealId: string;
+  sourceEventId: string;
+  accepted: boolean;
+  event: OutcomeEventRecord | null;
+  rejection: OutcomeRejectionRecord | null;
+}
+
 export type Stage =
   | "intake"
   | "enriched"
@@ -178,6 +535,154 @@ export type PipelineEventMeta =
         status?: "ok" | "warning";
         url?: string;
       }>;
+    }
+  | {
+      kind: "commercial_state";
+      source: "local";
+      eventKey: string;
+      sourceEventId: string;
+      commercialState: CommercialState;
+      occurredAt: string;
+      projected: boolean;
+      observationCode?: string;
+      reason?: string;
+      expectedRedPath?: boolean;
+    }
+  | {
+      kind: "deployment_facts";
+      source: "local";
+      eventKey: string;
+      sourceEventId: string;
+      useCaseClear: boolean;
+      integrationsKnown: boolean;
+      dataReady: boolean;
+      operator: string;
+      operatorSource: "self_reported";
+      occurredAt: string;
+      accepted: boolean;
+      staleKind?: "age" | "ordering";
+      tieKind?: "same_values" | "different_values" | "different_operator";
+    }
+  | {
+      kind: "deployment_readiness_notification";
+      mode: "dry_run" | "live";
+      fingerprint: string;
+      previousReadiness: PreviousDeploymentReadiness;
+      readiness: Exclude<DeploymentReadiness, "not_required">;
+      blockerCode: DeploymentBlocker | null;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | {
+      kind: "deployment_readiness_notification_superseded";
+      mode: "dry_run" | "live";
+      fingerprint: string;
+      previousReadiness: PreviousDeploymentReadiness;
+      readiness: Exclude<DeploymentReadiness, "not_required">;
+      blockerCode: DeploymentBlocker | null;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | {
+      kind: "commercial_terminal_drift";
+      mode: "dry_run" | "live";
+      alertKey: string;
+      source: "local" | "hubspot";
+      sourceEventId: string;
+      incomingCommercialState: CommercialState;
+      currentCommercialState: CommercialState;
+      incomingOccurredAt: string;
+      currentOccurredAt: string;
+      driftKind: "terminal_regression";
+      tieResolutionDrift: boolean;
+      expectedRedPath: boolean;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | {
+      kind: "commercial_terminal_drift_superseded";
+      mode: "dry_run" | "live";
+      alertKey: string;
+      source: "local" | "hubspot";
+      sourceEventId: string;
+      incomingCommercialState: CommercialState;
+      currentCommercialState: CommercialState;
+      incomingOccurredAt: string;
+      currentOccurredAt: string;
+      driftKind: "terminal_regression";
+      tieResolutionDrift: boolean;
+      expectedRedPath: boolean;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | ({
+      kind: "post_sale_outcome";
+      source: OutcomeSource;
+      eventKey: string;
+      sourceEventId: string;
+      occurredAt: string;
+      operator: string;
+      operatorSource: OutcomeOperatorSource;
+      reasonCategory: OutcomeReasonCategory | null;
+    } & (
+      | {
+          outcome: "expanded";
+          arrDeltaUsd: number;
+        }
+      | {
+          outcome: NonExpandedOutcomeState;
+          arrDeltaUsd: null;
+        }
+    ))
+  | {
+      kind: "deployment_handoff_failed";
+      mode: "dry_run" | "live";
+      fingerprint: string;
+      fallbackKey: string;
+      readiness: Exclude<DeploymentReadiness, "not_required">;
+      errorClass: string;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+    }
+  | {
+      kind: "deployment_handoff_failed_superseded";
+      mode: "dry_run" | "live";
+      fingerprint: string;
+      fallbackKey: string;
+      readiness: Exclude<DeploymentReadiness, "not_required">;
+      errorClass: string;
+      receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
     };
 
 export interface Metrics {
@@ -199,4 +704,25 @@ export interface Metrics {
   partialSyncs: number; // routed rows where a secondary downstream handoff warned
   externallySyncedStoreErrors: number; // live sink succeeded, local persistence failed
   stageNotificationAuditGaps: number; // current rows where Slack lease released but audit append failed
+  deploymentReadiness: Record<DeploymentReadiness, number>;
+  readinessNotificationGaps: number;
+  readinessPendingOverSla: number;
+  readinessFactsStaleProjected: number;
+  readinessFactsStaleIgnored: number;
+  commercialProjectionDrift: number;
+  commercialTerminalDriftAlerts: number;
+  commercialTerminalDriftNotificationGaps: number;
+  commercialTerminalTieConflicts: number;
+  notRoutedClosedWonStageEvents: number;
+  deploymentStartedDeals: number;
+  deployedDeals: number;
+  landedDeals: number;
+  expandedDeals: number;
+  expandedArrDeltaUsd: number;
+  churnedDeals: number;
+  outcomeChurnBeforeDeploy: number;
+  outcomeCommercialStateConflicts: number;
+  outcomeInvalidHistories: number;
+  medianTimeClosedWonToDeployedHours: number;
+  medianTimeDeployedToLandedHours: number;
 }

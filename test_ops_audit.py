@@ -30,6 +30,37 @@ CREATE TABLE deals (
 )
 """
 
+COMMERCIAL_STATES_DDL = """
+CREATE TABLE commercial_states (
+  deal_id TEXT PRIMARY KEY,
+  commercial_state TEXT NOT NULL,
+  state_entered_at TEXT NOT NULL
+)
+"""
+
+OUTCOME_EVENTS_DDL = """
+CREATE TABLE outcome_events (
+  id TEXT PRIMARY KEY,
+  deal_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  arr_delta_usd INTEGER
+)
+"""
+
+EVENTS_DDL = """
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  from_st TEXT NOT NULL,
+  to_st TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  meta TEXT
+)
+"""
+
 
 def _routed(id_, kind, usd, latency):
     payload = json.dumps({"id": id_, "dealUSD": usd, "route": {"kind": kind}})
@@ -41,12 +72,54 @@ def _quar(id_, code, latency):
     return (id_, "quarantined", None, q, latency, "t", "t")
 
 
-def make_db(rows):
+def _commercial(deal_id, state, state_entered_at):
+    return (deal_id, state, state_entered_at)
+
+
+def _outcome(id_, deal_id, outcome, occurred_at, arr_delta_usd=None):
+    return (id_, deal_id, outcome, occurred_at, occurred_at, arr_delta_usd)
+
+
+def _commercial_event(deal_id, occurred_at, projected=True):
+    meta = json.dumps(
+        {
+            "kind": "commercial_state",
+            "source": "local",
+            "eventKey": "event-key",
+            "sourceEventId": "source-event",
+            "commercialState": "closed_won",
+            "occurredAt": occurred_at,
+            "projected": projected,
+        }
+    )
+    return (deal_id, occurred_at, "routed", "routed", "commercial state changed", meta)
+
+
+def make_db(rows, outcome_rows=None, commercial_rows=None, event_rows=None):
     conn = sqlite3.connect(":memory:")
     conn.execute(DEALS_DDL)
     conn.executemany(
         "INSERT INTO deals VALUES (?,?,?,?,?,?,?)", rows
     )
+    if event_rows is not None:
+        conn.execute(EVENTS_DDL)
+        conn.executemany(
+            """INSERT INTO events (
+                 deal_id, ts, from_st, to_st, detail, meta
+               )
+               VALUES (?,?,?,?,?,?)""",
+            event_rows,
+        )
+    if commercial_rows is not None:
+        conn.execute(COMMERCIAL_STATES_DDL)
+        conn.executemany(
+            "INSERT INTO commercial_states VALUES (?,?,?)", commercial_rows
+        )
+    if outcome_rows is not None:
+        conn.execute(OUTCOME_EVENTS_DDL)
+        conn.executemany(
+            "INSERT INTO outcome_events VALUES (?,?,?,?,?,?)", outcome_rows
+        )
     conn.commit()
     return conn
 
@@ -100,6 +173,87 @@ class AuditTest(unittest.TestCase):
         r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
         self.assertFalse(r.ok)
         self.assertTrue(any("p95_latency" in b for b in r.breaches))
+
+    def test_outcome_loop_metrics_pass_on_valid_history(self):
+        conn = make_db(
+            [_routed("a", "human_assisted", 120000, 1)],
+            commercial_rows=[
+                _commercial("a", "closed_won", "2026-05-26T12:00:00.000Z")
+            ],
+            event_rows=[
+                _commercial_event("a", "2026-05-21T12:00:00.000Z")
+            ],
+            outcome_rows=[
+                _outcome("o1", "a", "deployment_started", "2026-05-22T12:00:00.000Z"),
+                _outcome("o2", "a", "deployed", "2026-05-23T12:00:00.000Z"),
+                _outcome("o3", "a", "landed", "2026-05-24T00:00:00.000Z"),
+                _outcome(
+                    "o4",
+                    "a",
+                    "expanded",
+                    "2026-05-25T00:00:00.000Z",
+                    50000,
+                ),
+            ],
+        )
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.deployment_started_deals, 1)
+        self.assertEqual(r.deployed_deals, 1)
+        self.assertEqual(r.landed_deals, 1)
+        self.assertEqual(r.expanded_deals, 1)
+        self.assertEqual(r.expanded_arr_delta_usd, 50000)
+        self.assertEqual(r.median_time_closed_won_to_deployed_hours, 48)
+        self.assertEqual(r.median_time_deployed_to_landed_hours, 12)
+
+    def test_outcome_commercial_conflict_fails(self):
+        conn = make_db(
+            [_routed("a", "human_assisted", 120000, 1)],
+            commercial_rows=[_commercial("a", "open", "2026-05-21T12:00:00.000Z")],
+            outcome_rows=[
+                _outcome("o1", "a", "deployment_started", "2026-05-22T12:00:00.000Z")
+            ],
+        )
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.outcome_commercial_state_conflicts, 1)
+        self.assertTrue(
+            any("outcomeCommercialStateConflicts" in b for b in r.breaches)
+        )
+
+    def test_invalid_outcome_history_fails(self):
+        conn = make_db(
+            [_routed("a", "human_assisted", 120000, 1)],
+            commercial_rows=[
+                _commercial("a", "closed_won", "2026-05-21T12:00:00.000Z")
+            ],
+            outcome_rows=[
+                _outcome("o1", "a", "deployed", "2026-05-22T12:00:00.000Z"),
+                _outcome("o2", "a", "churned", "2026-05-23T12:00:00.000Z"),
+                _outcome("o3", "a", "landed", "2026-05-24T12:00:00.000Z"),
+            ],
+        )
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.outcome_invalid_histories, 3)
+        self.assertEqual(r.median_time_closed_won_to_deployed_hours, 0)
+        self.assertEqual(r.median_time_deployed_to_landed_hours, 0)
+        self.assertTrue(any("outcomeInvalidHistories" in b for b in r.breaches))
+
+    def test_churn_before_deploy_is_warning_not_failure(self):
+        conn = make_db(
+            [_routed("a", "human_assisted", 120000, 1)],
+            commercial_rows=[
+                _commercial("a", "closed_won", "2026-05-21T12:00:00.000Z")
+            ],
+            outcome_rows=[
+                _outcome("o1", "a", "deployment_started", "2026-05-22T12:00:00.000Z"),
+                _outcome("o2", "a", "churned", "2026-05-23T12:00:00.000Z"),
+            ],
+        )
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.outcome_churn_before_deploy, 1)
 
 
 class MainExitCodeTest(unittest.TestCase):

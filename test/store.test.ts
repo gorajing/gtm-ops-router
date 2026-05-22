@@ -3,16 +3,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
+import {
+  DEPLOYMENT_FACT_MAX_AGE_DAYS,
+  READINESS_PENDING_SLA_HOURS,
+} from "../src/constants.js";
+import { integrationConfigBundleFromEnv } from "../src/integrations.js";
 import { Store } from "../src/store.js";
 import type {
   ExternalStageState,
+  LocalOutcomeInput,
   PipelineEventMeta,
   RoutedDeal,
 } from "../src/types.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
+  StatementSync: unknown;
   DatabaseSync: new (path: string) => {
-    prepare(sql: string): { run(...args: unknown[]): unknown };
+    prepare(sql: string): {
+      run(...args: unknown[]): unknown;
+      get(...args: unknown[]): unknown;
+      all(...args: unknown[]): unknown[];
+    };
     close(): void;
   };
 };
@@ -74,6 +85,213 @@ function externalMeta(eventKey = "lease-key"): PipelineEventMeta {
   };
 }
 
+function closedWonRoutedDeal(store: Store, deal: RoutedDeal = routed()): void {
+  store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+  store.recordLocalCommercialState({
+    dealId: deal.id,
+    commercialState: "closed_won",
+    sourceEventId: "11111111-1111-4111-8111-111111111111",
+    occurredAt: "2026-05-21T12:00:00.000Z",
+    reason: null,
+    expectedRedPath: false,
+  });
+}
+
+function outcomeInput(
+  overrides: Partial<LocalOutcomeInput> = {},
+): LocalOutcomeInput {
+  return {
+    dealId: "D-lease",
+    sourceEventId: "22222222-2222-4222-8222-222222222222",
+    outcome: "deployment_started",
+    occurredAt: "2026-05-22T12:00:00.000Z",
+    operator: "DS",
+    arrDeltaUsd: null,
+    reasonCategory: null,
+    ...overrides,
+  };
+}
+
+function outcomeEventKey(sourceEventId: string): string {
+  return JSON.stringify(["outcome", "local", sourceEventId]);
+}
+
+function withTempStoreDb(test: (db: InstanceType<typeof DatabaseSync>) => void): void {
+  const dir = join(tmpdir(), `gtm-router-schema-${process.pid}-${Date.now()}`);
+  mkdirSync(dir);
+  const dbPath = join(dir, "router.db");
+  try {
+    new Store(dbPath).close();
+    const db = new DatabaseSync(dbPath);
+    try {
+      test(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function withTempStore(
+  test: (store: Store, dbPath: string) => void,
+): void {
+  const dir = join(tmpdir(), `gtm-router-store-${process.pid}-${Date.now()}`);
+  mkdirSync(dir);
+  const dbPath = join(dir, "router.db");
+  try {
+    const store = new Store(dbPath);
+    try {
+      test(store, dbPath);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+interface ReadinessRow {
+  readiness: string;
+  blocker_code: string | null;
+  secondary_blocker_codes: string | null;
+  blocker_entered_at: string | null;
+  reason: string | null;
+  state_entered_at: string;
+}
+
+interface ReadinessNotificationRow {
+  last_notified_fingerprint: string | null;
+  notify_status: string | null;
+  notify_pending_at: string | null;
+  notify_attempts: number;
+  notify_error: string | null;
+}
+
+interface ExternalEventKeyRow {
+  key: string;
+  notify_status: string;
+  notify_leases: number;
+  notify_pending_at: string | null;
+  scope: string;
+  notify_error: string | null;
+}
+
+function readReadiness(
+  dbPath: string,
+  dealId: string,
+): ReadinessRow | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT readiness, blocker_code, secondary_blocker_codes,
+                blocker_entered_at, reason, state_entered_at
+         FROM deployment_readiness
+         WHERE deal_id = ?`,
+      )
+      .get(dealId) as ReadinessRow | undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function readReadinessNotification(
+  dbPath: string,
+  dealId: string,
+): ReadinessNotificationRow | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT last_notified_fingerprint, notify_status, notify_pending_at,
+                notify_attempts, notify_error
+         FROM deployment_readiness
+         WHERE deal_id = ?`,
+      )
+      .get(dealId) as ReadinessNotificationRow | undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function readExternalEventKey(
+  dbPath: string,
+  key: string,
+): ExternalEventKeyRow | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT key, notify_status, notify_leases, notify_pending_at, scope,
+                notify_error
+         FROM external_event_keys
+         WHERE key = ?`,
+      )
+      .get(key) as ExternalEventKeyRow | undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function readObservationConfigHash(
+  dbPath: string,
+  sourceEventId: string,
+): string | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db
+      .prepare(
+        `SELECT config_hash
+         FROM external_event_observations
+         WHERE source = 'local'
+           AND source_event_id = ?`,
+      )
+      .get(sourceEventId) as { config_hash: string } | undefined;
+    return row?.config_hash;
+  } finally {
+    db.close();
+  }
+}
+
+function setExternalEventLease(
+  dbPath: string,
+  key: string,
+  leaseAcquiredAt: string,
+): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db
+      .prepare(
+        `UPDATE external_event_keys
+         SET notify_pending_at = ?
+         WHERE key = ?`,
+      )
+      .run(leaseAcquiredAt, key);
+  } finally {
+    db.close();
+  }
+}
+
+function setCommercialTerminalTieResolvedAt(
+  dbPath: string,
+  dealId: string,
+  resolvedAt: string,
+): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db
+      .prepare(
+        `UPDATE commercial_states
+         SET terminal_tie_resolved_at = ?
+         WHERE deal_id = ?`,
+      )
+      .run(resolvedAt, dealId);
+  } finally {
+    db.close();
+  }
+}
+
 class AuditAppendFailureStore extends Store {
   failNotificationAppend = false;
 
@@ -84,6 +302,3100 @@ class AuditAppendFailureStore extends Store {
     super.appendEvent(...args);
   }
 }
+
+describe("Store Phase 1 storage schema", () => {
+  it("creates the lifecycle tables", () => {
+    withTempStoreDb((db) => {
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .all() as Array<{ name: string }>;
+
+      expect(tables.map((row) => row.name)).toEqual(
+        expect.arrayContaining([
+          "commercial_states",
+          "deployment_facts",
+          "deployment_facts_rejections",
+          "deployment_readiness",
+          "integration_config",
+          "external_event_observations",
+          "idempotency_violations",
+          "outcome_events",
+          "outcome_rejections",
+        ]),
+      );
+    });
+  });
+
+  it("enforces commercial-state terminal tie invariants", () => {
+    withTempStoreDb((db) => {
+      const insert = db.prepare(
+        `INSERT INTO commercial_states (
+           deal_id, commercial_state, source, source_event_id,
+           source_payload_hash, occurred_at, state_entered_at, updated_at,
+           terminal_projected_at, projected_via_terminal_tie,
+           terminal_tie_occurred_at, terminal_tie_resolved_at,
+           terminal_tie_winner_state, terminal_tie_loser_state
+         )
+         VALUES (?, ?, 'local', ?, 'hash', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const at = "2026-05-21T00:00:00.000Z";
+
+      expect(() =>
+        insert.run(
+          "deal-open-terminal-at",
+          "open",
+          "evt-open-terminal-at",
+          at,
+          at,
+          at,
+          at,
+          0,
+          null,
+          null,
+          null,
+          null,
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-won-missing-terminal-at",
+          "closed_won",
+          "evt-won-missing-terminal-at",
+          at,
+          at,
+          at,
+          null,
+          0,
+          null,
+          null,
+          null,
+          null,
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-direct-with-tie-fields",
+          "closed_won",
+          "evt-direct-with-tie-fields",
+          at,
+          at,
+          at,
+          at,
+          0,
+          at,
+          at,
+          "closed_lost",
+          "closed_won",
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-mismatched-tie-winner",
+          "closed_lost",
+          "evt-mismatched-tie-winner",
+          at,
+          at,
+          at,
+          at,
+          1,
+          at,
+          at,
+          "closed_won",
+          "closed_lost",
+        ),
+      ).toThrow();
+
+      insert.run(
+        "deal-tie",
+        "closed_lost",
+        "evt-tie",
+        at,
+        at,
+        at,
+        at,
+        1,
+        at,
+        at,
+        "closed_lost",
+        "closed_won",
+      );
+
+      const row = db
+        .prepare("SELECT projected_via_terminal_tie FROM commercial_states WHERE deal_id='deal-tie'")
+        .get() as { projected_via_terminal_tie: number };
+      expect(row.projected_via_terminal_tie).toBe(1);
+    });
+  });
+
+  it("enforces deployment-readiness blocker and notification invariants", () => {
+    withTempStoreDb((db) => {
+      const insert = db.prepare(
+        `INSERT INTO deployment_readiness (
+           deal_id, readiness, blocker_code, secondary_blocker_codes,
+           blocker_entered_at, reason, state_entered_at,
+           last_notified_fingerprint, notify_status, notify_pending_at,
+           notify_attempts, notify_error, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      );
+      const at = "2026-05-21T00:00:00.000Z";
+
+      insert.run(
+        "deal-pending",
+        "pending",
+        null,
+        null,
+        null,
+        "awaiting deployment facts",
+        at,
+        null,
+        null,
+        null,
+        null,
+        at,
+      );
+
+      expect(() =>
+        insert.run(
+          "deal-blocked-no-code",
+          "blocked",
+          null,
+          null,
+          at,
+          null,
+          at,
+          null,
+          null,
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-ready-with-code",
+          "ready",
+          "deployment_data_unavailable",
+          null,
+          null,
+          null,
+          at,
+          null,
+          null,
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-pending-notify-without-lease",
+          "pending",
+          null,
+          null,
+          null,
+          null,
+          at,
+          "fingerprint",
+          "pending",
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+
+      expect(() =>
+        insert.run(
+          "deal-max-without-fingerprint",
+          "pending",
+          null,
+          null,
+          null,
+          null,
+          at,
+          null,
+          "max_attempts_exceeded",
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+    });
+  });
+
+  it("enforces observation and idempotency guardrail constraints", () => {
+    withTempStoreDb((db) => {
+      const at = "2026-05-21T00:00:00.000Z";
+      db.prepare(
+        `INSERT INTO external_event_observations (
+           source, source_event_id, observation_code, projected, payload_hash,
+           config_hash, mapped_commercial_state, router_deal_id, external_deal_id,
+           stage_id, occurred_at, reason, meta_json, created_at
+         )
+         VALUES (
+           'local', 'obs-1', 'terminal_tie_conflict', 1, 'payload',
+           'config', 'closed_lost', 'deal-1', 'external-1',
+           'closedlost', ?, 'terminal tie', ?, ?
+         )`,
+      ).run(
+        at,
+        JSON.stringify({
+          tieArrivalMode: "batch",
+          tieWinnerChangedProjection: true,
+          logicalTieKey: "deal-1:2026-05-21T00:00:00.000Z:closed_lost:closed_won",
+        }),
+        at,
+      );
+
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO external_event_observations (
+               source, source_event_id, observation_code, projected,
+               payload_hash, config_hash, created_at
+             )
+             VALUES ('local', 'obs-2', 'same_state_tie', 1, 'payload', 'config', ?)`,
+          )
+          .run(at),
+      ).toThrow();
+
+      db
+        .prepare(
+          `INSERT INTO idempotency_violations (
+             id, source, source_event_id, scope, existing_payload_hash,
+             incoming_payload_hash, reason, created_at
+           )
+           VALUES ('idem-outcome', 'local', 'evt-outcome', 'outcome', 'a', 'b', 'replay', ?)`,
+        )
+        .run(at);
+
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO idempotency_violations (
+               id, source, source_event_id, scope, existing_payload_hash,
+               incoming_payload_hash, reason, created_at
+             )
+             VALUES ('idem-1', 'local', 'evt-1', 'slack', 'a', 'b', 'bad scope', ?)`,
+          )
+          .run(at),
+      ).toThrow();
+    });
+  });
+
+  it("enforces outcome event and rejection constraints", () => {
+    withTempStoreDb((db) => {
+      const at = "2026-05-21T00:00:00.000Z";
+      const insertEvent = db.prepare(
+        `INSERT INTO outcome_events (
+           id, deal_id, source, source_event_id, source_payload_hash,
+           outcome, occurred_at, operator, operator_source, arr_delta_usd,
+           reason_category, created_at
+         )
+         VALUES (?, 'deal-1', ?, ?, 'hash', ?, ?, 'DS', ?, ?, ?, ?)`,
+      );
+
+      insertEvent.run(
+        "outcome-deployed",
+        "local",
+        "evt-deployed",
+        "deployed",
+        at,
+        "self_reported",
+        null,
+        "technical_blocker_resolved",
+        at,
+      );
+      insertEvent.run(
+        "outcome-expanded",
+        "local",
+        "evt-expanded",
+        "expanded",
+        at,
+        "self_reported",
+        25_000,
+        "scope_expanded",
+        at,
+      );
+
+      expect(() =>
+        insertEvent.run(
+          "outcome-deployed-arr",
+          "local",
+          "evt-deployed-arr",
+          "deployed",
+          at,
+          "self_reported",
+          1_000,
+          null,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-expanded-missing-arr",
+          "local",
+          "evt-expanded-missing-arr",
+          "expanded",
+          at,
+          "self_reported",
+          null,
+          "scope_expanded",
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-expanded-zero-arr",
+          "local",
+          "evt-expanded-zero-arr",
+          "expanded",
+          at,
+          "self_reported",
+          0,
+          "scope_expanded",
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-bad-source",
+          "hubspot",
+          "evt-bad-source",
+          "deployed",
+          at,
+          "self_reported",
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-bad-outcome",
+          "local",
+          "evt-bad-outcome",
+          "go_live",
+          at,
+          "self_reported",
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-bad-operator-source",
+          "local",
+          "evt-bad-operator-source",
+          "deployed",
+          at,
+          "system",
+          null,
+          null,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertEvent.run(
+          "outcome-bad-reason",
+          "local",
+          "evt-bad-reason",
+          "deployed",
+          at,
+          "self_reported",
+          null,
+          "customer_note",
+          at,
+        ),
+      ).toThrow();
+
+      const insertRejection = db.prepare(
+        `INSERT INTO outcome_rejections (
+           id, deal_id, source, source_event_id, source_payload_hash,
+           rejection_kind, outcome, occurred_at, created_at
+         )
+         VALUES (?, 'deal-1', ?, ?, 'hash', ?, ?, ?, ?)`,
+      );
+      insertRejection.run(
+        "outcome-rejection",
+        "local",
+        "evt-rejected",
+        "missing_prior_outcome",
+        "deployed",
+        at,
+        at,
+      );
+
+      expect(() =>
+        insertRejection.run(
+          "outcome-rejection-bad-kind",
+          "local",
+          "evt-rejected-bad-kind",
+          "not_closed_won",
+          "deployed",
+          at,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertRejection.run(
+          "outcome-rejection-bad-source",
+          "hubspot",
+          "evt-rejected-bad-source",
+          "missing_prior_outcome",
+          "deployed",
+          at,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        insertRejection.run(
+          "outcome-rejection-bad-outcome",
+          "local",
+          "evt-rejected-bad-outcome",
+          "missing_prior_outcome",
+          "go_live",
+          at,
+          at,
+        ),
+      ).toThrow();
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO outcome_rejections (
+               id, deal_id, source, source_event_id, source_payload_hash,
+               rejection_kind, outcome, occurred_at, created_at
+             )
+             VALUES (
+               'outcome-rejection-null-source-event', 'deal-1', 'local',
+               NULL, 'hash', 'missing_prior_outcome', 'deployed', ?, ?
+             )`,
+          )
+          .run(at, at),
+      ).toThrow();
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO outcome_rejections (
+               id, deal_id, source, source_event_id, source_payload_hash,
+               rejection_kind, outcome, occurred_at, created_at
+             )
+             VALUES (
+               'outcome-rejection-null-payload-hash', 'deal-1', 'local',
+               'evt-rejected-null-payload-hash', NULL, 'missing_prior_outcome',
+               'deployed', ?, ?
+             )`,
+          )
+          .run(at, at),
+      ).toThrow();
+    });
+  });
+
+  it("deduplicates unchanged integration config activations", () => {
+    const dir = join(tmpdir(), `gtm-router-config-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      const bundle = integrationConfigBundleFromEnv("dry-run", {
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
+      });
+      const first = store.recordIntegrationConfigBundle(bundle);
+      const second = store.recordIntegrationConfigBundle(bundle);
+      const changed = store.recordIntegrationConfigBundle({
+        ...bundle,
+        allowLocalWriteEndpoints: true,
+      });
+      expect(first.activationId).toBe(second.activationId);
+      expect(changed.activationId).not.toBe(first.activationId);
+      expect(first.bundleHash).toBe(second.bundleHash);
+      expect(changed.bundleHash).not.toBe(first.bundleHash);
+      expect(first.rows).toBe(11);
+      expect(second.rows).toBe(0);
+      expect(changed.rows).toBe(11);
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const activations = db
+          .prepare(
+            "SELECT activation_id, value_hash FROM integration_config WHERE key='effective_bundle' ORDER BY id",
+          )
+          .all() as Array<{ activation_id: string; value_hash: string }>;
+        expect(activations).toHaveLength(2);
+        expect(activations[0]?.activation_id).toBe(first.activationId);
+        expect(activations[1]?.activation_id).toBe(changed.activationId);
+        expect(activations[0]?.value_hash).toBe(first.bundleHash);
+        expect(activations[1]?.value_hash).toBe(changed.bundleHash);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stores raw local commercial UUIDs in projections and observations", () => {
+    const dir = join(tmpdir(), `gtm-router-commercial-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "open",
+        sourceEventId: "77777777-7777-4777-8777-777777777777",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "proposal_sent",
+        sourceEventId: "88888888-8888-4888-8888-888888888888",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const conflict = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "open",
+        sourceEventId: "77777777-7777-4777-8777-777777777777",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: "changed replay",
+        expectedRedPath: false,
+      });
+
+      expect(conflict.status).toBe("idempotency_conflict");
+      expect(store.commercialState("D-lease")?.sourceEventId).toBe(
+        "88888888-8888-4888-8888-888888888888",
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const observation = db
+          .prepare(
+            `SELECT source_event_id
+             FROM external_event_observations
+             WHERE observation_code='commercial_stage_tie_resolved'`,
+          )
+          .get() as { source_event_id: string } | undefined;
+        const claim = db
+          .prepare(
+            `SELECT key
+             FROM external_event_keys
+             WHERE key = ?`,
+          )
+          .get(
+            JSON.stringify([
+              "commercial_state",
+              "local",
+              "88888888-8888-4888-8888-888888888888",
+            ]),
+          ) as { key: string } | undefined;
+        const violation = db
+          .prepare(
+            `SELECT source_event_id
+             FROM idempotency_violations
+             WHERE scope='commercial_state'`,
+          )
+          .get() as { source_event_id: string } | undefined;
+
+        expect(observation?.source_event_id).toBe(
+          "88888888-8888-4888-8888-888888888888",
+        );
+        expect(claim?.key).toBe(
+          JSON.stringify([
+            "commercial_state",
+            "local",
+            "88888888-8888-4888-8888-888888888888",
+          ]),
+        );
+        expect(violation?.source_event_id).toBe(
+          "77777777-7777-4777-8777-777777777777",
+        );
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the existing winner event id when a terminal tie arrives late", () => {
+    const store = new Store(":memory:");
+    try {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_lost",
+        sourceEventId: "99999999-9999-4999-8999-999999999999",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const tie = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const current = store.commercialState("D-lease");
+
+      expect(tie.status).toBe("recorded");
+      expect(tie.projected).toBe(false);
+      expect(current?.commercialState).toBe("closed_lost");
+      expect(current?.sourceEventId).toBe(
+        "99999999-9999-4999-8999-999999999999",
+      );
+      expect(current?.projectedViaTerminalTie).toBe(true);
+      expect(current?.terminalTieWinnerState).toBe("closed_lost");
+      expect(current?.terminalTieLoserState).toBe("closed_won");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("claims deployment facts before stale and tie handling while preserving current facts", () => {
+    const dir = join(tmpdir(), `gtm-router-facts-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const oldAt = new Date(
+        Date.now() - (DEPLOYMENT_FACT_MAX_AGE_DAYS + 1) * 86_400_000,
+      ).toISOString();
+      const freshAt = new Date(Date.now() - 60_000).toISOString();
+      const olderThanFreshAt = new Date(Date.parse(freshAt) - 60_000).toISOString();
+
+      const staleAge = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: oldAt,
+      });
+      const recorded = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: freshAt,
+      });
+      const staleOrdering = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        useCaseClear: false,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: olderThanFreshAt,
+      });
+      const sameValuesTie = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: freshAt,
+      });
+      const differentValuesTie = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "abababab-abab-4bab-8bab-abababababab",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: freshAt,
+      });
+      const differentOperatorTie = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "acacacac-acac-4cac-8cac-acacacacacac",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "FDE",
+        occurredAt: freshAt,
+      });
+
+      expect(staleAge).toEqual(
+        expect.objectContaining({ status: "stale_age", accepted: false }),
+      );
+      expect(recorded).toEqual(
+        expect.objectContaining({ status: "recorded", accepted: true }),
+      );
+      expect(staleOrdering).toEqual(
+        expect.objectContaining({ status: "stale_ordering", accepted: false }),
+      );
+      expect(sameValuesTie).toEqual(
+        expect.objectContaining({ status: "same_values_tie", accepted: false }),
+      );
+      expect(differentValuesTie).toEqual(
+        expect.objectContaining({ status: "tie_conflict", accepted: false }),
+      );
+      expect(differentOperatorTie).toEqual(
+        expect.objectContaining({ status: "tie_conflict", accepted: false }),
+      );
+      expect(store.deploymentFacts("D-lease")).toEqual(
+        expect.objectContaining({
+          sourceEventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          useCaseClear: true,
+          integrationsKnown: true,
+          dataReady: true,
+        }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const rejections = db
+          .prepare(
+            `SELECT source_event_id, rejection_kind, current_occurred_at
+             FROM deployment_facts_rejections
+             ORDER BY created_at, source_event_id`,
+          )
+          .all() as Array<{
+          source_event_id: string;
+          rejection_kind: string;
+          current_occurred_at: string | null;
+        }>;
+        const claims = db
+          .prepare(
+            "SELECT key FROM external_event_keys WHERE key LIKE '[\"deployment_facts\"%' ORDER BY key",
+          )
+          .all() as Array<{ key: string }>;
+
+        expect(rejections).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              source_event_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              rejection_kind: "age",
+              current_occurred_at: null,
+            }),
+            expect.objectContaining({
+              source_event_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+              rejection_kind: "ordering",
+              current_occurred_at: freshAt,
+            }),
+            expect.objectContaining({
+              source_event_id: "abababab-abab-4bab-8bab-abababababab",
+              rejection_kind: "tie_conflict",
+              current_occurred_at: freshAt,
+            }),
+            expect.objectContaining({
+              source_event_id: "acacacac-acac-4cac-8cac-acacacacacac",
+              rejection_kind: "tie_conflict",
+              current_occurred_at: freshAt,
+            }),
+          ]),
+        );
+        expect(claims).toHaveLength(6);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a hash-shaped config sentinel before integrations are recorded", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "17171717-1717-4717-8717-171717171717",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "18181818-1818-4818-8818-181818181818",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+        reason: "newer duplicate state",
+        expectedRedPath: false,
+      });
+
+      const configHash = readObservationConfigHash(
+        dbPath,
+        "18181818-1818-4818-8818-181818181818",
+      );
+
+      expect(configHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(configHash).not.toBe("local");
+    });
+  });
+});
+
+describe("Store readiness derivation", () => {
+  it("claims one readiness notification per readiness transition", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d0d0d0d0-d0d0-40d0-80d0-d0d0d0d0d0d0",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      expect(pending.readinessNotification).toEqual(
+        expect.objectContaining({
+          dealId: "D-lease",
+          fingerprint: "readiness:D-lease:none:pending",
+          previousReadiness: "none",
+          readiness: "pending",
+          blockerCode: null,
+          attempt: 1,
+        }),
+      );
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          last_notified_fingerprint: "readiness:D-lease:none:pending",
+          notify_status: "pending",
+          notify_pending_at: expect.any(String),
+          notify_attempts: 0,
+          notify_error: null,
+        }),
+      );
+
+      const duplicate = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d0d0d0d0-d0d0-40d0-80d0-d0d0d0d0d0d0",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      expect(duplicate.status).toBe("duplicate");
+      expect(duplicate.readinessNotification).toBeNull();
+
+      const ready = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: new Date().toISOString(),
+      });
+
+      expect(ready.readinessNotification).toEqual(
+        expect.objectContaining({
+          dealId: "D-lease",
+          fingerprint: "readiness:D-lease:pending:ready",
+          previousReadiness: "pending",
+          readiness: "ready",
+          blockerCode: null,
+          attempt: 1,
+        }),
+      );
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          last_notified_fingerprint: "readiness:D-lease:pending:ready",
+          notify_status: "pending",
+          notify_attempts: 0,
+        }),
+      );
+    });
+  });
+
+  it("does not claim a new notification for blocker-only blocked updates", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d2d2d2d2-d2d2-42d2-82d2-d2d2d2d2d2d2",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const blocked = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "d3d3d3d3-d3d3-43d3-83d3-d3d3d3d3d3d3",
+        useCaseClear: false,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+      expect(blocked.readinessNotification?.fingerprint).toBe(
+        "readiness:D-lease:pending:blocked",
+      );
+
+      const changedBlocker = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "d4d4d4d4-d4d4-44d4-84d4-d4d4d4d4d4d4",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:02:00.000Z",
+      });
+
+      expect(changedBlocker.status).toBe("recorded");
+      expect(changedBlocker.readinessNotification).toBeNull();
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "blocked",
+          blocker_code: "deployment_integration_unknown",
+        }),
+      );
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          last_notified_fingerprint: "readiness:D-lease:pending:blocked",
+          notify_status: "pending",
+        }),
+      );
+    });
+  });
+
+  it("records readiness notification results against the claimed fingerprint", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d5d5d5d5-d5d5-45d5-85d5-d5d5d5d5d5d5",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      const claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "posted redacted deployment handoff",
+        },
+      ]);
+
+      expect(delivery).toEqual({ status: "ok", fallbackClaim: null });
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          last_notified_fingerprint: "readiness:D-lease:none:pending",
+          notify_status: "ok",
+          notify_pending_at: null,
+          notify_attempts: 0,
+          notify_error: null,
+        }),
+      );
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "deployment readiness notification",
+          meta: expect.objectContaining({
+            kind: "deployment_readiness_notification",
+            mode: "dry_run",
+            fingerprint: "readiness:D-lease:none:pending",
+            readiness: "pending",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("audits readiness notifications that lose the lease to a newer state", () => {
+    withTempStore((store) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const supersededClaim = pending.readinessNotification;
+      if (!supersededClaim) throw new Error("expected readiness notification claim");
+
+      const ready = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+      expect(ready.readinessNotification?.fingerprint).toBe(
+        "readiness:D-lease:pending:ready",
+      );
+
+      const delivery = store.recordReadinessNotificationEvent(
+        supersededClaim,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted redacted deployment handoff",
+          },
+        ],
+      );
+
+      expect(delivery).toEqual({ status: "lost_race", fallbackClaim: null });
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "deployment readiness notification superseded",
+          meta: expect.objectContaining({
+            kind: "deployment_readiness_notification_superseded",
+            mode: "dry_run",
+            fingerprint: "readiness:D-lease:none:pending",
+            readiness: "pending",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("records warning readiness notification receipts as retryable failures", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d6d6d6d6-d6d6-46d6-86d6-d6d6d6d6d6d6",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      const claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "deployment readiness notification failed: channel_not_found",
+          status: "warning",
+        },
+      ]);
+
+      expect(delivery).toEqual({ status: "failed", fallbackClaim: null });
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          last_notified_fingerprint: "readiness:D-lease:none:pending",
+          notify_status: "failed",
+          notify_pending_at: null,
+          notify_attempts: 1,
+          notify_error:
+            "deployment readiness notification failed: channel_not_found",
+        }),
+      );
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "deployment readiness notification failed",
+          meta: expect.objectContaining({
+            kind: "deployment_readiness_notification",
+            receipts: [
+              expect.objectContaining({
+                status: "warning",
+                detail:
+                  "deployment readiness notification failed: channel_not_found",
+              }),
+            ],
+          }),
+        }),
+      );
+    });
+  });
+
+  it("claims primary readiness notification retries with CAS predicates", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d7d7d7d7-d7d7-47d7-87d7-d7d7d7d7d7d7",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const initialClaim = pending.readinessNotification;
+      if (!initialClaim) throw new Error("expected readiness notification claim");
+      store.recordReadinessNotificationEvent(initialClaim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "deployment readiness notification failed: rate_limited",
+          status: "warning",
+        },
+      ]);
+
+      const retryClaim = store.claimReadinessNotificationRetry(
+        "D-lease",
+        "readiness:D-lease:none:pending",
+      );
+      expect(retryClaim).toEqual(
+        expect.objectContaining({
+          dealId: "D-lease",
+          fingerprint: "readiness:D-lease:none:pending",
+          previousReadiness: "none",
+          readiness: "pending",
+          attempt: 2,
+        }),
+      );
+      expect(store.claimReadinessNotificationRetry(
+        "D-lease",
+        "readiness:D-lease:none:pending",
+      )).toBeNull();
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          notify_status: "pending",
+          notify_pending_at: retryClaim?.leaseAcquiredAt,
+          notify_attempts: 1,
+        }),
+      );
+    });
+  });
+
+  it("claims a fallback lease when primary readiness attempts are exhausted", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d8d8d8d8-d8d8-48d8-88d8-d8d8d8d8d8d8",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      let claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      let delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "deployment readiness notification failed: outage",
+          status: "warning",
+        },
+      ]);
+      expect(delivery.status).toBe("failed");
+      claim = store.claimReadinessNotificationRetry(
+        "D-lease",
+        "readiness:D-lease:none:pending",
+      );
+      if (!claim) throw new Error("expected first retry claim");
+      delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "deployment readiness notification failed: outage",
+          status: "warning",
+        },
+      ]);
+      expect(delivery.status).toBe("failed");
+      claim = store.claimReadinessNotificationRetry(
+        "D-lease",
+        "readiness:D-lease:none:pending",
+      );
+      if (!claim) throw new Error("expected second retry claim");
+      delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+        {
+          system: "slack",
+          externalId: "CDEPLOY",
+          detail: "deployment readiness notification failed: outage",
+          status: "warning",
+        },
+      ]);
+
+      expect(delivery).toEqual({
+        status: "max_attempts_exceeded",
+        fallbackClaim: expect.objectContaining({
+          dealId: "D-lease",
+          fingerprint: "readiness:D-lease:none:pending",
+          fallbackKey: "readiness_fallback:readiness:D-lease:none:pending",
+          readiness: "pending",
+          errorClass: "slack_delivery_failed",
+          leaseGeneration: 1,
+        }),
+      });
+      expect(readReadinessNotification(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          notify_status: "max_attempts_exceeded",
+          notify_attempts: 3,
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:none:pending",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          notify_status: "pending",
+          notify_leases: 1,
+          notify_pending_at: delivery.fallbackClaim?.leaseAcquiredAt,
+          scope: "readiness_fallback",
+        }),
+      );
+    });
+  });
+
+  it("preserves delivered fallback outcomes across recurring readiness transitions", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "ebebebeb-ebeb-4beb-8beb-ebebebebebeb",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      if (!pending.readinessNotification) {
+        throw new Error("expected pending notification");
+      }
+      store.recordReadinessNotificationEvent(
+        pending.readinessNotification,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted pending deployment handoff",
+          },
+        ],
+      );
+
+      const readyOne = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "ecececec-ecec-4cec-8cec-ecececececec",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+      if (!readyOne.readinessNotification) {
+        throw new Error("expected first ready notification");
+      }
+      store.recordReadinessNotificationEvent(
+        readyOne.readinessNotification,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted ready deployment handoff",
+          },
+        ],
+      );
+
+      const blockOne = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "edededed-eded-4ded-8ded-edededededed",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:02:00.000Z",
+      });
+      let claim = blockOne.readinessNotification;
+      if (!claim) throw new Error("expected first blocked notification");
+      let fallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        fallbackClaim = delivery.fallbackClaim;
+        if (fallbackClaim) break;
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:ready:blocked",
+        );
+        if (!claim) throw new Error("expected retry before first fallback");
+      }
+      if (!fallbackClaim) throw new Error("expected first fallback claim");
+      store.recordReadinessFallbackNotificationEvent(
+        fallbackClaim,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "posted deployment_handoff_failed alert",
+          },
+        ],
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:ready:blocked",
+        ),
+      ).toEqual(expect.objectContaining({ notify_status: "ok" }));
+
+      const readyTwo = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:03:00.000Z",
+      });
+      if (!readyTwo.readinessNotification) {
+        throw new Error("expected second ready notification");
+      }
+      store.recordReadinessNotificationEvent(
+        readyTwo.readinessNotification,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted ready deployment handoff again",
+          },
+        ],
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:ready:blocked",
+        ),
+      ).toEqual(expect.objectContaining({ notify_status: "ok" }));
+
+      const blockTwo = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "efefefef-efef-4fef-8fef-efefefefefef",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:04:00.000Z",
+      });
+      claim = blockTwo.readinessNotification;
+      expect(claim?.fingerprint).toBe("readiness:D-lease:ready:blocked");
+      if (!claim) throw new Error("expected second blocked notification");
+
+      let secondFallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        secondFallbackClaim = delivery.fallbackClaim;
+        if (secondFallbackClaim) break;
+        if (delivery.status === "max_attempts_exceeded") break;
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:ready:blocked",
+        );
+        if (!claim) throw new Error("expected retry before second fallback");
+      }
+
+      expect(secondFallbackClaim).toBeNull();
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:ready:blocked",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          notify_status: "ok",
+          notify_leases: 1,
+          notify_pending_at: null,
+        }),
+      );
+      expect(
+        store.readinessFallbackClaimMissStatus(
+          "readiness:D-lease:ready:blocked",
+        ),
+      ).toBe("already_delivered");
+    });
+  });
+
+  it("reclaims superseded fallback rows when a recurring transition reuses a fingerprint", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "abababab-abab-4bab-8bab-abababababab",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      if (!pending.readinessNotification) {
+        throw new Error("expected pending notification");
+      }
+      store.recordReadinessNotificationEvent(
+        pending.readinessNotification,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted pending deployment handoff",
+          },
+        ],
+      );
+
+      const readyOne = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "acacacac-acac-4cac-8cac-acacacacacac",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+      if (!readyOne.readinessNotification) {
+        throw new Error("expected first ready notification");
+      }
+      store.recordReadinessNotificationEvent(
+        readyOne.readinessNotification,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "posted ready deployment handoff",
+          },
+        ],
+      );
+
+      const blockOne = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "adadadad-adad-4dad-8dad-adadadadadad",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:02:00.000Z",
+      });
+      let claim = blockOne.readinessNotification;
+      if (!claim) throw new Error("expected first blocked notification");
+      let fallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        fallbackClaim = delivery.fallbackClaim;
+        if (fallbackClaim) break;
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:ready:blocked",
+        );
+        if (!claim) throw new Error("expected retry before first fallback");
+      }
+      if (!fallbackClaim) throw new Error("expected first fallback claim");
+
+      const readyTwo = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:03:00.000Z",
+      });
+      if (!readyTwo.readinessNotification) {
+        throw new Error("expected second ready notification");
+      }
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:ready:blocked",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          notify_status: "superseded_by_new_readiness",
+          notify_pending_at: null,
+        }),
+      );
+
+      const blockTwo = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "afafafaf-afaf-4faf-8faf-afafafafafaf",
+        useCaseClear: true,
+        integrationsKnown: false,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:04:00.000Z",
+      });
+      claim = blockTwo.readinessNotification;
+      if (!claim) throw new Error("expected second blocked notification");
+      let secondFallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        secondFallbackClaim = delivery.fallbackClaim;
+        if (secondFallbackClaim) break;
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:ready:blocked",
+        );
+        if (!claim) throw new Error("expected retry before second fallback");
+      }
+
+      expect(secondFallbackClaim).toEqual(
+        expect.objectContaining({
+          dealId: "D-lease",
+          fingerprint: "readiness:D-lease:ready:blocked",
+          fallbackKey: "readiness_fallback:readiness:D-lease:ready:blocked",
+          readiness: "blocked",
+          leaseGeneration: 1,
+        }),
+      );
+    });
+  });
+
+  it("records fallback notification success against the claimed lease generation", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "d9d9d9d9-d9d9-49d9-89d9-d9d9d9d9d9d9",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      let claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        if (delivery.fallbackClaim) {
+          const fallback = store.recordReadinessFallbackNotificationEvent(
+            delivery.fallbackClaim,
+            "dry_run",
+            [
+              {
+                system: "slack",
+                externalId: "CGENERIC",
+                detail: "posted deployment_handoff_failed alert",
+              },
+            ],
+          );
+          expect(fallback).toEqual({ status: "ok" });
+          break;
+        }
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:none:pending",
+        );
+        if (!claim) throw new Error("expected retry claim before fallback");
+      }
+
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:none:pending",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          notify_status: "ok",
+          notify_pending_at: null,
+          notify_leases: 1,
+        }),
+      );
+      expect(
+        store.readinessNotificationRetryCandidates({
+          dealId: "D-lease",
+          limit: 10,
+        }),
+      ).toEqual([]);
+      expect(
+        store.readinessFallbackClaimMissStatus(
+          "readiness:D-lease:none:pending",
+        ),
+      ).toBe("already_delivered");
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "deployment handoff fallback notification",
+          meta: expect.objectContaining({
+            kind: "deployment_handoff_failed",
+            fingerprint: "readiness:D-lease:none:pending",
+            fallbackKey: "readiness_fallback:readiness:D-lease:none:pending",
+            readiness: "pending",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("removes terminal fallback failures from retry candidates", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "dadadada-dada-4ada-8ada-dadadadadada",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      let claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      let fallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        if (delivery.fallbackClaim) {
+          fallbackClaim = delivery.fallbackClaim;
+          break;
+        }
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:none:pending",
+        );
+        if (!claim) throw new Error("expected retry claim before fallback");
+      }
+      if (!fallbackClaim) throw new Error("expected fallback claim");
+
+      for (let i = 0; i < 3; i += 1) {
+        const fallback = store.recordReadinessFallbackNotificationEvent(
+          fallbackClaim,
+          "dry_run",
+          [
+            {
+              system: "slack",
+              externalId: "CGENERIC",
+              detail: "deployment handoff fallback notification failed: outage",
+              status: "warning",
+            },
+          ],
+        );
+        if (fallback.status === "fallback_max_attempts_exceeded") break;
+        fallbackClaim = store.claimReadinessFallback(
+          "D-lease",
+          "readiness:D-lease:none:pending",
+        );
+        if (!fallbackClaim) throw new Error("expected fallback retry claim");
+      }
+
+      expect(
+        readExternalEventKey(
+          dbPath,
+          "readiness_fallback:readiness:D-lease:none:pending",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          notify_status: "fallback_max_attempts_exceeded",
+          notify_leases: 3,
+        }),
+      );
+      expect(
+        store.readinessNotificationRetryCandidates({
+          dealId: "D-lease",
+          limit: 10,
+        }),
+      ).toEqual([]);
+      expect(
+        store.readinessFallbackClaimMissStatus(
+          "readiness:D-lease:none:pending",
+        ),
+      ).toBe("fallback_max_attempts_exceeded");
+    });
+  });
+
+  it("orders readiness retry candidates by oldest pending lease", () => {
+    withTempStore((store, dbPath) => {
+      const db = new DatabaseSync(dbPath);
+      try {
+        const insert = db.prepare(
+          `INSERT INTO deployment_readiness (
+             deal_id, readiness, blocker_code, secondary_blocker_codes,
+             blocker_entered_at, reason, state_entered_at,
+             last_notified_fingerprint, notify_status, notify_pending_at,
+             notify_attempts, notify_error, updated_at
+           )
+           VALUES (?, 'pending', NULL, NULL, NULL, NULL, ?, ?, 'pending', ?, 0, NULL, ?)`,
+        );
+        insert.run(
+          "D-a",
+          "2026-05-21T12:00:00.000Z",
+          "readiness:D-a:none:pending",
+          "2001-01-01T00:00:00.000Z",
+          "2001-01-01T00:00:00.000Z",
+        );
+        insert.run(
+          "D-z",
+          "2026-05-21T12:00:00.000Z",
+          "readiness:D-z:none:pending",
+          "2000-01-01T00:00:00.000Z",
+          "2000-01-01T00:00:00.000Z",
+        );
+      } finally {
+        db.close();
+      }
+
+      expect(
+        store
+          .readinessNotificationRetryCandidates({ limit: 2 })
+          .map((candidate) => candidate.dealId),
+      ).toEqual(["D-z", "D-a"]);
+    });
+  });
+
+  it("orders terminal drift retry candidates by oldest pending lease", () => {
+    withTempStore((store, dbPath) => {
+      const db = new DatabaseSync(dbPath);
+      try {
+        const insertObservation = db.prepare(
+          `INSERT INTO external_event_observations (
+             source, source_event_id, observation_code, projected,
+             payload_hash, config_hash, router_deal_id, created_at
+           )
+           VALUES ('local', ?, 'terminal_drift_unsupported', 0, ?, ?, ?, ?)`,
+        );
+        const insertKey = db.prepare(
+          `INSERT INTO external_event_keys (
+             key, system, recorded_at, notify_status, notify_leases,
+             notify_pending_at, scope
+           )
+           VALUES (?, 'slack', ?, 'pending', 1, ?, 'commercial_terminal_drift')`,
+        );
+        insertObservation.run(
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "payload-a",
+          "config-a",
+          "D-a",
+          "2001-01-01T00:00:00.000Z",
+        );
+        insertKey.run(
+          "commercial_terminal_drift:local:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "2001-01-01T00:00:00.000Z",
+          "2001-01-01T00:00:00.000Z",
+        );
+        insertObservation.run(
+          "zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz",
+          "payload-z",
+          "config-z",
+          "D-z",
+          "2000-01-01T00:00:00.000Z",
+        );
+        insertKey.run(
+          "commercial_terminal_drift:local:zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz",
+          "2000-01-01T00:00:00.000Z",
+          "2000-01-01T00:00:00.000Z",
+        );
+      } finally {
+        db.close();
+      }
+
+      expect(
+        store
+          .commercialTerminalDriftAlertRetryCandidates({ limit: 2 })
+          .map((candidate) => candidate.dealId),
+      ).toEqual(["D-z", "D-a"]);
+    });
+  });
+
+  it("audits fallback notifications that lose the lease to a newer readiness", () => {
+    withTempStore((store) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const pending = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "53535353-5353-4353-8353-535353535353",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      let claim = pending.readinessNotification;
+      if (!claim) throw new Error("expected readiness notification claim");
+      let fallbackClaim = null;
+      for (let i = 0; i < 3; i += 1) {
+        const delivery = store.recordReadinessNotificationEvent(claim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CDEPLOY",
+            detail: "deployment readiness notification failed: outage",
+            status: "warning",
+          },
+        ]);
+        fallbackClaim = delivery.fallbackClaim;
+        if (fallbackClaim) break;
+        claim = store.claimReadinessNotificationRetry(
+          "D-lease",
+          "readiness:D-lease:none:pending",
+        );
+        if (!claim) throw new Error("expected retry claim before fallback");
+      }
+      if (!fallbackClaim) throw new Error("expected fallback claim");
+
+      const ready = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "54545454-5454-4454-8454-545454545454",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+      expect(ready.readinessNotification?.fingerprint).toBe(
+        "readiness:D-lease:pending:ready",
+      );
+
+      const delivery = store.recordReadinessFallbackNotificationEvent(
+        fallbackClaim,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "posted deployment_handoff_failed alert",
+          },
+        ],
+      );
+
+      expect(delivery).toEqual({ status: "lost_race" });
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "deployment handoff fallback notification superseded",
+          meta: expect.objectContaining({
+            kind: "deployment_handoff_failed_superseded",
+            mode: "dry_run",
+            fingerprint: "readiness:D-lease:none:pending",
+            fallbackKey: "readiness_fallback:readiness:D-lease:none:pending",
+            readiness: "pending",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("reclaims failed terminal drift alert leases for retry", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "51515151-5151-4151-8151-515151515151",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const drift = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_lost",
+        sourceEventId: "52525252-5252-4252-8252-525252525252",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+        reason: null,
+        expectedRedPath: true,
+      });
+      if (!drift.terminalDriftAlert) {
+        throw new Error("expected terminal drift alert claim");
+      }
+      const alertKey =
+        "commercial_terminal_drift:local:52525252-5252-4252-8252-525252525252";
+      const failed = store.recordCommercialTerminalDriftAlertEvent(
+        drift.terminalDriftAlert,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "commercial terminal drift alert failed: rate_limited",
+            status: "warning",
+          },
+        ],
+      );
+
+      expect(failed).toEqual({ status: "failed" });
+      expect(
+        store.commercialTerminalDriftAlertRetryCandidates({
+          dealId: "D-lease",
+          limit: 10,
+        }),
+      ).toEqual([
+        {
+          type: "terminal_drift",
+          dealId: "D-lease",
+          alertKey,
+        },
+      ]);
+      const retryClaim = store.claimCommercialTerminalDriftAlertRetry(alertKey);
+      expect(retryClaim).toEqual(
+        expect.objectContaining({
+          dealId: "D-lease",
+          alertKey,
+          sourceEventId: "52525252-5252-4252-8252-525252525252",
+          incomingCommercialState: "closed_lost",
+          currentCommercialState: "closed_won",
+          driftKind: "terminal_regression",
+          expectedRedPath: true,
+          leaseGeneration: 2,
+        }),
+      );
+      expect(readExternalEventKey(dbPath, alertKey)).toEqual(
+        expect.objectContaining({
+          notify_status: "pending",
+          notify_leases: 2,
+          notify_pending_at: retryClaim?.leaseAcquiredAt,
+        }),
+      );
+      if (!retryClaim) throw new Error("expected terminal drift retry claim");
+      expect(
+        store.recordCommercialTerminalDriftAlertEvent(retryClaim, "dry_run", [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "posted commercial_terminal_drift alert",
+          },
+        ]),
+      ).toEqual({ status: "ok" });
+      expect(
+        store.commercialTerminalDriftAlertRetryCandidates({
+          dealId: "D-lease",
+          limit: 10,
+        }),
+      ).toEqual([]);
+    });
+  });
+
+  it("audits terminal drift alerts that lose the lease", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "55555555-5555-4555-8555-555555555555",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const drift = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_lost",
+        sourceEventId: "56565656-5656-4656-8656-565656565656",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+        reason: null,
+        expectedRedPath: true,
+      });
+      if (!drift.terminalDriftAlert) {
+        throw new Error("expected terminal drift alert claim");
+      }
+      const alertKey =
+        "commercial_terminal_drift:local:56565656-5656-4656-8656-565656565656";
+      setExternalEventLease(dbPath, alertKey, "2026-05-21T12:02:00.000Z");
+
+      const delivery = store.recordCommercialTerminalDriftAlertEvent(
+        drift.terminalDriftAlert,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "posted commercial_terminal_drift alert",
+          },
+        ],
+      );
+
+      expect(delivery).toEqual({ status: "lost_race" });
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "commercial terminal drift alert superseded",
+          meta: expect.objectContaining({
+            kind: "commercial_terminal_drift_superseded",
+            mode: "dry_run",
+            alertKey,
+            sourceEventId: "56565656-5656-4656-8656-565656565656",
+            incomingCommercialState: "closed_lost",
+            currentCommercialState: "closed_won",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("keeps terminal drift tie classification stable across retries", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const tieAt = "2026-05-21T12:00:00.000Z";
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "57575757-5757-4757-8757-575757575757",
+        occurredAt: tieAt,
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_lost",
+        sourceEventId: "58585858-5858-4858-8858-585858585858",
+        occurredAt: tieAt,
+        reason: null,
+        expectedRedPath: false,
+      });
+      expect(store.commercialState("D-lease")).toEqual(
+        expect.objectContaining({
+          commercialState: "closed_lost",
+          projectedViaTerminalTie: true,
+        }),
+      );
+
+      const drift = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "59595959-5959-4959-8959-595959595959",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+        reason: null,
+        expectedRedPath: true,
+      });
+      if (!drift.terminalDriftAlert) {
+        throw new Error("expected terminal drift alert claim");
+      }
+      expect(drift.terminalDriftAlert.tieResolutionDrift).toBe(true);
+      store.recordCommercialTerminalDriftAlertEvent(
+        drift.terminalDriftAlert,
+        "dry_run",
+        [
+          {
+            system: "slack",
+            externalId: "CGENERIC",
+            detail: "commercial terminal drift alert failed: rate_limited",
+            status: "warning",
+          },
+        ],
+      );
+
+      const alertKey =
+        "commercial_terminal_drift:local:59595959-5959-4959-8959-595959595959";
+      setCommercialTerminalTieResolvedAt(
+        dbPath,
+        "D-lease",
+        "2026-05-21T00:00:00.000Z",
+      );
+      const retryClaim = store.claimCommercialTerminalDriftAlertRetry(alertKey);
+
+      expect(retryClaim).toEqual(
+        expect.objectContaining({
+          alertKey,
+          tieResolutionDrift: true,
+        }),
+      );
+    });
+  });
+
+  it("derives pending immediately for closed-won human-assisted deals without facts", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const result = store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "adadadad-adad-4dad-8dad-adadadadadad",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      expect(result.status).toBe("recorded");
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "pending",
+          blocker_code: null,
+          secondary_blocker_codes: null,
+          blocker_entered_at: null,
+          reason: "awaiting deployment facts",
+        }),
+      );
+    });
+  });
+
+  it("flips closed-won human-assisted readiness to ready when complete facts arrive", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      const result = store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "afafafaf-afaf-4faf-8faf-afafafafafaf",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: new Date().toISOString(),
+      });
+
+      expect(result.status).toBe("recorded");
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "ready",
+          blocker_code: null,
+          secondary_blocker_codes: null,
+          blocker_entered_at: null,
+          reason: null,
+        }),
+      );
+    });
+  });
+
+  it("derives blocked readiness with primary and secondary blockers", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
+        useCaseClear: false,
+        integrationsKnown: false,
+        dataReady: false,
+        operator: "DS",
+        occurredAt: new Date().toISOString(),
+      });
+
+      const readiness = readReadiness(dbPath, "D-lease");
+      expect(readiness).toEqual(
+        expect.objectContaining({
+          readiness: "blocked",
+          blocker_code: "deployment_use_case_unclear",
+          secondary_blocker_codes: JSON.stringify([
+            "deployment_integration_unknown",
+            "deployment_data_unavailable",
+          ]),
+          reason: "blocked: deployment_use_case_unclear",
+        }),
+      );
+      expect(readiness?.blocker_entered_at).toEqual(expect.any(String));
+    });
+  });
+
+  it("stores null secondary blockers for a single blocker", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "b3b3b3b3-b3b3-43b3-83b3-b3b3b3b3b3b3",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: false,
+        operator: "DS",
+        occurredAt: new Date().toISOString(),
+      });
+
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "blocked",
+          blocker_code: "deployment_data_unavailable",
+          secondary_blocker_codes: null,
+        }),
+      );
+    });
+  });
+
+  it("preserves blocker_entered_at when the primary blocker is unchanged", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "b6b6b6b6-b6b6-46b6-86b6-b6b6b6b6b6b6",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "b7b7b7b7-b7b7-47b7-87b7-b7b7b7b7b7b7",
+        useCaseClear: false,
+        integrationsKnown: false,
+        dataReady: false,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:01:00.000Z",
+      });
+
+      const sentinel = "2026-05-21T00:00:00.000Z";
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          "UPDATE deployment_readiness SET blocker_entered_at=? WHERE deal_id=?",
+        ).run(sentinel, "D-lease");
+      } finally {
+        db.close();
+      }
+
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "b8b8b8b8-b8b8-48b8-88b8-b8b8b8b8b8b8",
+        useCaseClear: false,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-21T12:02:00.000Z",
+      });
+
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "blocked",
+          blocker_code: "deployment_use_case_unclear",
+          secondary_blocker_codes: null,
+          blocker_entered_at: sentinel,
+        }),
+      );
+    });
+  });
+
+  it("treats corrupt stored deployment fact timestamps as missing facts", () => {
+    const dir = join(tmpdir(), `gtm-router-corrupt-facts-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          `INSERT INTO deployment_facts (
+             deal_id, use_case_clear, integrations_known, data_ready,
+             source, source_event_id, source_payload_hash, operator,
+             operator_source, occurred_at, updated_at
+           )
+           VALUES (
+             'D-lease', 1, 1, 1, 'local',
+             'b9b9b9b9-b9b9-49b9-89b9-b9b9b9b9b9b9',
+             'payload', 'DS', 'self_reported', 'not-a-date',
+             '2026-05-21T12:00:00.000Z'
+           )`,
+        ).run();
+      } finally {
+        db.close();
+      }
+
+      const reopened = new Store(dbPath);
+      try {
+        reopened.recordLocalCommercialState({
+          dealId: "D-lease",
+          commercialState: "closed_won",
+          sourceEventId: "bababaab-baba-4aba-8aba-babababababa",
+          occurredAt: "2026-05-21T12:00:00.000Z",
+          reason: null,
+          expectedRedPath: false,
+        });
+      } finally {
+        reopened.close();
+      }
+
+      expect(readReadiness(dbPath, "D-lease")).toEqual(
+        expect.objectContaining({
+          readiness: "pending",
+          blocker_code: null,
+          reason: "awaiting deployment facts",
+        }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("derives not_required for non-closed-won and non-human-assisted deals", () => {
+    withTempStore((store, dbPath) => {
+      const openDeal = routed();
+      openDeal.id = "D-open";
+      store.recordRouted(openDeal, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-open",
+        commercialState: "negotiating",
+        sourceEventId: "b4b4b4b4-b4b4-44b4-84b4-b4b4b4b4b4b4",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      const selfServeDeal = routed();
+      selfServeDeal.id = "D-self";
+      selfServeDeal.route = {
+        kind: "self_serve",
+        queue: "sales_self_serve",
+        slaHours: 24,
+      };
+      store.recordRouted(selfServeDeal, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      store.recordLocalCommercialState({
+        dealId: "D-self",
+        commercialState: "closed_won",
+        sourceEventId: "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      expect(readReadiness(dbPath, "D-open")).toEqual(
+        expect.objectContaining({ readiness: "not_required", reason: null }),
+      );
+      expect(readReadiness(dbPath, "D-self")).toEqual(
+        expect.objectContaining({ readiness: "not_required", reason: null }),
+      );
+    });
+  });
+
+  it("exposes persisted readiness state with fact freshness for the dashboard", () => {
+    withTempStore((store, dbPath) => {
+      const acceptedAt = new Date().toISOString();
+      const staleAcceptedAt = new Date(
+        Date.now() - (DEPLOYMENT_FACT_MAX_AGE_DAYS + 1) * 86_400_000,
+      ).toISOString();
+      const expectedStaleAt = new Date(
+        Date.parse(staleAcceptedAt) +
+          DEPLOYMENT_FACT_MAX_AGE_DAYS * 86_400_000,
+      ).toISOString();
+
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: acceptedAt,
+      });
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          "UPDATE deployment_facts SET occurred_at=? WHERE deal_id=?",
+        ).run(staleAcceptedAt, "D-lease");
+      } finally {
+        db.close();
+      }
+
+      expect(store.deploymentReadinessRecords()).toEqual([
+        expect.objectContaining({
+          dealId: "D-lease",
+          readiness: "ready",
+          blockerCode: null,
+          secondaryBlockerCodes: null,
+          factsStatus: "stale",
+          factsFresh: false,
+          factsStaleAt: expectedStaleAt,
+        }),
+      ]);
+      expect(store.metrics()).toEqual(
+        expect.objectContaining({
+          deploymentReadiness: {
+            not_required: 0,
+            pending: 0,
+            ready: 1,
+            blocked: 0,
+          },
+          readinessFactsStaleProjected: 1,
+        }),
+      );
+    });
+  });
+
+  it("counts pending readiness over SLA and stale ignored deployment facts", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-lease",
+        commercialState: "closed_won",
+        sourceEventId: "bdbdbdbd-bdbd-4dbd-8dbd-bdbdbdbdbdbd",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-lease",
+        sourceEventId: "bebebebe-bebe-4ebe-8ebe-bebebebebebe",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: new Date(
+          Date.now() - (DEPLOYMENT_FACT_MAX_AGE_DAYS + 1) * 86_400_000,
+        ).toISOString(),
+      });
+
+      const oldPendingAt = new Date(
+        Date.now() - (READINESS_PENDING_SLA_HOURS + 1) * 3_600_000,
+      ).toISOString();
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          "UPDATE deployment_readiness SET state_entered_at=? WHERE deal_id=?",
+        ).run(oldPendingAt, "D-lease");
+      } finally {
+        db.close();
+      }
+
+      expect(store.metrics()).toEqual(
+        expect.objectContaining({
+          deploymentReadiness: {
+            not_required: 0,
+            pending: 1,
+            ready: 0,
+            blocked: 0,
+          },
+          readinessPendingOverSla: 1,
+          readinessFactsStaleIgnored: 1,
+        }),
+      );
+    });
+  });
+});
+
+describe("Store Phase 2 migrations", () => {
+  it("migrates idempotency violations to admit outcome scope without losing rows", () => {
+    const dir = join(tmpdir(), `gtm-router-outcome-migration-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          `CREATE TABLE idempotency_violations (
+             id TEXT PRIMARY KEY,
+             source TEXT NOT NULL,
+             source_event_id TEXT NOT NULL,
+             scope TEXT NOT NULL,
+             existing_payload_hash TEXT NOT NULL,
+             incoming_payload_hash TEXT NOT NULL,
+             reason TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             UNIQUE (source, source_event_id, scope),
+             CHECK (
+               scope IN ('commercial_state', 'deployment_facts') OR
+               scope LIKE 'external_event_observation:%'
+             )
+           )`,
+        ).run();
+        db.prepare(
+          `INSERT INTO idempotency_violations (
+             id, source, source_event_id, scope, existing_payload_hash,
+             incoming_payload_hash, reason, created_at
+           )
+           VALUES (
+             'phase1-violation', 'local', 'evt-phase1', 'commercial_state',
+             'existing', 'incoming', 'phase 1 replay',
+             '2026-05-21T00:00:00.000Z'
+           )`,
+        ).run();
+      } finally {
+        db.close();
+      }
+
+      new Store(dbPath).close();
+      const sqlAfterFirstOpen = new DatabaseSync(dbPath);
+      let migratedTableSql: string;
+      try {
+        const row = sqlAfterFirstOpen
+          .prepare(
+            `SELECT sql
+             FROM sqlite_master
+             WHERE type='table'
+               AND name='idempotency_violations'`,
+          )
+          .get() as { sql: string } | undefined;
+        migratedTableSql = row?.sql ?? "";
+        expect(migratedTableSql).toContain("'outcome'");
+      } finally {
+        sqlAfterFirstOpen.close();
+      }
+
+      new Store(dbPath).close();
+      const sqlAfterSecondOpen = new DatabaseSync(dbPath);
+      try {
+        const row = sqlAfterSecondOpen
+          .prepare(
+            `SELECT sql
+             FROM sqlite_master
+             WHERE type='table'
+               AND name='idempotency_violations'`,
+          )
+          .get() as { sql: string } | undefined;
+        expect(row?.sql).toBe(migratedTableSql);
+      } finally {
+        sqlAfterSecondOpen.close();
+      }
+
+      const migrated = new DatabaseSync(dbPath);
+      try {
+        const preserved = migrated
+          .prepare(
+            `SELECT scope, existing_payload_hash, incoming_payload_hash
+             FROM idempotency_violations
+             WHERE id = 'phase1-violation'`,
+          )
+          .get() as
+          | {
+              scope: string;
+              existing_payload_hash: string;
+              incoming_payload_hash: string;
+            }
+          | undefined;
+        expect(preserved).toEqual({
+          scope: "commercial_state",
+          existing_payload_hash: "existing",
+          incoming_payload_hash: "incoming",
+        });
+
+        migrated
+          .prepare(
+            `INSERT INTO idempotency_violations (
+               id, source, source_event_id, scope, existing_payload_hash,
+               incoming_payload_hash, reason, created_at
+             )
+             VALUES ('outcome-violation', 'local', 'evt-outcome', 'outcome', 'a', 'b', 'outcome replay', ?)`,
+          )
+          .run("2026-05-21T00:00:00.000Z");
+
+        expect(() =>
+          migrated
+            .prepare(
+              `INSERT INTO idempotency_violations (
+                 id, source, source_event_id, scope, existing_payload_hash,
+                 incoming_payload_hash, reason, created_at
+               )
+               VALUES ('bad-scope', 'local', 'evt-bad', 'slack', 'a', 'b', 'bad', ?)`,
+            )
+            .run("2026-05-21T00:00:00.000Z"),
+        ).toThrow();
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Store Phase 2 outcome writes", () => {
+  it("rejects unknown or not-closed-won deals before claiming an outcome event", () => {
+    withTempStore((store, dbPath) => {
+      const missing = store.recordLocalOutcome(
+        outcomeInput({
+          dealId: "missing",
+          sourceEventId: "22222222-2222-4222-8222-222222222223",
+        }),
+      );
+      expect(missing).toEqual(
+        expect.objectContaining({
+          status: "not_found",
+          accepted: false,
+          event: null,
+          rejection: null,
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          outcomeEventKey("22222222-2222-4222-8222-222222222223"),
+        ),
+      ).toBeUndefined();
+
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const notClosedWon = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222224",
+        }),
+      );
+      expect(notClosedWon).toEqual(
+        expect.objectContaining({
+          status: "not_closed_won",
+          accepted: false,
+          event: null,
+          rejection: null,
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          outcomeEventKey("22222222-2222-4222-8222-222222222224"),
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  it("records accepted outcomes and appends a post-sale timeline event", () => {
+    withTempStore((store, dbPath) => {
+      closedWonRoutedDeal(store);
+      const input = outcomeInput({
+        sourceEventId: "22222222-2222-4222-8222-222222222225",
+        reasonCategory: "customer_ready",
+      });
+
+      const result = store.recordLocalOutcome(input);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          accepted: true,
+          eventKey: outcomeEventKey(input.sourceEventId),
+          event: expect.objectContaining({
+            dealId: "D-lease",
+            sourceEventId: input.sourceEventId,
+            outcome: "deployment_started",
+            arrDeltaUsd: null,
+            reasonCategory: "customer_ready",
+          }),
+          rejection: null,
+        }),
+      );
+      expect(readExternalEventKey(dbPath, outcomeEventKey(input.sourceEventId))).toEqual(
+        expect.objectContaining({
+          notify_status: "ok",
+          scope: "source_event",
+        }),
+      );
+      expect(store.outcomeEvents("D-lease")).toHaveLength(1);
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          from: "routed",
+          to: "routed",
+          detail: "post_sale_outcome",
+          meta: expect.objectContaining({
+            kind: "post_sale_outcome",
+            source: "local",
+            sourceEventId: input.sourceEventId,
+            outcome: "deployment_started",
+            operatorSource: "self_reported",
+            arrDeltaUsd: null,
+            reasonCategory: "customer_ready",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("dedupes identical outcome replays and records idempotency conflicts", () => {
+    withTempStore((store, dbPath) => {
+      closedWonRoutedDeal(store);
+      const input = outcomeInput({
+        sourceEventId: "22222222-2222-4222-8222-222222222226",
+      });
+
+      expect(store.recordLocalOutcome(input).status).toBe("recorded");
+      const duplicate = store.recordLocalOutcome(input);
+      expect(duplicate).toEqual(
+        expect.objectContaining({
+          status: "duplicate",
+          accepted: false,
+          event: expect.objectContaining({ sourceEventId: input.sourceEventId }),
+          rejection: null,
+        }),
+      );
+      expect(store.outcomeEvents("D-lease")).toHaveLength(1);
+
+      const conflict = store.recordLocalOutcome({
+        ...input,
+        reasonCategory: "other",
+      });
+      expect(conflict).toEqual(
+        expect.objectContaining({
+          status: "idempotency_conflict",
+          accepted: false,
+          event: expect.objectContaining({ sourceEventId: input.sourceEventId }),
+          rejection: null,
+        }),
+      );
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const violation = db
+          .prepare(
+            `SELECT scope, source_event_id
+             FROM idempotency_violations
+             WHERE scope = 'outcome'`,
+          )
+          .get() as { scope: string; source_event_id: string } | undefined;
+        expect(violation).toEqual({
+          scope: "outcome",
+          source_event_id: input.sourceEventId,
+        });
+        const rejectionCount = db
+          .prepare("SELECT COUNT(*) n FROM outcome_rejections")
+          .get() as { n: number };
+        expect(rejectionCount.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  it("records semantic outcome rejections after claiming the source event", () => {
+    withTempStore((store, dbPath) => {
+      closedWonRoutedDeal(store);
+      const missingPrior = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222227",
+          outcome: "deployed",
+        }),
+      );
+      const invalidArr = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222228",
+          outcome: "deployed",
+          arrDeltaUsd: 10_000,
+        }),
+      );
+      const started = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222229",
+        }),
+      );
+      const duplicateSemantic = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222230",
+        }),
+      );
+      const churned = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222231",
+          outcome: "churned",
+          occurredAt: "2026-05-22T12:01:00.000Z",
+        }),
+      );
+      const postChurn = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222232",
+          outcome: "landed",
+          occurredAt: "2026-05-22T12:02:00.000Z",
+        }),
+      );
+
+      expect(missingPrior.status).toBe("missing_prior_outcome");
+      expect(invalidArr.status).toBe("invalid_arr_delta");
+      expect(started.status).toBe("recorded");
+      expect(duplicateSemantic.status).toBe("duplicate_semantic_outcome");
+      expect(churned.status).toBe("recorded");
+      expect(postChurn.status).toBe("post_churn_outcome");
+      expect(store.outcomeEvents("D-lease").map((event) => event.outcome)).toEqual([
+        "deployment_started",
+        "churned",
+      ]);
+      expect(
+        store
+          .outcomeRejections("D-lease")
+          .map((rejection) => rejection.rejectionKind),
+      ).toEqual(
+        expect.arrayContaining([
+          "missing_prior_outcome",
+          "invalid_arr_delta",
+          "duplicate_semantic_outcome",
+          "post_churn_outcome",
+        ]),
+      );
+      expect(store.outcomeRejections("D-lease")).toHaveLength(4);
+      expect(
+        readExternalEventKey(
+          dbPath,
+          outcomeEventKey("22222222-2222-4222-8222-222222222227"),
+        ),
+      ).toEqual(expect.objectContaining({ notify_status: "ok" }));
+    });
+  });
+
+  it("requires landed before expansion and allows multiple expansions", () => {
+    withTempStore((store) => {
+      closedWonRoutedDeal(store);
+      expect(
+        store.recordLocalOutcome(
+          outcomeInput({
+            sourceEventId: "22222222-2222-4222-8222-222222222233",
+            outcome: "expanded",
+            arrDeltaUsd: 25_000,
+            reasonCategory: "scope_expanded",
+          }),
+        ).status,
+      ).toBe("missing_prior_outcome");
+
+      for (const input of [
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222234",
+          occurredAt: "2026-05-22T12:00:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222235",
+          outcome: "deployed",
+          occurredAt: "2026-05-22T12:01:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222236",
+          outcome: "landed",
+          occurredAt: "2026-05-22T12:02:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222237",
+          outcome: "expanded",
+          occurredAt: "2026-05-22T12:03:00.000Z",
+          arrDeltaUsd: 25_000,
+          reasonCategory: "scope_expanded",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222238",
+          outcome: "expanded",
+          occurredAt: "2026-05-22T12:04:00.000Z",
+          arrDeltaUsd: 15_000,
+          reasonCategory: "scope_expanded",
+        }),
+      ]) {
+        expect(store.recordLocalOutcome(input).status).toBe("recorded");
+      }
+
+      expect(store.outcomeEvents("D-lease").map((event) => event.outcome)).toEqual([
+        "deployment_started",
+        "deployed",
+        "landed",
+        "expanded",
+        "expanded",
+      ]);
+      const expandedArr = store
+        .outcomeEvents("D-lease")
+        .filter((event) => event.outcome === "expanded")
+        .reduce((sum, event) => sum + event.arrDeltaUsd, 0);
+      expect(expandedArr).toBe(40_000);
+    });
+  });
+
+  it("summarizes accepted outcome metrics and cycle times", () => {
+    withTempStore((store, dbPath) => {
+      closedWonRoutedDeal(store);
+      const db = new DatabaseSync(dbPath);
+      try {
+        db
+          .prepare(
+            `UPDATE commercial_states
+             SET state_entered_at = ?
+             WHERE deal_id = ?`,
+          )
+          .run("2026-05-26T12:00:00.000Z", "D-lease");
+      } finally {
+        db.close();
+      }
+      for (const input of [
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222239",
+          occurredAt: "2026-05-22T12:00:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222240",
+          outcome: "deployed",
+          occurredAt: "2026-05-23T12:00:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222241",
+          outcome: "landed",
+          occurredAt: "2026-05-24T00:00:00.000Z",
+        }),
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222242",
+          outcome: "expanded",
+          occurredAt: "2026-05-25T00:00:00.000Z",
+          arrDeltaUsd: 50_000,
+          reasonCategory: "scope_expanded",
+        }),
+      ]) {
+        expect(store.recordLocalOutcome(input).status).toBe("recorded");
+      }
+
+      expect(store.metrics()).toEqual(
+        expect.objectContaining({
+          deploymentStartedDeals: 1,
+          deployedDeals: 1,
+          landedDeals: 1,
+          expandedDeals: 1,
+          expandedArrDeltaUsd: 50_000,
+          churnedDeals: 0,
+          outcomeChurnBeforeDeploy: 0,
+          outcomeCommercialStateConflicts: 0,
+          outcomeInvalidHistories: 0,
+          medianTimeClosedWonToDeployedHours: 48,
+          medianTimeDeployedToLandedHours: 12,
+        }),
+      );
+    });
+  });
+
+  it("flags impossible accepted outcome histories from persisted rows", () => {
+    withTempStore((store, dbPath) => {
+      const lease = routed();
+      const churn = { ...routed(), id: "D-churn", company: "Churn Freight" };
+      store.recordRouted(lease, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordRouted(churn, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: lease.id,
+        commercialState: "closed_won",
+        sourceEventId: "33333333-3333-4333-8333-333333333331",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalCommercialState({
+        dealId: churn.id,
+        commercialState: "closed_won",
+        sourceEventId: "33333333-3333-4333-8333-333333333332",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const insertOutcome = db.prepare(
+          `INSERT INTO outcome_events (
+             id, deal_id, source, source_event_id, source_payload_hash,
+             outcome, occurred_at, operator, operator_source, arr_delta_usd,
+             reason_category, created_at
+           )
+           VALUES (?, ?, 'local', ?, 'hash', ?, ?, 'DS', 'self_reported', NULL, NULL, ?)`,
+        );
+        for (const row of [
+          [
+            "outcome-deployed-missing",
+            lease.id,
+            "evt-deployed-missing",
+            "deployed",
+            "2026-05-22T12:00:00.000Z",
+          ],
+          [
+            "outcome-lease-churned",
+            lease.id,
+            "evt-lease-churned",
+            "churned",
+            "2026-05-23T12:00:00.000Z",
+          ],
+          [
+            "outcome-landed-post-churn",
+            lease.id,
+            "evt-landed-post-churn",
+            "landed",
+            "2026-05-24T12:00:00.000Z",
+          ],
+          [
+            "outcome-churn-started",
+            churn.id,
+            "evt-churn-started",
+            "deployment_started",
+            "2026-05-22T12:00:00.000Z",
+          ],
+          [
+            "outcome-churn-before-deploy",
+            churn.id,
+            "evt-churn-before-deploy",
+            "churned",
+            "2026-05-23T12:00:00.000Z",
+          ],
+          [
+            "outcome-deployed-after-churn",
+            churn.id,
+            "evt-deployed-after-churn",
+            "deployed",
+            "2026-05-24T12:00:00.000Z",
+          ],
+          [
+            "outcome-orphan-started",
+            "D-orphan",
+            "evt-orphan-started",
+            "deployment_started",
+            "2026-05-22T12:00:00.000Z",
+          ],
+        ] as const) {
+          insertOutcome.run(row[0], row[1], row[2], row[3], row[4], row[4]);
+        }
+      } finally {
+        db.close();
+      }
+
+      expect(store.metrics()).toEqual(
+        expect.objectContaining({
+          deploymentStartedDeals: 2,
+          deployedDeals: 2,
+          landedDeals: 1,
+          churnedDeals: 2,
+          outcomeChurnBeforeDeploy: 1,
+          outcomeCommercialStateConflicts: 1,
+          outcomeInvalidHistories: 4,
+          medianTimeClosedWonToDeployedHours: 0,
+          medianTimeDeployedToLandedHours: 0,
+        }),
+      );
+    });
+  });
+});
 
 describe("Store external webhook leases", () => {
   it("backfills pending lease timestamps on migration", () => {
@@ -148,6 +3460,57 @@ describe("Store external webhook leases", () => {
         ),
       ).toBe("duplicate");
       store.close();
+
+      const migrated = new DatabaseSync(dbPath);
+      try {
+        const columns = migrated
+          .prepare("PRAGMA table_info(external_event_keys)")
+          .all() as Array<{ name: string }>;
+        expect(columns.map((column) => column.name)).toEqual(
+          expect.arrayContaining(["scope", "payload_hash"]),
+        );
+        expect(() =>
+          migrated
+            .prepare(
+              `INSERT INTO external_event_keys (
+                 key, system, recorded_at, notify_status, scope
+               )
+               VALUES ('bad-scope', 'hubspot', ?, 'pending', 'slack')`,
+            )
+            .run("2026-05-19T17:00:00.000Z"),
+        ).toThrow();
+        expect(() =>
+          migrated
+            .prepare(
+              `INSERT INTO external_event_keys (
+                 key, system, recorded_at, notify_status, scope
+               )
+               VALUES ('bad-status', 'hubspot', ?, 'mystery', 'source_event')`,
+            )
+            .run("2026-05-19T17:00:00.000Z"),
+        ).toThrow();
+        for (const status of [
+          "superseded_by_readiness",
+          "superseded_by_terminal_drift",
+        ]) {
+          expect(() =>
+            migrated
+              .prepare(
+                `INSERT INTO external_event_keys (
+                   key, system, recorded_at, notify_status, scope
+                 )
+                 VALUES (?, 'hubspot', ?, ?, 'source_event')`,
+              )
+              .run(
+                `dead-status-${status}`,
+                "2026-05-19T17:00:00.000Z",
+                status,
+              ),
+          ).toThrow();
+        }
+      } finally {
+        migrated.close();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -205,6 +205,9 @@ That boundary is a deliberate design output, not a missing feature.
 - **The self-improving loop:** score routing decisions against closed-won
   outcomes, surface the false-positive / missed-pattern quadrants, and tune
   the thresholds from data instead of by hand. (Same loop, pointed at ops.)
+- A more detailed org-level roadmap is in
+  [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md): the next production slice is
+  a closed-loop deployment handoff, not a CRM clone.
 
 ## Architecture
 

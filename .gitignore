@@ -10,3 +10,4 @@ data/*.db-wal
 data/*.db-shm
 .DS_Store
 dist/
+.playwright-mcp/

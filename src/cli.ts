@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
 import {
   type IntegrationBuild,
+  type IntegrationConfigBundle,
+  integrationConfigBundleFromEnv,
   integrationOptionsFromEnv,
   renderIntegrationChecks,
   runIntegrationDoctor,
@@ -83,16 +85,30 @@ function pipelineOptions(
 ): {
   label: string;
   opts: Partial<PipelineOptions>;
+  configBundle: IntegrationConfigBundle;
   stageChanges?: IntegrationBuild["stageChanges"];
+  readinessNotifications?: IntegrationBuild["readinessNotifications"];
+  fallbackNotifications?: IntegrationBuild["fallbackNotifications"];
+  terminalDriftNotifications?: IntegrationBuild["terminalDriftNotifications"];
 } {
   const mode = integrationMode(args);
   if (mode !== "off") {
     const built = integrationOptionsFromEnv(mode);
-    return { label: built.label, opts: built, stageChanges: built.stageChanges };
+    return {
+      label: built.label,
+      opts: built,
+      configBundle: built.configBundle,
+      stageChanges: built.stageChanges,
+      readinessNotifications: built.readinessNotifications,
+      fallbackNotifications: built.fallbackNotifications,
+      terminalDriftNotifications: built.terminalDriftNotifications,
+    };
   }
+  const configBundle = integrationConfigBundleFromEnv(mode);
   if (args.includes("--flaky")) {
     return {
       label: "flaky",
+      configBundle,
       opts: {
         dryRun: false,
         sink: new FlakySink({
@@ -103,7 +119,7 @@ function pipelineOptions(
       },
     };
   }
-  return { label: "logging", opts: {} };
+  return { label: "logging", opts: {}, configBundle };
 }
 
 async function cmdDemo(args: string[]): Promise<void> {
@@ -111,7 +127,8 @@ async function cmdDemo(args: string[]): Promise<void> {
   const store = new Store(":memory:");
   const enricher = new FixtureEnricher(loadFixture());
   const seed = loadJsonl(`${ROOT}data/inbound.seed.jsonl`);
-  const { label, opts } = pipelineOptions(args);
+  const { label, opts, configBundle } = pipelineOptions(args);
+  store.recordIntegrationConfigBundle(configBundle);
   if (label === "flaky") {
     console.log(
       "[--flaky] live sink: 1 retryable failure then success; " +
@@ -155,11 +172,13 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
   const Store = await loadStore();
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
+  const { opts, configBundle } = pipelineOptions(args);
+  store.recordIntegrationConfigBundle(configBundle);
   await processBatch(
     loadJsonl(file),
     store,
     enricher,
-    pipelineOptions(args).opts,
+    opts,
   );
   console.log(renderMetricsTable(store.metrics()));
   store.close();
@@ -176,12 +195,24 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
   const mode = integrationMode(args);
-  const { label, opts, stageChanges } = pipelineOptions(args);
+  const {
+    label,
+    opts,
+    configBundle,
+    stageChanges,
+    readinessNotifications,
+    fallbackNotifications,
+    terminalDriftNotifications,
+  } = pipelineOptions(args);
+  store.recordIntegrationConfigBundle(configBundle);
   const server = startServer(store, enricher, port, {
     pipelineOptions: opts,
     sinkLabel: label,
     liveIntegrations: mode === "live",
     ...(stageChanges ? { stageChanges } : {}),
+    ...(readinessNotifications ? { readinessNotifications } : {}),
+    ...(fallbackNotifications ? { fallbackNotifications } : {}),
+    ...(terminalDriftNotifications ? { terminalDriftNotifications } : {}),
   });
   let closed = false;
   const closeStore = (): void => {

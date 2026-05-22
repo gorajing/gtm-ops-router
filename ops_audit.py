@@ -37,6 +37,72 @@ def percentile(values: list[int], p: float) -> int:
     return s[idx]
 
 
+def median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    mid = len(s) // 2
+    if len(s) % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2
+
+
+def hours_between(start_iso: str, end_iso: str) -> float | None:
+    from datetime import datetime
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    try:
+        delta = parse(end_iso) - parse(start_iso)
+    except ValueError:
+        return None
+    seconds = delta.total_seconds()
+    if seconds < 0:
+        return None
+    return round(seconds / 3600, 2)
+
+
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def first_projected_closed_won_by_deal(
+    conn: sqlite3.Connection,
+) -> dict[str, str]:
+    if not table_exists(conn, "events"):
+        return {}
+    closed_won_at: dict[str, str] = {}
+    for deal_id, meta_json in conn.execute(
+        "SELECT deal_id, meta FROM events WHERE meta IS NOT NULL ORDER BY ts, id"
+    ).fetchall():
+        try:
+            meta = json.loads(meta_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(meta, dict)
+            or meta.get("kind") != "commercial_state"
+            or meta.get("commercialState") != "closed_won"
+            or meta.get("projected") is not True
+        ):
+            continue
+        occurred_at = meta.get("occurredAt")
+        if not isinstance(occurred_at, str):
+            continue
+        deal = str(deal_id)
+        previous = closed_won_at.get(deal)
+        if previous is None or occurred_at < previous:
+            closed_won_at[deal] = occurred_at
+    return closed_won_at
+
+
 @dataclass
 class AuditReport:
     intake: int = 0
@@ -48,11 +114,171 @@ class AuditReport:
     p95_latency_ms: int = 0
     routed_arr_usd: float = 0.0
     arr_by_route: dict[str, float] = field(default_factory=dict)
+    deployment_started_deals: int = 0
+    deployed_deals: int = 0
+    landed_deals: int = 0
+    expanded_deals: int = 0
+    expanded_arr_delta_usd: float = 0.0
+    churned_deals: int = 0
+    outcome_churn_before_deploy: int = 0
+    outcome_commercial_state_conflicts: int = 0
+    outcome_invalid_histories: int = 0
+    median_time_closed_won_to_deployed_hours: float = 0.0
+    median_time_deployed_to_landed_hours: float = 0.0
     breaches: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.invariant_ok and not self.breaches
+
+
+def audit_outcomes(conn: sqlite3.Connection, r: AuditReport) -> None:
+    if not table_exists(conn, "outcome_events"):
+        return
+
+    rows = conn.execute(
+        """SELECT id, deal_id, outcome, occurred_at, created_at, arr_delta_usd
+           FROM outcome_events
+           ORDER BY deal_id, occurred_at, created_at, id"""
+    ).fetchall()
+    if not rows:
+        return
+
+    commercial_by_deal: dict[str, str] = {}
+    if table_exists(conn, "commercial_states"):
+        for deal_id, commercial_state in conn.execute(
+            "SELECT deal_id, commercial_state FROM commercial_states"
+        ).fetchall():
+            commercial_by_deal[str(deal_id)] = str(commercial_state)
+    first_closed_won_at = first_projected_closed_won_by_deal(conn)
+
+    deals_by_outcome: dict[str, set[str]] = {
+        "deployment_started": set(),
+        "deployed": set(),
+        "landed": set(),
+        "expanded": set(),
+        "churned": set(),
+    }
+    histories: dict[str, list[dict[str, object]]] = {}
+    for row_id, deal_id, outcome, occurred_at, created_at, arr_delta_usd in rows:
+        deal = str(deal_id)
+        outcome_name = str(outcome)
+        if outcome_name in deals_by_outcome:
+            deals_by_outcome[outcome_name].add(deal)
+        if outcome_name == "expanded" and arr_delta_usd is not None:
+            r.expanded_arr_delta_usd += float(arr_delta_usd)
+        histories.setdefault(deal, []).append(
+            {
+                "id": str(row_id),
+                "deal_id": deal,
+                "outcome": outcome_name,
+                "occurred_at": str(occurred_at),
+                "created_at": str(created_at),
+            }
+        )
+
+    r.deployment_started_deals = len(deals_by_outcome["deployment_started"])
+    r.deployed_deals = len(deals_by_outcome["deployed"])
+    r.landed_deals = len(deals_by_outcome["landed"])
+    r.expanded_deals = len(deals_by_outcome["expanded"])
+    r.churned_deals = len(deals_by_outcome["churned"])
+    r.outcome_commercial_state_conflicts = sum(
+        1
+        for deal_id in histories
+        if commercial_by_deal.get(deal_id) != "closed_won"
+    )
+
+    invalid_row_ids: set[str] = set()
+    closed_won_to_deployed: list[float] = []
+    deployed_to_landed: list[float] = []
+
+    def event_key(event: dict[str, object]) -> tuple[str, str, str]:
+        return (
+            str(event["occurred_at"]),
+            str(event["created_at"]),
+            str(event["id"]),
+        )
+
+    for deal_id, history in histories.items():
+        history.sort(key=event_key)
+        seen_non_expanded: set[str] = set()
+        saw_churn = False
+        first_deployed: dict[str, object] | None = None
+        first_landed_after_deployed: dict[str, object] | None = None
+        first_churned: dict[str, object] | None = None
+
+        for event in history:
+            row_id = str(event["id"])
+            outcome = str(event["outcome"])
+            if saw_churn:
+                invalid_row_ids.add(row_id)
+            if outcome != "expanded" and outcome in seen_non_expanded:
+                invalid_row_ids.add(row_id)
+            if outcome == "deployed" and "deployment_started" not in seen_non_expanded:
+                invalid_row_ids.add(row_id)
+            if outcome == "landed" and "deployed" not in seen_non_expanded:
+                invalid_row_ids.add(row_id)
+            if outcome == "expanded" and "landed" not in seen_non_expanded:
+                invalid_row_ids.add(row_id)
+            if outcome == "churned" and "deployment_started" not in seen_non_expanded:
+                invalid_row_ids.add(row_id)
+
+            if outcome == "deployed" and first_deployed is None:
+                first_deployed = event
+            if (
+                outcome == "landed"
+                and first_deployed is not None
+                and first_landed_after_deployed is None
+            ):
+                first_landed_after_deployed = event
+            if outcome == "churned" and first_churned is None:
+                first_churned = event
+            if outcome != "expanded":
+                seen_non_expanded.add(outcome)
+            if outcome == "churned":
+                saw_churn = True
+
+        if first_churned is not None and (
+            first_deployed is None or event_key(first_churned) < event_key(first_deployed)
+        ):
+            r.outcome_churn_before_deploy += 1
+        has_invalid_history = any(str(event["id"]) in invalid_row_ids for event in history)
+        commercial_state = commercial_by_deal.get(deal_id)
+        if (
+            not has_invalid_history
+            and first_deployed is not None
+            and commercial_state == "closed_won"
+        ):
+            closed_won_at = first_closed_won_at.get(deal_id)
+            if closed_won_at is not None:
+                hours = hours_between(closed_won_at, str(first_deployed["occurred_at"]))
+                if hours is not None:
+                    closed_won_to_deployed.append(hours)
+        if (
+            not has_invalid_history
+            and first_deployed is not None
+            and first_landed_after_deployed is not None
+        ):
+            hours = hours_between(
+                str(first_deployed["occurred_at"]),
+                str(first_landed_after_deployed["occurred_at"]),
+            )
+            if hours is not None:
+                deployed_to_landed.append(hours)
+
+    r.outcome_invalid_histories = len(invalid_row_ids)
+    r.median_time_closed_won_to_deployed_hours = median(closed_won_to_deployed)
+    r.median_time_deployed_to_landed_hours = median(deployed_to_landed)
+
+    if r.outcome_commercial_state_conflicts:
+        r.breaches.append(
+            "OUTCOME outcomeCommercialStateConflicts "
+            f"{r.outcome_commercial_state_conflicts} > 0"
+        )
+    if r.outcome_invalid_histories:
+        r.breaches.append(
+            f"OUTCOME outcomeInvalidHistories {r.outcome_invalid_histories} > 0"
+        )
 
 
 def audit(
@@ -109,6 +335,7 @@ def audit(
         r.breaches.append(
             f"SLO p95_latency {r.p95_latency_ms}ms > {max_p95_ms}ms"
         )
+    audit_outcomes(conn, r)
     return r
 
 
@@ -125,6 +352,19 @@ def render(r: AuditReport) -> str:
         f"  routed ARR .......... ${r.routed_arr_usd:,.0f}",
         "  ARR by route:",
         *[f"    {k:<16} ${v:,.0f}" for k, v in r.arr_by_route.items()],
+        "  post-sale outcomes:",
+        f"    deployment_started {r.deployment_started_deals}",
+        f"    deployed .......... {r.deployed_deals}",
+        f"    landed ............ {r.landed_deals}",
+        f"    expanded .......... {r.expanded_deals} "
+        f"(${r.expanded_arr_delta_usd:,.0f} ARR delta)",
+        f"    churned ........... {r.churned_deals}",
+        f"    churn before deploy {r.outcome_churn_before_deploy}",
+        f"    commercial conflict {r.outcome_commercial_state_conflicts}",
+        f"    invalid histories . {r.outcome_invalid_histories}",
+        f"    won-to-deployed med "
+        f"{r.median_time_closed_won_to_deployed_hours:g}h",
+        f"    deployed-to-landed  {r.median_time_deployed_to_landed_hours:g}h",
         "-" * 48,
         "  RESULT: " + ("PASS" if r.ok else "FAIL"),
         *[f"    - {b}" for b in r.breaches],

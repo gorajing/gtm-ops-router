@@ -1,13 +1,22 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  DeploymentReadinessSlackNotifier,
   HubSpotSlackSink,
   hubSpotV3Signature,
   hubSpotDealPayload,
+  integrationConfigBundleFromEnv,
   integrationOptionsFromEnv,
   parseHubSpotStageEvents,
   parseHubSpotStageWebhookBatch,
+  resolveHubSpotStageMap,
   runIntegrationDoctor,
   slackHandoffPayload,
+  slackCommercialTerminalDriftPayload,
+  slackDeploymentReadinessPayload,
+  slackDeploymentHandoffFailedPayload,
   slackStageChangePayload,
 } from "../src/integrations.js";
 import { FixtureEnricher } from "../src/enrich.js";
@@ -15,6 +24,12 @@ import { processOne } from "../src/pipeline.js";
 import { RetryableSinkError, TerminalSinkError } from "../src/sink.js";
 import { Store } from "../src/store.js";
 import type { RoutedDeal } from "../src/types.js";
+
+const STAGE_MAP_JSON = JSON.stringify({
+  contact_made: "open",
+  closedwon: "closed_won",
+  notify_only: "ignore",
+});
 
 function routed(id = "D-1", company = "Ryder Digital"): RoutedDeal {
   return {
@@ -53,6 +68,130 @@ function routed(id = "D-1", company = "Ryder Digital"): RoutedDeal {
 }
 
 describe("HubSpot + Slack integration sink", () => {
+  it("parses HubSpot stage maps from inline JSON and path without secrets", () => {
+    expect(
+      resolveHubSpotStageMap({ HUBSPOT_STAGE_MAP_JSON: STAGE_MAP_JSON }),
+    ).toEqual({
+      source: "json",
+      map: {
+        contact_made: "open",
+        closedwon: "closed_won",
+        notify_only: "ignore",
+      },
+    });
+
+    const dir = join(tmpdir(), `gtm-router-stage-map-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const path = join(dir, "hubspot-stage-map.json");
+    try {
+      writeFileSync(path, STAGE_MAP_JSON);
+      expect(resolveHubSpotStageMap({ HUBSPOT_STAGE_MAP_PATH: path })).toEqual(
+        expect.objectContaining({
+          source: "path",
+          map: expect.objectContaining({ closedwon: "closed_won" }),
+        }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const bundle = integrationConfigBundleFromEnv("live", {
+      HUBSPOT_STAGE_MAP_JSON: STAGE_MAP_JSON,
+      HUBSPOT_NOTIFY_STAGE_IDS: "contact_made,notify_only",
+      ALLOW_UNSIGNED_WEBHOOKS: "0",
+      SLACK_CHANNEL_ID: "C0123456789",
+      SLACK_DEPLOYMENT_CHANNEL_ID: "C9999999999",
+      PUBLIC_BASE_URL: "https://router.example.com",
+    });
+    expect(bundle).toEqual(
+      expect.objectContaining({
+        hubspotStageMapSource: "json",
+        hubspotNotifyStageIds: ["contact_made", "notify_only"],
+        deploymentHandoffChannelMode: "dedicated",
+      }),
+    );
+    expect(JSON.stringify(bundle)).not.toContain("xoxb");
+    expect(JSON.stringify(bundle)).not.toContain("pat-");
+  });
+
+  it("rejects invalid or ambiguous HubSpot stage map config", () => {
+    expect(
+      integrationConfigBundleFromEnv("off", {
+        HUBSPOT_STAGE_MAP_PATH: "missing-stage-map.json",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        hubspotStageMapSource: "none",
+        hubspotStageMap: {},
+      }),
+    );
+    expect(() =>
+      integrationConfigBundleFromEnv("off", {
+        HUBSPOT_STAGE_MAP_JSON: STAGE_MAP_JSON,
+        HUBSPOT_STAGE_MAP_PATH: "config/hubspot-stage-map.json",
+      }),
+    ).toThrow("set only one");
+    expect(() =>
+      integrationConfigBundleFromEnv("dry-run", {
+        HUBSPOT_STAGE_MAP_PATH: "missing-stage-map.json",
+      }),
+    ).toThrow("invalid HUBSPOT_STAGE_MAP_PATH");
+    expect(() =>
+      resolveHubSpotStageMap({
+        HUBSPOT_STAGE_MAP_JSON: "{",
+      }),
+    ).toThrow("invalid HUBSPOT_STAGE_MAP_JSON");
+    expect(() =>
+      resolveHubSpotStageMap({
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "bad" }),
+      }),
+    ).toThrow("unsupported value");
+    expect(() =>
+      resolveHubSpotStageMap({
+        HUBSPOT_STAGE_MAP_JSON: STAGE_MAP_JSON,
+        HUBSPOT_STAGE_MAP_PATH: "config/hubspot-stage-map.json",
+      }),
+    ).toThrow("set only one");
+  });
+
+  it("live mode requires mapped notify stages and rejects local-only demo flags", () => {
+    const base = {
+      HUBSPOT_ACCESS_TOKEN: "pat-na2-token",
+      HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+      HUBSPOT_WEBHOOK_SECRET: "client-secret",
+      PUBLIC_BASE_URL: "https://router.example.com",
+      HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+      SLACK_BOT_TOKEN: "xoxb-token",
+      SLACK_CHANNEL_ID: "C0123456789",
+    };
+
+    expect(() => integrationOptionsFromEnv("live", base)).toThrow(
+      "missing live integration env: HUBSPOT_STAGE_MAP_JSON or HUBSPOT_STAGE_MAP_PATH",
+    );
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        ...base,
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ other_stage: "open" }),
+      }),
+    ).toThrow("HUBSPOT_NOTIFY_STAGE_IDS (unmapped: contact_made)");
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        ...base,
+        HUBSPOT_NOTIFY_STAGE_IDS: "constructor",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
+      }),
+    ).toThrow("HUBSPOT_NOTIFY_STAGE_IDS (unmapped: constructor)");
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        ...base,
+        HUBSPOT_STAGE_MAP_JSON: STAGE_MAP_JSON,
+        ALLOW_UNSIGNED_WEBHOOKS: "1",
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        ALLOW_EXPECTED_RED_PATHS: "1",
+      }),
+    ).toThrow("ALLOW_UNSIGNED_WEBHOOKS");
+  });
+
   it("builds an idempotent HubSpot upsert payload keyed by router deal id", () => {
     const payload = hubSpotDealPayload(routed(), {
       hubspotExternalIdProperty: "gtm_router_deal_id",
@@ -81,6 +220,136 @@ describe("HubSpot + Slack integration sink", () => {
     expect(payload.text).toContain("Ryder Digital");
     expect(payload.text).toContain("HubSpot: 12345");
     expect(payload.text).toContain("pricing_approval");
+  });
+
+  it("builds redacted deployment-readiness handoff messages", () => {
+    const payload = slackDeploymentReadinessPayload(
+      {
+        dealId: "D-redacted",
+        fingerprint: "readiness:D-redacted:none:pending",
+        previousReadiness: "none",
+        readiness: "pending",
+        blockerCode: null,
+        reason: "awaiting deployment facts",
+        leaseAcquiredAt: "2026-05-21T12:00:00.000Z",
+        attempt: 1,
+      },
+      "CDEPLOY",
+    );
+
+    expect(payload.channel).toBe("CDEPLOY");
+    expect(payload.text).toContain("Deployment readiness handoff");
+    expect(payload.text).toContain("Router id: D-redacted");
+    expect(payload.text).toContain("Transition: none -> pending");
+    expect(payload.text).not.toContain("\n\n");
+    expect(payload.text).not.toContain("HubSpot");
+    expect(payload.text).not.toContain("@");
+    expect(payload.text).not.toContain("Local State Co");
+  });
+
+  it("retries retryable Slack errors for readiness notifications", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify(
+          calls === 1
+            ? { ok: false, error: "ratelimited" }
+            : { ok: true, channel: "CDEPLOY", ts: "123.456" },
+        ),
+        { status: 200 },
+      );
+    });
+    const notifier = new DeploymentReadinessSlackNotifier({
+      mode: "live",
+      slackBotToken: "xoxb-token",
+      slackChannelId: "CGENERIC",
+      deploymentSlackChannelId: "CDEPLOY",
+      slackApiBase: "https://slack.test",
+      fetchImpl,
+      slackRetry: {
+        maxAttempts: 2,
+        baseDelayMs: 0,
+        sleep: async () => {},
+      },
+    });
+
+    const receipts = await notifier.notify({
+      dealId: "D-redacted",
+      fingerprint: "readiness:D-redacted:none:pending",
+      previousReadiness: "none",
+      readiness: "pending",
+      blockerCode: null,
+      reason: null,
+      leaseAcquiredAt: "2026-05-21T12:00:00.000Z",
+      attempt: 1,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(receipts).toEqual([
+      {
+        system: "slack",
+        externalId: "123.456",
+        detail: "posted deployment readiness handoff to CDEPLOY",
+      },
+    ]);
+  });
+
+  it("builds redacted deployment-handoff failure fallback messages", () => {
+    const payload = slackDeploymentHandoffFailedPayload(
+      {
+        dealId: "D-redacted",
+        fingerprint: "readiness:D-redacted:none:pending",
+        fallbackKey: "readiness_fallback:readiness:D-redacted:none:pending",
+        readiness: "pending",
+        errorClass: "slack_channel_error",
+        leaseAcquiredAt: "2026-05-21T12:00:00.000Z",
+        leaseGeneration: 1,
+      },
+      "CGENERIC",
+    );
+
+    expect(payload.channel).toBe("CGENERIC");
+    expect(payload.text).toContain("Deployment handoff failed");
+    expect(payload.text).toContain("Router id: D-redacted");
+    expect(payload.text).toContain("Readiness: pending");
+    expect(payload.text).toContain("Error: slack_channel_error");
+    expect(payload.text).not.toContain("HubSpot");
+    expect(payload.text).not.toContain("@");
+    expect(payload.text).not.toContain("Local State Co");
+    expect(payload.text).not.toContain("deployment_data_unavailable");
+  });
+
+  it("builds redacted commercial terminal-drift messages", () => {
+    const payload = slackCommercialTerminalDriftPayload(
+      {
+        dealId: "D-redacted",
+        alertKey: "commercial_terminal_drift:local:evt-1",
+        source: "local",
+        sourceEventId: "evt-1",
+        incomingCommercialState: "closed_lost",
+        currentCommercialState: "closed_won",
+        incomingOccurredAt: "2026-05-21T12:01:00.000Z",
+        currentOccurredAt: "2026-05-21T12:00:00.000Z",
+        driftKind: "terminal_regression",
+        tieResolutionDrift: false,
+        expectedRedPath: true,
+        leaseAcquiredAt: "2026-05-21T12:01:01.000Z",
+        leaseGeneration: 1,
+      },
+      "CGENERIC",
+    );
+
+    expect(payload.channel).toBe("CGENERIC");
+    expect(payload.text).toContain("Commercial terminal drift");
+    expect(payload.text).toContain("Router id: D-redacted");
+    expect(payload.text).toContain("Incoming: closed_lost");
+    expect(payload.text).toContain("Current: closed_won");
+    expect(payload.text).toContain("Drift: terminal_regression");
+    expect(payload.text).not.toContain("HubSpot");
+    expect(payload.text).not.toContain("@");
+    expect(payload.text).not.toContain("Local State Co");
+    expect(payload.text).not.toContain("evt-1");
   });
 
   it("escapes Slack link-control chars while leaving readable identifiers intact", () => {
@@ -202,6 +471,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "secret",
         PUBLIC_BASE_URL: "https://example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C12345678",
       },
@@ -249,6 +519,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "secret",
         PUBLIC_BASE_URL: "https://example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C12345678",
       },
@@ -298,6 +569,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "secret",
         PUBLIC_BASE_URL: "https://example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C12345678",
       },
@@ -448,6 +720,7 @@ describe("HubSpot + Slack integration sink", () => {
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C12345678",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
       },
       fetchImpl,
     );
@@ -517,6 +790,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "secret",
         PUBLIC_BASE_URL: "https://example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C12345678",
       },
@@ -743,6 +1017,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: " , ,, ",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       }),
@@ -757,6 +1032,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       }),
@@ -771,6 +1047,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: " , contact_made , ",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       }),
@@ -785,10 +1062,27 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "#ops",
       }),
     ).toThrow("invalid live integration env: SLACK_CHANNEL_ID");
+  });
+
+  it("live mode rejects malformed dedicated deployment Slack channel ids before first send", () => {
+    expect(() =>
+      integrationOptionsFromEnv("live", {
+        HUBSPOT_ACCESS_TOKEN: "hs-token",
+        HUBSPOT_DEAL_EXTERNAL_ID_PROPERTY: "gtm_router_deal_id",
+        HUBSPOT_WEBHOOK_SECRET: "client-secret",
+        PUBLIC_BASE_URL: "https://router.example.com",
+        HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
+        SLACK_BOT_TOKEN: "xoxb-token",
+        SLACK_CHANNEL_ID: "C0123456789",
+        SLACK_DEPLOYMENT_CHANNEL_ID: "#deployments",
+      }),
+    ).toThrow("invalid live integration env: SLACK_DEPLOYMENT_CHANNEL_ID");
   });
 
   it("live mode requires PUBLIC_BASE_URL to be an HTTPS origin", () => {
@@ -799,6 +1093,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com/prefix",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
       }),
@@ -931,6 +1226,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
         INTEGRATION_FETCH_TIMEOUT_MS: "1",
@@ -1212,6 +1508,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",
@@ -1282,6 +1579,7 @@ describe("HubSpot + Slack integration sink", () => {
         HUBSPOT_WEBHOOK_SECRET: "client-secret",
         PUBLIC_BASE_URL: "https://router.example.com",
         HUBSPOT_NOTIFY_STAGE_IDS: "contact_made",
+        HUBSPOT_STAGE_MAP_JSON: JSON.stringify({ contact_made: "open" }),
         HUBSPOT_DEALSTAGE: "3695885012",
         SLACK_BOT_TOKEN: "xoxb-token",
         SLACK_CHANNEL_ID: "C0123456789",

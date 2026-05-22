@@ -19,11 +19,17 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import { MAX_FUTURE_SKEW_MS } from "./constants.js";
 import type { Enricher } from "./enrich.js";
 import {
+  type FallbackNotificationHandler,
   type HubSpotStageChangeHandler,
   type IntegrationCheck,
+  type ReadinessNotificationHandler,
   type ResolvedHubSpotStageChange,
+  type TerminalDriftNotificationHandler,
   WebhookPayloadError,
   runIntegrationDoctor,
 } from "./integrations.js";
@@ -32,10 +38,16 @@ import { enrichWithGate, processBatch, scoreAndRoute } from "./pipeline.js";
 import type { PipelineOptions } from "./pipeline.js";
 import type { Store } from "./store.js";
 import type {
+  DeploymentReadinessState,
+  CommercialTerminalDriftAlertClaim,
+  CommercialTerminalDriftAlertRetryCandidate,
   Metrics,
   Quarantine,
+  ReadinessFallbackNotificationClaim,
+  ReadinessNotificationClaim,
   RoutedDeal,
 } from "./types.js";
+import { CommercialState, OutcomeReasonCategory, OutcomeState } from "./types.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 const STATE_DEAL_LIMIT = 200;
@@ -44,6 +56,21 @@ const STATE_EVENTS_PER_DEAL = 50;
 const HEALTH_TTL_MS = 35_000;
 const MAX_BATCH_DEALS = 250;
 const MAX_LIVE_BATCH_DEALS = 5;
+const LOCAL_ENDPOINT_SECRET_HEADER = "x-local-endpoint-secret";
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LOCAL_SERVER_HOST = "127.0.0.1";
+const MIN_LOCAL_ENDPOINT_SECRET_LENGTH = 32;
+const LOCAL_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LIVE_INTENT_ENV = [
+  "HUBSPOT_ACCESS_TOKEN",
+  "HUBSPOT_WEBHOOK_SECRET",
+  "HUBSPOT_PORTAL_ID",
+  "PUBLIC_BASE_URL",
+  "SLACK_BOT_TOKEN",
+  "SLACK_CHANNEL_ID",
+  "SLACK_DEPLOYMENT_CHANNEL_ID",
+] as const;
 // Failed checks back off longer to avoid hammering Slack/HubSpot during an outage.
 const HEALTH_FAILURE_TTL_MS = 120_000;
 
@@ -110,11 +137,48 @@ interface ConsoleState {
   };
   queue: ConsoleDeal[];
   exceptions: Quarantine[];
+  deploymentReadiness: DeploymentReadinessState[];
 }
 
 type PreviewResult =
   | { ok: true; deal: RoutedDeal }
   | { ok: false; stage: "intake" | "enriched"; reason: string };
+
+const LocalCommercialStateBody = z.object({
+  dealId: z.string().min(1),
+  commercialState: CommercialState,
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  reason: z.string().min(1).max(500).optional(),
+  expectedRedPath: z.boolean().optional(),
+  occurredAt: z.string().min(1),
+});
+
+const LocalDeploymentFactsBody = z.object({
+  dealId: z.string().min(1),
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  useCaseClear: z.boolean(),
+  integrationsKnown: z.boolean(),
+  dataReady: z.boolean(),
+  operator: z.string().trim().min(1).max(120),
+  occurredAt: z.string().min(1),
+});
+
+const LocalOutcomeBody = z.object({
+  dealId: z.string().min(1),
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  outcome: OutcomeState,
+  occurredAt: z.string().min(1),
+  operator: z.string().trim().min(1).max(120),
+  arrDeltaUsd: z.number().int("arrDeltaUsd must be an integer").optional(),
+  reasonCategory: OutcomeReasonCategory.optional(),
+});
+
+const NotificationRetryBody = z.object({
+  dealId: z.string().min(1).optional(),
+  fingerprint: z.string().min(1).optional(),
+  alertKey: z.string().min(1).optional(),
+  limit: z.number().int().optional(),
+});
 
 function quarantineCompany(q: Quarantine, intakeLabels: Map<string, string>): string {
   const intake = intakeLabels.get(q.dealId);
@@ -175,6 +239,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     integrity,
     queue,
     exceptions: quarantined.map((record) => record.quarantine),
+    deploymentReadiness: store.deploymentReadinessRecords(),
   };
 }
 
@@ -227,10 +292,10 @@ function consoleHtml(sinkLabel: string): string {
  .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;white-space:nowrap}
  .pass{color:var(--green)}.warn{color:var(--amber)}.fail,.risk{color:var(--red)}.muted{color:var(--muted)}.blue{color:var(--blue)}.violet{color:var(--violet)}
  .detail{display:grid;gap:12px}.section{border-top:1px solid var(--line);padding-top:10px}.kv{display:grid;grid-template-columns:128px 1fr;gap:7px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.kv div:nth-child(odd){color:var(--muted)}
- .journey{display:grid;gap:8px}.event{border:1px solid var(--line);background:#fff;border-radius:5px;padding:8px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+ .journey{display:grid;gap:8px}.event{border:1px solid var(--line);background:#fff;border-radius:5px;padding:8px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap}
  .receipts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.receipt{border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;font-size:11px}
  .empty{border:1px dashed var(--line);border-radius:5px;padding:14px;color:var(--muted);background:#fff}
- .queue-wrap{max-height:560px;overflow:auto}.exceptions{max-height:260px;overflow:auto}
+ .queue-wrap{max-height:560px;overflow:auto}.exceptions,.handoff-wrap{max-height:260px;overflow:auto}
  .footer{color:var(--muted);font-size:12px;margin-top:12px}
  @media(max-width:1180px){.layout,.top{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
  @media(max-width:640px){.shell{padding:14px}.two,.kpis{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.stamp{white-space:normal}.layout{grid-template-columns:1fr}.queue-wrap{max-height:none}}
@@ -283,6 +348,10 @@ function consoleHtml(sinkLabel: string): string {
   <div class="section">
    <h2>Exceptions Inbox</h2>
    <div class="exceptions" id="exceptions"></div>
+  </div>
+  <div class="section">
+   <h2>Deployment Handoff</h2>
+   <div class="handoff-wrap" id="deployment-handoff"></div>
   </div>
  </section>
  <section class="panel">
@@ -349,6 +418,7 @@ async function fetchJson(url, init){
 }
 function renderKpis(){
   const m = state.metrics;
+  const readiness = m.deploymentReadiness || {not_required:0,pending:0,ready:0,blocked:0};
   const cards = [
     ["Routed ARR", fmtMoney.format(m.routedArrUsd), fmtMoney.format(m.humanRoutedArrUsd) + " human-owned"],
     ["Open Queue", state.queue.length, "visible work items"],
@@ -361,6 +431,9 @@ function renderKpis(){
     ["Partial Syncs", m.partialSyncs, "routed with downstream warning"],
     ["Sync Gaps", m.externallySyncedStoreErrors, "external sync succeeded, local store failed"],
     ["Audit Gaps", m.stageNotificationAuditGaps, "stage notification audit rows needing attention"],
+    ["Deploy Ready", readiness.ready, readiness.blocked + " blocked"],
+    ["Deploy Pending", readiness.pending, m.readinessPendingOverSla + " over SLA"],
+    ["Fact Risk", m.readinessFactsStaleProjected, m.readinessFactsStaleIgnored + " stale ignored"],
     ["p95 Latency", m.latencyMsP95 + "ms", state.sinkLabel]
   ];
   const root = qs("#kpis");
@@ -398,7 +471,7 @@ function renderQueue(){
   table.append(head);
   for (const deal of state.queue) {
     const row = el("tr", "selectable" + (deal.id === selectedId ? " selected" : ""));
-    row.addEventListener("click", () => { selectedId = deal.id; renderQueue(); renderDetail(); });
+    row.addEventListener("click", () => selectDeal(deal.id));
     const hubspotStage = deal.externalStage
       ? (deal.externalStage.stageLabel || deal.externalStage.stageId)
       : "-";
@@ -466,52 +539,132 @@ function renderExceptions(){
   }
   root.replaceChildren(table);
 }
+const blockerLabels = {
+  deployment_use_case_unclear: "Use case unclear",
+  deployment_integration_unknown: "Integration unknown",
+  deployment_data_unavailable: "Data unavailable"
+};
+function readinessTitle(readiness){
+  if (readiness === "not_required") return "Not required";
+  if (readiness === "pending") return "Pending";
+  if (readiness === "ready") return "Ready";
+  return "Blocked";
+}
+function readinessDisplay(row){
+  const staleProjection = row.factsStatus === "stale" && (row.readiness === "ready" || row.readiness === "blocked");
+  return readinessTitle(row.readiness) + (staleProjection ? " (stale facts)" : "");
+}
+function readinessClass(row){
+  if (row.factsStatus === "stale" && (row.readiness === "ready" || row.readiness === "blocked")) return "risk";
+  if (row.readiness === "ready") return "pass";
+  if (row.readiness === "pending") return "warn";
+  if (row.readiness === "blocked") return "fail";
+  return "muted";
+}
+function blockerDisplay(row){
+  if (row.blockerCode) {
+    const primary = blockerLabels[row.blockerCode] || row.blockerCode;
+    const secondary = row.secondaryBlockerCodes && row.secondaryBlockerCodes.length
+      ? " +" + row.secondaryBlockerCodes.length
+      : "";
+    return primary + secondary;
+  }
+  if (row.factsStatus === "missing") return "Awaiting facts";
+  if (row.factsStatus === "stale") return "Facts stale";
+  return "-";
+}
+function renderDeploymentHandoff(){
+  const root = qs("#deployment-handoff");
+  const rows = state.deploymentReadiness || [];
+  if (!rows.length) {
+    root.replaceChildren(el("div", "empty", "No deployment handoffs yet."));
+    return;
+  }
+  const table = el("table");
+  const head = document.createElement("tr");
+  ["Router ID", "Readiness", "Blocker", "Reason", "Last Updated"].forEach((h) => head.append(el("th", null, h)));
+  table.append(head);
+  for (const rowState of rows) {
+    const row = el("tr", "selectable" + (rowState.dealId === selectedId ? " selected" : ""));
+    row.addEventListener("click", () => selectDeal(rowState.dealId));
+    const reason = rowState.reason || (rowState.factsStatus === "missing" ? "awaiting deployment facts" : "-");
+    row.append(
+      cell(rowState.dealId),
+      cell(readinessDisplay(rowState), readinessClass(rowState)),
+      cell(blockerDisplay(rowState)),
+      cell(reason),
+      cell(rowState.updatedAt)
+    );
+    table.append(row);
+  }
+  root.replaceChildren(table);
+}
+function selectDeal(dealId){
+  selectedId = dealId;
+  renderQueue();
+  renderDeploymentHandoff();
+  void renderDetail();
+}
 async function renderDetail(){
   const seq = ++detailRequestSeq;
   const root = qs("#detail");
   const selected = selectedId ? state.queue.find((d) => d.id === selectedId) : null;
-  if (selectedId && !selected) {
-    root.replaceChildren(el("div", "empty", "Selected deal " + selectedId + " is outside the visible queue. Refresh or submit a new deal to select another record."));
+  const readiness = selectedId
+    ? (state.deploymentReadiness || []).find((row) => row.dealId === selectedId)
+    : null;
+  if (selectedId && !selected && !readiness) {
+    root.replaceChildren(el("div", "empty", "Selected deal " + selectedId + " is no longer in the current state payload. Refresh or select another record."));
     return;
   }
-  const deal = selected || state.queue[0];
-  if (!deal) {
+  const deal = selected || null;
+  const detailId = selected?.id || readiness?.dealId || null;
+  if (!detailId) {
     root.replaceChildren(el("div", "empty", "Select a deal."));
     return;
   }
-  selectedId = deal.id;
+  const detailReadiness = readiness || (state.deploymentReadiness || []).find((row) => row.dealId === detailId) || null;
   root.replaceChildren(el("div", "empty", "Loading deal journey..."));
   let eventBody;
   try {
-    eventBody = await dealEvents(deal.id);
+    eventBody = await dealEvents(detailId);
   } catch (err) {
     if (seq !== detailRequestSeq) return;
     root.replaceChildren(el("div", "empty", "Could not load deal events: " + String(err)));
     return;
   }
-  if (seq !== detailRequestSeq || selectedId !== deal.id) return;
+  if (seq !== detailRequestSeq || selectedId !== detailId) return;
   const events = eventBody.events || [];
   const title = el("div", "section");
-  title.append(el("h2", null, deal.company));
+  title.append(el("h2", null, deal?.company || "Deployment handoff"));
   const kv = el("div", "kv");
-  const fields = [
-    ["ID", deal.id],
-    ["Status", deal.status],
-    ["Route", routeText(deal)],
-    ["Reason", deal.reason || "-"],
-    ["ARR", deal.amount ? fmtMoney.format(deal.amount) : "-"]
-  ];
-  if (deal.externalStage) {
+  const fields = [["ID", detailId]];
+  if (deal) {
+    fields.push(
+      ["Status", deal.status],
+      ["Route", routeText(deal)],
+      ["Reason", deal.reason || "-"],
+      ["ARR", deal.amount ? fmtMoney.format(deal.amount) : "-"]
+    );
+  }
+  if (detailReadiness) {
+    fields.push(
+      ["Readiness", readinessDisplay(detailReadiness)],
+      ["Blocker", blockerDisplay(detailReadiness)],
+      ["Facts", detailReadiness.factsStatus],
+      ["Readiness Updated", detailReadiness.updatedAt]
+    );
+  }
+  if (deal?.externalStage) {
     fields.push(["HubSpot ID", deal.externalStage.externalId]);
     fields.push(["HubSpot Stage", deal.externalStage.stageLabel || deal.externalStage.stageId]);
     fields.push(["Stage Updated", deal.externalStage.updatedAt]);
   }
-  if (deal.scoreTotal !== undefined) {
+  if (deal?.scoreTotal !== undefined) {
     fields.push(["Score", deal.scoreTotal.toFixed(2)]);
     fields.push(["Source", deal.sourceChannel || "-"]);
     fields.push(["Need", deal.statedNeed || "-"]);
   }
-  if (deal.quarantine) {
+  if (deal?.quarantine) {
     fields.push(["Stage", deal.quarantine.stage]);
     fields.push(["Reason", deal.quarantine.reason]);
   }
@@ -519,12 +672,12 @@ async function renderDetail(){
   title.append(kv, receiptBadges(events));
   const scoreBox = el("div", "section");
   scoreBox.append(el("h2", null, "Score Explanation"));
-  if (deal.scoreNotes) {
+  if (deal?.scoreNotes && deal.scoreNotes.length) {
     const notes = el("div", "journey");
     for (const note of deal.scoreNotes) notes.append(el("div", "event", note));
     scoreBox.append(notes);
   } else {
-    scoreBox.append(el("div", "empty", "No score for quarantined records."));
+    scoreBox.append(el("div", "empty", "No score notes available."));
   }
   const journey = el("div", "section");
   journey.append(el("h2", null, "Deal Journey"));
@@ -545,10 +698,12 @@ async function loadState(){
     if (seq !== stateRequestSeq) return;
     state = next;
     if (!selectedId && state.queue[0]) selectedId = state.queue[0].id;
+    if (!selectedId && (state.deploymentReadiness || [])[0]) selectedId = state.deploymentReadiness[0].dealId;
     qs("#last-refresh").textContent = new Date().toLocaleTimeString();
     renderKpis();
     renderQueue();
     renderExceptions();
+    renderDeploymentHandoff();
     void renderDetail();
   } catch (err) {
     if (seq !== stateRequestSeq) return;
@@ -558,6 +713,7 @@ async function loadState(){
       qs("#kpis").replaceChildren(el("div", "empty", msg));
       qs("#queue").replaceChildren(el("div", "empty", msg));
       qs("#exceptions").replaceChildren(el("div", "empty", msg));
+      qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
       qs("#detail").replaceChildren(el("div", "empty", msg));
     }
   }
@@ -707,11 +863,125 @@ interface ServerOptions {
   sinkLabel?: string;
   liveIntegrations?: boolean;
   stageChanges?: HubSpotStageChangeHandler;
+  readinessNotifications?: ReadinessNotificationHandler;
+  fallbackNotifications?: FallbackNotificationHandler;
+  terminalDriftNotifications?: TerminalDriftNotificationHandler;
 }
 
 interface RequestUrlOptions {
   publicBaseUrl: string | undefined;
   trustProxy: boolean;
+}
+
+interface LocalWriteEndpointOptions {
+  enabled: boolean;
+  secret: string | null;
+  allowExpectedRedPaths: boolean;
+  configuredPort: number;
+}
+
+function envFlag(name: string): boolean {
+  return process.env[name] === "1";
+}
+
+function hasLiveIntegrationIntent(options: ServerOptions): boolean {
+  return (
+    options.liveIntegrations === true ||
+    LIVE_INTENT_ENV.some((name) => {
+      const value = process.env[name];
+      return typeof value === "string" && value.length > 0;
+    })
+  );
+}
+
+function localWriteEndpointOptions(
+  options: ServerOptions,
+  configuredPort: number,
+): LocalWriteEndpointOptions {
+  const enabled = envFlag("ALLOW_LOCAL_WRITE_ENDPOINTS");
+  const allowExpectedRedPaths = envFlag("ALLOW_EXPECTED_RED_PATHS");
+  const liveIntent = hasLiveIntegrationIntent(options);
+
+  if (allowExpectedRedPaths && liveIntent) {
+    throw new Error(
+      "ALLOW_EXPECTED_RED_PATHS is only allowed in local/demo mode",
+    );
+  }
+  if (!enabled) {
+    return {
+      enabled: false,
+      secret: null,
+      allowExpectedRedPaths,
+      configuredPort,
+    };
+  }
+  if (liveIntent) {
+    throw new Error(
+      "ALLOW_LOCAL_WRITE_ENDPOINTS cannot be enabled with live HubSpot/Slack integration intent",
+    );
+  }
+  if (envFlag("TRUST_PROXY")) {
+    throw new Error("ALLOW_LOCAL_WRITE_ENDPOINTS cannot be used with TRUST_PROXY=1");
+  }
+
+  const secret = process.env.LOCAL_ENDPOINT_SECRET;
+  if (!secret || secret.length < MIN_LOCAL_ENDPOINT_SECRET_LENGTH) {
+    throw new Error(
+      `LOCAL_ENDPOINT_SECRET must be at least ${MIN_LOCAL_ENDPOINT_SECRET_LENGTH} characters when local write endpoints are enabled`,
+    );
+  }
+
+  return {
+    enabled: true,
+    secret,
+    allowExpectedRedPaths,
+    configuredPort,
+  };
+}
+
+function defaultReadinessNotifications(): ReadinessNotificationHandler {
+  return {
+    eventMode: "dry_run",
+    async notify(claim: ReadinessNotificationClaim) {
+      return [
+        {
+          system: "slack",
+          externalId: "readiness:dry-run",
+          detail: `would post redacted deployment readiness handoff for ${claim.dealId}`,
+        },
+      ];
+    },
+  };
+}
+
+function defaultFallbackNotifications(): FallbackNotificationHandler {
+  return {
+    eventMode: "dry_run",
+    async notify(claim: ReadinessFallbackNotificationClaim) {
+      return [
+        {
+          system: "slack",
+          externalId: "fallback:dry-run",
+          detail: `would post deployment_handoff_failed alert for ${claim.dealId}`,
+        },
+      ];
+    },
+  };
+}
+
+function defaultTerminalDriftNotifications(): TerminalDriftNotificationHandler {
+  return {
+    eventMode: "dry_run",
+    async notify(claim: CommercialTerminalDriftAlertClaim) {
+      return [
+        {
+          system: "slack",
+          externalId: "terminal-drift:dry-run",
+          detail: `would post commercial_terminal_drift alert for ${claim.dealId}`,
+        },
+      ];
+    },
+  };
 }
 
 export function startServer(
@@ -722,6 +992,13 @@ export function startServer(
 ): ReturnType<typeof createServer> {
   const sinkLabel = options.sinkLabel ?? "logging";
   const integrationHealthEnabled = options.liveIntegrations === true;
+  const localWrites = localWriteEndpointOptions(options, port);
+  const readinessNotifications =
+    options.readinessNotifications ?? defaultReadinessNotifications();
+  const fallbackNotifications =
+    options.fallbackNotifications ?? defaultFallbackNotifications();
+  const terminalDriftNotifications =
+    options.terminalDriftNotifications ?? defaultTerminalDriftNotifications();
   let healthCache:
     | { at: number; ttlMs: number; checks: IntegrationCheck[] }
     | undefined;
@@ -771,6 +1048,10 @@ export function startServer(
       html,
       options,
       requestUrlOptions,
+      localWrites,
+      readinessNotifications,
+      fallbackNotifications,
+      terminalDriftNotifications,
     ).catch(
       (err: unknown) => {
         if (!res.headersSent) {
@@ -783,7 +1064,7 @@ export function startServer(
       },
     );
   });
-  server.listen(port, "127.0.0.1");
+  server.listen(port, LOCAL_SERVER_HOST);
   return server;
 }
 
@@ -791,6 +1072,57 @@ function incomingHeader(req: IncomingMessage, name: string): string | undefined 
   const value = req.headers[name.toLowerCase()];
   const first = Array.isArray(value) ? value[0] : value;
   return typeof first === "string" && first.length > 0 ? first : undefined;
+}
+
+function isLoopbackRemoteAddress(address: string | undefined): boolean {
+  if (address === "127.0.0.1" || address === "::1") return true;
+  if (!address?.startsWith("::ffff:")) return false;
+  return address.slice("::ffff:".length) === "127.0.0.1";
+}
+
+function hostHeaderAllowed(host: string | undefined, configuredPort: number): boolean {
+  if (!host) return false;
+  const lower = host.toLowerCase();
+  let name: string;
+  let port: string | undefined;
+
+  if (lower.startsWith("[")) {
+    const close = lower.indexOf("]");
+    if (close < 0) return false;
+    name = lower.slice(0, close + 1);
+    const rest = lower.slice(close + 1);
+    if (rest.length > 0) {
+      if (!rest.startsWith(":")) return false;
+      port = rest.slice(1);
+    }
+  } else {
+    const firstColon = lower.indexOf(":");
+    const lastColon = lower.lastIndexOf(":");
+    if (firstColon !== lastColon) return false;
+    if (firstColon >= 0) {
+      name = lower.slice(0, firstColon);
+      port = lower.slice(firstColon + 1);
+    } else {
+      name = lower;
+    }
+  }
+
+  if (!LOCAL_ALLOWED_HOSTS.has(name)) return false;
+  if (port === undefined) return true;
+  if (!/^\d+$/.test(port)) return false;
+  return configuredPort === 0 || Number(port) === configuredPort;
+}
+
+function localSecretMatches(expected: string, received: string | undefined): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const receivedBytes = Buffer.from(received ?? "", "utf8");
+  if (receivedBytes.length !== expectedBytes.length) {
+    const padded = Buffer.alloc(expectedBytes.length);
+    receivedBytes.copy(padded, 0, 0, Math.min(receivedBytes.length, padded.length));
+    timingSafeEqual(expectedBytes, padded);
+    return false;
+  }
+  return timingSafeEqual(expectedBytes, receivedBytes);
 }
 
 function requestAbsoluteUrl(
@@ -1013,6 +1345,606 @@ async function handleHubSpotWebhook(
   });
 }
 
+function localCommercialStateStatusCode(
+  status: ReturnType<Store["recordLocalCommercialState"]>["status"],
+  expectedRedPath: boolean,
+): number {
+  if (status === "not_routed") return 404;
+  if (status === "idempotency_conflict" || status === "regression") return 409;
+  if (status === "terminal_drift" && !expectedRedPath) return 409;
+  return 200;
+}
+
+function guardLocalWriteRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  localWrites: LocalWriteEndpointOptions,
+  url: string,
+): boolean {
+  if (!localWrites.enabled || !localWrites.secret) {
+    json(res, 404, { error: "not found", url });
+    return false;
+  }
+  if (!hostHeaderAllowed(incomingHeader(req, "host"), localWrites.configuredPort)) {
+    json(res, 403, { error: "local endpoint host rejected" });
+    return false;
+  }
+  if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
+    json(res, 403, { error: "local endpoint requires loopback remote address" });
+    return false;
+  }
+  if (
+    !localSecretMatches(
+      localWrites.secret,
+      incomingHeader(req, LOCAL_ENDPOINT_SECRET_HEADER),
+    )
+  ) {
+    json(res, 401, { error: "invalid local endpoint secret" });
+    return false;
+  }
+  return true;
+}
+
+async function deliverReadinessNotification(
+  store: Store,
+  handler: ReadinessNotificationHandler,
+  fallbackHandler: FallbackNotificationHandler,
+  claim: ReadinessNotificationClaim | null,
+): Promise<{
+  status: string;
+  receipts: number;
+  fingerprint: string;
+  fallbackStatus?: string;
+  fallbackReceipts?: number;
+} | null> {
+  if (!claim) return null;
+  let receipts: Array<{
+    system: string;
+    externalId: string;
+    detail: string;
+    status?: "ok" | "warning";
+    url?: string;
+  }>;
+  try {
+    receipts = await handler.notify(claim);
+  } catch (err) {
+    // The bundled Slack notifier returns warning receipts, but custom handlers
+    // may throw; convert that into the same retryable writeback path.
+    receipts = [
+      {
+        system: "slack",
+        externalId: "readiness-notification",
+        detail: `deployment readiness notification failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        status: "warning",
+      },
+    ];
+  }
+  const delivery = store.recordReadinessNotificationEvent(
+    claim,
+    handler.eventMode,
+    receipts,
+  );
+  const result: {
+    status: string;
+    receipts: number;
+    fingerprint: string;
+    fallbackStatus?: string;
+    fallbackReceipts?: number;
+  } = {
+    status: delivery.status,
+    receipts: receipts.length,
+    fingerprint: claim.fingerprint,
+  };
+  if (delivery.fallbackClaim) {
+    const fallback = await deliverFallbackNotification(
+      store,
+      fallbackHandler,
+      delivery.fallbackClaim,
+    );
+    if (fallback) {
+      result.fallbackStatus = fallback.status;
+      result.fallbackReceipts = fallback.receipts;
+    }
+  }
+  return result;
+}
+
+async function deliverFallbackNotification(
+  store: Store,
+  handler: FallbackNotificationHandler,
+  claim: ReadinessFallbackNotificationClaim | null,
+): Promise<{ status: string; receipts: number; fallbackKey: string } | null> {
+  if (!claim) return null;
+  let receipts: Array<{
+    system: string;
+    externalId: string;
+    detail: string;
+    status?: "ok" | "warning";
+    url?: string;
+  }>;
+  try {
+    receipts = await handler.notify(claim);
+  } catch (err) {
+    receipts = [
+      {
+        system: "slack",
+        externalId: "fallback-notification",
+        detail: `deployment handoff fallback notification failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        status: "warning",
+      },
+    ];
+  }
+  const delivery = store.recordReadinessFallbackNotificationEvent(
+    claim,
+    handler.eventMode,
+    receipts,
+  );
+  return {
+    status: delivery.status,
+    receipts: receipts.length,
+    fallbackKey: claim.fallbackKey,
+  };
+}
+
+async function deliverTerminalDriftNotification(
+  store: Store,
+  handler: TerminalDriftNotificationHandler,
+  claim: CommercialTerminalDriftAlertClaim | null,
+): Promise<{ status: string; receipts: number; alertKey: string } | null> {
+  if (!claim) return null;
+  let receipts: Array<{
+    system: string;
+    externalId: string;
+    detail: string;
+    status?: "ok" | "warning";
+    url?: string;
+  }>;
+  try {
+    receipts = await handler.notify(claim);
+  } catch (err) {
+    receipts = [
+      {
+        system: "slack",
+        externalId: "terminal-drift-notification",
+        detail: `commercial terminal drift alert failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        status: "warning",
+      },
+    ];
+  }
+  const delivery = store.recordCommercialTerminalDriftAlertEvent(
+    claim,
+    handler.eventMode,
+    receipts,
+  );
+  return {
+    status: delivery.status,
+    receipts: receipts.length,
+    alertKey: claim.alertKey,
+  };
+}
+
+async function handleLocalCommercialState(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  readinessNotifications: ReadinessNotificationHandler,
+  fallbackNotifications: FallbackNotificationHandler,
+  terminalDriftNotifications: TerminalDriftNotificationHandler,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/commercial-state")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalCommercialStateBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid commercial-state request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = new Date(body.data.occurredAt);
+  if (Number.isNaN(occurredAt.getTime())) {
+    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+    return;
+  }
+  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  const expectedRedPath = body.data.expectedRedPath === true;
+  if (expectedRedPath && !localWrites.allowExpectedRedPaths) {
+    json(res, 403, {
+      error: "expectedRedPath requires ALLOW_EXPECTED_RED_PATHS=1",
+    });
+    return;
+  }
+
+  const result = store.recordLocalCommercialState({
+    dealId: body.data.dealId,
+    commercialState: body.data.commercialState,
+    sourceEventId: body.data.sourceEventId,
+    occurredAt: occurredAt.toISOString(),
+    reason: body.data.reason ?? null,
+    expectedRedPath,
+  });
+  const readinessNotificationResult = await deliverReadinessNotification(
+    store,
+    readinessNotifications,
+    fallbackNotifications,
+    result.readinessNotification,
+  );
+  const terminalDriftAlertResult = await deliverTerminalDriftNotification(
+    store,
+    terminalDriftNotifications,
+    result.terminalDriftAlert,
+  );
+  json(res, localCommercialStateStatusCode(result.status, expectedRedPath), {
+    ...result,
+    ...(readinessNotificationResult ? { readinessNotificationResult } : {}),
+    ...(terminalDriftAlertResult ? { terminalDriftAlertResult } : {}),
+  });
+}
+
+function localDeploymentFactsStatusCode(
+  status: ReturnType<Store["recordLocalDeploymentFacts"]>["status"],
+): number {
+  if (status === "not_found") return 404;
+  if (status === "idempotency_conflict" || status === "tie_conflict") return 409;
+  return 200;
+}
+
+function localOutcomeStatusCode(
+  status: ReturnType<Store["recordLocalOutcome"]>["status"],
+): number {
+  if (status === "not_found") return 404;
+  if (status === "invalid_arr_delta") return 422;
+  if (
+    status === "idempotency_conflict" ||
+    status === "not_closed_won" ||
+    status === "duplicate_semantic_outcome" ||
+    status === "missing_prior_outcome" ||
+    status === "post_churn_outcome"
+  ) {
+    return 409;
+  }
+  return 200;
+}
+
+async function handleLocalDeploymentFacts(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  readinessNotifications: ReadinessNotificationHandler,
+  fallbackNotifications: FallbackNotificationHandler,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/deployment-facts")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalDeploymentFactsBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid deployment-facts request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = new Date(body.data.occurredAt);
+  if (Number.isNaN(occurredAt.getTime())) {
+    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+    return;
+  }
+  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  const result = store.recordLocalDeploymentFacts({
+    dealId: body.data.dealId,
+    sourceEventId: body.data.sourceEventId,
+    useCaseClear: body.data.useCaseClear,
+    integrationsKnown: body.data.integrationsKnown,
+    dataReady: body.data.dataReady,
+    operator: body.data.operator,
+    occurredAt: occurredAt.toISOString(),
+  });
+  const readinessNotificationResult = await deliverReadinessNotification(
+    store,
+    readinessNotifications,
+    fallbackNotifications,
+    result.readinessNotification,
+  );
+  json(res, localDeploymentFactsStatusCode(result.status), {
+    ...result,
+    ...(readinessNotificationResult ? { readinessNotificationResult } : {}),
+  });
+}
+
+function outcomeBodyError(parsed: unknown): string {
+  if (parsed && typeof parsed === "object" && !("dealId" in parsed)) {
+    const record = parsed as Record<string, unknown>;
+    if ("hubspotDealId" in record || "externalDealId" in record) {
+      return "router dealId required";
+    }
+  }
+  return "invalid outcome request";
+}
+
+async function handleLocalOutcome(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/outcomes")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalOutcomeBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: outcomeBodyError(parsed),
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = new Date(body.data.occurredAt);
+  if (Number.isNaN(occurredAt.getTime())) {
+    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+    return;
+  }
+  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  const result = store.recordLocalOutcome({
+    dealId: body.data.dealId,
+    sourceEventId: body.data.sourceEventId,
+    outcome: body.data.outcome,
+    occurredAt: occurredAt.toISOString(),
+    operator: body.data.operator,
+    arrDeltaUsd: body.data.arrDeltaUsd ?? null,
+    reasonCategory: body.data.reasonCategory ?? null,
+  });
+  json(res, localOutcomeStatusCode(result.status), result);
+}
+
+async function handleNotificationRetry(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  readinessNotifications: ReadinessNotificationHandler,
+  fallbackNotifications: FallbackNotificationHandler,
+  terminalDriftNotifications: TerminalDriftNotificationHandler,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/notification-retry")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = NotificationRetryBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid notification-retry request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+  if (body.data.fingerprint && body.data.alertKey) {
+    json(res, 400, {
+      error: "fingerprint and alertKey filters are mutually exclusive",
+    });
+    return;
+  }
+  const limit = body.data.limit ?? 25;
+  if (limit < 1 || limit > 100) {
+    json(res, 400, { error: "limit must be between 1 and 100" });
+    return;
+  }
+
+  const readinessCandidates = body.data.alertKey
+    ? []
+    : store.readinessNotificationRetryCandidates({
+        ...(body.data.dealId ? { dealId: body.data.dealId } : {}),
+        ...(body.data.fingerprint ? { fingerprint: body.data.fingerprint } : {}),
+        limit: limit + 1,
+      });
+  const terminalDriftCandidates = body.data.fingerprint
+    ? []
+    : store.commercialTerminalDriftAlertRetryCandidates({
+        ...(body.data.dealId ? { dealId: body.data.dealId } : {}),
+        ...(body.data.alertKey ? { alertKey: body.data.alertKey } : {}),
+        limit: limit + 1,
+      });
+  type ReadinessRetryCandidate = (typeof readinessCandidates)[number];
+  type RetryCandidate =
+    | ReadinessRetryCandidate
+    | CommercialTerminalDriftAlertRetryCandidate;
+  const candidates: RetryCandidate[] = [];
+  for (
+    let i = 0;
+    candidates.length < limit + 1 &&
+    (i < readinessCandidates.length || i < terminalDriftCandidates.length);
+    i += 1
+  ) {
+    const readiness = readinessCandidates[i];
+    if (readiness) candidates.push(readiness);
+    const terminalDrift = terminalDriftCandidates[i];
+    if (terminalDrift && candidates.length < limit + 1) {
+      candidates.push(terminalDrift);
+    }
+  }
+  const attempted = candidates.slice(0, limit);
+  const results: Array<Record<string, unknown>> = [];
+
+  for (const candidate of attempted) {
+    if (candidate.type === "terminal_drift") {
+      const claim = store.claimCommercialTerminalDriftAlertRetry(
+        candidate.alertKey,
+      );
+      if (!claim) {
+        results.push({ ...candidate, status: "lost_race", receipts: 0 });
+        continue;
+      }
+      const delivery = await deliverTerminalDriftNotification(
+        store,
+        terminalDriftNotifications,
+        claim,
+      );
+      results.push({
+        ...candidate,
+        status: delivery?.status ?? "lost_race",
+        receipts: delivery?.receipts ?? 0,
+      });
+      continue;
+    }
+
+    if (candidate.type === "primary") {
+      const claim = store.claimReadinessNotificationRetry(
+        candidate.dealId,
+        candidate.fingerprint,
+      );
+      if (!claim) {
+        results.push({ ...candidate, status: "lost_race", receipts: 0 });
+        continue;
+      }
+      let receipts: Array<{
+        system: string;
+        externalId: string;
+        detail: string;
+        status?: "ok" | "warning";
+        url?: string;
+      }>;
+      try {
+        receipts = await readinessNotifications.notify(claim);
+      } catch (err) {
+        receipts = [
+          {
+            system: "slack",
+            externalId: "readiness-notification",
+            detail: `deployment readiness notification failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            status: "warning",
+          },
+        ];
+      }
+      const delivery = store.recordReadinessNotificationEvent(
+        claim,
+        readinessNotifications.eventMode,
+        receipts,
+      );
+      const result: Record<string, unknown> = {
+        ...candidate,
+        status: delivery.status,
+        receipts: receipts.length,
+      };
+      if (delivery.fallbackClaim) {
+        const fallback = await deliverFallbackNotification(
+          store,
+          fallbackNotifications,
+          delivery.fallbackClaim,
+        );
+        if (fallback) {
+          result.fallbackStatus = fallback.status;
+          result.fallbackReceipts = fallback.receipts;
+        }
+      }
+      results.push(result);
+      continue;
+    }
+
+    const fallbackClaim = store.claimReadinessFallback(
+      candidate.dealId,
+      candidate.fingerprint,
+    );
+    if (!fallbackClaim) {
+      results.push({
+        ...candidate,
+        status: store.readinessFallbackClaimMissStatus(candidate.fingerprint),
+        receipts: 0,
+      });
+      continue;
+    }
+    const fallback = await deliverFallbackNotification(
+      store,
+      fallbackNotifications,
+      fallbackClaim,
+    );
+    results.push({
+      ...candidate,
+      status: fallback?.status ?? "lost_race",
+      receipts: fallback?.receipts ?? 0,
+    });
+  }
+
+  json(res, 200, {
+    attempted: attempted.length,
+    results,
+    ...(candidates.length > limit ? { moreAvailable: true } : {}),
+  });
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1022,6 +1954,10 @@ async function handleRequest(
   html: string,
   options: ServerOptions,
   requestUrlOptions: RequestUrlOptions,
+  localWrites: LocalWriteEndpointOptions,
+  readinessNotifications: ReadinessNotificationHandler,
+  fallbackNotifications: FallbackNotificationHandler,
+  terminalDriftNotifications: TerminalDriftNotificationHandler,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost").pathname;
   const method = req.method === "HEAD" ? "GET" : req.method;
@@ -1091,6 +2027,45 @@ async function handleRequest(
       store,
       options.stageChanges,
       requestUrlOptions,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/commercial-state") {
+    await handleLocalCommercialState(
+      req,
+      res,
+      store,
+      localWrites,
+      readinessNotifications,
+      fallbackNotifications,
+      terminalDriftNotifications,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/deployment-facts") {
+    await handleLocalDeploymentFacts(
+      req,
+      res,
+      store,
+      localWrites,
+      readinessNotifications,
+      fallbackNotifications,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/outcomes") {
+    await handleLocalOutcome(req, res, store, localWrites);
+    return;
+  }
+  if (method === "POST" && url === "/notification-retry") {
+    await handleNotificationRetry(
+      req,
+      res,
+      store,
+      localWrites,
+      readinessNotifications,
+      fallbackNotifications,
+      terminalDriftNotifications,
     );
     return;
   }

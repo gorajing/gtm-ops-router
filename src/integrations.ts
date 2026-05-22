@@ -8,6 +8,7 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { HUBSPOT_WEBHOOK_FETCH_TIMEOUT_CAP_MS } from "./constants.js";
 import {
   DEFAULT_RETRY,
@@ -19,13 +20,21 @@ import {
   type SinkReceipt,
   withRetry,
 } from "./sink.js";
-import type { RoutedDeal } from "./types.js";
+import {
+  CommercialState,
+  type CommercialTerminalDriftAlertClaim,
+  type CommercialState as CommercialStateT,
+  type ReadinessFallbackNotificationClaim,
+  type ReadinessNotificationClaim,
+  type RoutedDeal,
+} from "./types.js";
 
 type FetchLike = typeof fetch;
 const DEFAULT_FETCH_TIMEOUT_MS = 8_000;
 
 export class WebhookPayloadError extends Error {}
 class HubSpotDealUnmappedError extends Error {}
+export class IntegrationConfigError extends Error {}
 
 export interface IntegrationSinkConfig {
   mode: "dry-run" | "live";
@@ -37,6 +46,7 @@ export interface IntegrationSinkConfig {
   hubspotPortalId: string | undefined;
   slackBotToken: string | undefined;
   slackChannelId: string;
+  deploymentSlackChannelId?: string;
   slackApiBase: string;
   fetchImpl: FetchLike;
   slackRetry?: RetryOptions;
@@ -47,6 +57,46 @@ export interface IntegrationBuild {
   sink: OpportunitySink;
   label: string;
   stageChanges: HubSpotStageChangeHandler;
+  readinessNotifications: ReadinessNotificationHandler;
+  fallbackNotifications: FallbackNotificationHandler;
+  terminalDriftNotifications: TerminalDriftNotificationHandler;
+  configBundle: IntegrationConfigBundle;
+}
+
+export interface ReadinessNotificationHandler {
+  readonly eventMode: "dry_run" | "live";
+  notify(claim: ReadinessNotificationClaim): Promise<SinkReceipt[]>;
+}
+
+export interface FallbackNotificationHandler {
+  readonly eventMode: "dry_run" | "live";
+  notify(claim: ReadinessFallbackNotificationClaim): Promise<SinkReceipt[]>;
+}
+
+export interface TerminalDriftNotificationHandler {
+  readonly eventMode: "dry_run" | "live";
+  notify(claim: CommercialTerminalDriftAlertClaim): Promise<SinkReceipt[]>;
+}
+
+export type HubSpotStageMapValue = CommercialStateT | "ignore";
+export type HubSpotStageMap = Record<string, HubSpotStageMapValue>;
+
+export interface ResolvedHubSpotStageMap {
+  source: "none" | "json" | "path";
+  map: HubSpotStageMap;
+}
+
+export interface IntegrationConfigBundle {
+  mode: "off" | "dry-run" | "live";
+  hubspotStageMapSource: ResolvedHubSpotStageMap["source"];
+  hubspotStageMap: HubSpotStageMap;
+  hubspotNotifyStageIds: string[];
+  allowUnsignedWebhooks: boolean;
+  allowLocalWriteEndpoints: boolean;
+  allowExpectedRedPaths: boolean;
+  trustProxy: boolean;
+  deploymentHandoffChannelMode: "unset" | "generic" | "dedicated";
+  publicBaseUrl: string | null;
 }
 
 export type IntegrationCheckStatus = "pass" | "warn" | "fail";
@@ -143,11 +193,22 @@ interface HubSpotStageChangeConfig {
   hubspotPortalId: string | undefined;
   hubspotWebhookSecret: string | undefined;
   hubspotNotifyStageIds: string[];
+  hubspotStageMap: HubSpotStageMap;
   slackBotToken: string | undefined;
   slackChannelId: string;
   slackApiBase: string;
   fetchImpl: FetchLike;
   allowUnsignedWebhooks: boolean;
+}
+
+interface DeploymentReadinessNotificationConfig {
+  mode: "dry-run" | "live";
+  slackBotToken: string | undefined;
+  slackChannelId: string;
+  deploymentSlackChannelId: string;
+  slackApiBase: string;
+  fetchImpl: FetchLike;
+  slackRetry?: RetryOptions;
 }
 
 interface HubSpotPropertyResponse {
@@ -280,6 +341,53 @@ export function slackHandoffPayload(
       hubspot.url ? ` (${escapeSlackLinkChars(hubspot.url)})` : ""
     }`,
     `Router id: ${escapeSlackLinkChars(deal.id)}`,
+  ];
+  return { channel, text: lines.join("\n") };
+}
+
+export function slackDeploymentReadinessPayload(
+  claim: ReadinessNotificationClaim,
+  channel: string,
+): { channel: string; text: string } {
+  const lines = [
+    "Deployment readiness handoff",
+    `Router id: ${escapeSlackLinkChars(claim.dealId)}`,
+    `Readiness: ${escapeSlackLinkChars(claim.readiness)}`,
+    `Transition: ${escapeSlackLinkChars(claim.previousReadiness)} -> ${escapeSlackLinkChars(claim.readiness)}`,
+    claim.blockerCode
+      ? `Blocker: ${escapeSlackLinkChars(claim.blockerCode)}`
+      : "",
+    claim.reason ? `Reason: ${escapeSlackLinkChars(claim.reason)}` : "",
+    `Fingerprint: ${escapeSlackLinkChars(claim.fingerprint)}`,
+  ].filter((line) => line.length > 0);
+  return { channel, text: lines.join("\n") };
+}
+
+export function slackDeploymentHandoffFailedPayload(
+  claim: ReadinessFallbackNotificationClaim,
+  channel: string,
+): { channel: string; text: string } {
+  const lines = [
+    "Deployment handoff failed",
+    `Router id: ${escapeSlackLinkChars(claim.dealId)}`,
+    `Readiness: ${escapeSlackLinkChars(claim.readiness)}`,
+    `Error: ${escapeSlackLinkChars(claim.errorClass)}`,
+    `Fingerprint: ${escapeSlackLinkChars(claim.fingerprint)}`,
+  ];
+  return { channel, text: lines.join("\n") };
+}
+
+export function slackCommercialTerminalDriftPayload(
+  claim: CommercialTerminalDriftAlertClaim,
+  channel: string,
+): { channel: string; text: string } {
+  const lines = [
+    "Commercial terminal drift",
+    `Router id: ${escapeSlackLinkChars(claim.dealId)}`,
+    `Incoming: ${escapeSlackLinkChars(claim.incomingCommercialState)}`,
+    `Current: ${escapeSlackLinkChars(claim.currentCommercialState)}`,
+    `Drift: ${escapeSlackLinkChars(claim.driftKind)}`,
+    `When: ${escapeSlackLinkChars(claim.incomingOccurredAt)}`,
   ];
   return { channel, text: lines.join("\n") };
 }
@@ -466,6 +574,10 @@ function integrationConfigFromEnv(
     hubspotPortalId: env.HUBSPOT_PORTAL_ID,
     slackBotToken: env.SLACK_BOT_TOKEN,
     slackChannelId: env.SLACK_CHANNEL_ID ?? "#gtm-ops-router-demo",
+    deploymentSlackChannelId:
+      env.SLACK_DEPLOYMENT_CHANNEL_ID ??
+      env.SLACK_CHANNEL_ID ??
+      "#gtm-ops-router-demo",
     slackApiBase: env.SLACK_API_BASE ?? "https://slack.com",
     fetchImpl: withFetchTimeout(fetchImpl, fetchTimeoutMs(env)),
   };
@@ -478,10 +590,118 @@ function csvEnv(value: string | undefined): string[] {
     .filter((part) => part.length > 0);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseHubSpotStageMap(
+  raw: string,
+  source: "json" | "path",
+): HubSpotStageMap {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new IntegrationConfigError(
+      `invalid HUBSPOT_STAGE_MAP_${source === "json" ? "JSON" : "PATH"}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (!isPlainObject(parsed)) {
+    throw new IntegrationConfigError(
+      `invalid HUBSPOT_STAGE_MAP_${source === "json" ? "JSON" : "PATH"}: expected object`,
+    );
+  }
+  const map: HubSpotStageMap = {};
+  for (const [stageId, value] of Object.entries(parsed)) {
+    if (stageId.trim().length === 0) {
+      throw new IntegrationConfigError("HubSpot stage map contains an empty stage id");
+    }
+    if (value === "ignore") {
+      map[stageId] = "ignore";
+      continue;
+    }
+    const commercialState = CommercialState.safeParse(value);
+    if (!commercialState.success) {
+      throw new IntegrationConfigError(
+        `HubSpot stage ${stageId} maps to unsupported value ${JSON.stringify(value)}`,
+      );
+    }
+    map[stageId] = commercialState.data;
+  }
+  return map;
+}
+
+export function resolveHubSpotStageMap(
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedHubSpotStageMap {
+  const inline = env.HUBSPOT_STAGE_MAP_JSON;
+  const path = env.HUBSPOT_STAGE_MAP_PATH;
+  if (inline && path) {
+    throw new IntegrationConfigError(
+      "set only one of HUBSPOT_STAGE_MAP_JSON or HUBSPOT_STAGE_MAP_PATH",
+    );
+  }
+  if (inline) {
+    return { source: "json", map: parseHubSpotStageMap(inline, "json") };
+  }
+  if (path) {
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch (err) {
+      throw new IntegrationConfigError(
+        `invalid HUBSPOT_STAGE_MAP_PATH: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return { source: "path", map: parseHubSpotStageMap(raw, "path") };
+  }
+  return { source: "none", map: {} };
+}
+
+export function integrationConfigBundleFromEnv(
+  mode: "off" | "dry-run" | "live",
+  env: NodeJS.ProcessEnv = process.env,
+): IntegrationConfigBundle {
+  const stageMap =
+    mode === "off"
+      ? (() => {
+          if (env.HUBSPOT_STAGE_MAP_JSON && env.HUBSPOT_STAGE_MAP_PATH) {
+            throw new IntegrationConfigError(
+              "set only one of HUBSPOT_STAGE_MAP_JSON or HUBSPOT_STAGE_MAP_PATH",
+            );
+          }
+          return { source: "none", map: {} } satisfies ResolvedHubSpotStageMap;
+        })()
+      : resolveHubSpotStageMap(env);
+  const genericSlackChannel = env.SLACK_CHANNEL_ID;
+  const deploymentSlackChannel = env.SLACK_DEPLOYMENT_CHANNEL_ID;
+  return {
+    mode,
+    hubspotStageMapSource: stageMap.source,
+    hubspotStageMap: stageMap.map,
+    hubspotNotifyStageIds: csvEnv(env.HUBSPOT_NOTIFY_STAGE_IDS),
+    allowUnsignedWebhooks: env.ALLOW_UNSIGNED_WEBHOOKS === "1",
+    allowLocalWriteEndpoints: env.ALLOW_LOCAL_WRITE_ENDPOINTS === "1",
+    allowExpectedRedPaths: env.ALLOW_EXPECTED_RED_PATHS === "1",
+    trustProxy: env.TRUST_PROXY === "1",
+    deploymentHandoffChannelMode: !deploymentSlackChannel
+      ? "unset"
+      : deploymentSlackChannel === genericSlackChannel
+        ? "generic"
+        : "dedicated",
+    publicBaseUrl: env.PUBLIC_BASE_URL ?? null,
+  };
+}
+
 function stageChangeConfigFromEnv(
   mode: "dry-run" | "live",
   env: NodeJS.ProcessEnv,
   fetchImpl: FetchLike,
+  configBundle: IntegrationConfigBundle,
 ): HubSpotStageChangeConfig {
   const sink = integrationConfigFromEnv(mode, env, fetchImpl);
   return {
@@ -492,6 +712,7 @@ function stageChangeConfigFromEnv(
     hubspotPortalId: sink.hubspotPortalId,
     hubspotWebhookSecret: env.HUBSPOT_WEBHOOK_SECRET,
     hubspotNotifyStageIds: csvEnv(env.HUBSPOT_NOTIFY_STAGE_IDS),
+    hubspotStageMap: configBundle.hubspotStageMap,
     slackBotToken: sink.slackBotToken,
     slackChannelId: sink.slackChannelId,
     slackApiBase: sink.slackApiBase,
@@ -534,6 +755,10 @@ function invalidPublicBaseUrl(value: string | undefined): boolean {
   }
 }
 
+function validSlackChannelId(value: string): boolean {
+  return /^[CGD][A-Z0-9]{8,}$/.test(value);
+}
+
 function invalidLiveEnv(
   cfg: IntegrationSinkConfig,
   env: NodeJS.ProcessEnv,
@@ -550,8 +775,14 @@ function invalidLiveEnv(
   ) {
     invalid.push("HUBSPOT_NOTIFY_STAGE_IDS (must list at least one stage id)");
   }
-  if (!/^[CGD][A-Z0-9]{8,}$/.test(cfg.slackChannelId)) {
+  if (!validSlackChannelId(cfg.slackChannelId)) {
     invalid.push("SLACK_CHANNEL_ID");
+  }
+  if (
+    env.SLACK_DEPLOYMENT_CHANNEL_ID !== undefined &&
+    !validSlackChannelId(cfg.deploymentSlackChannelId ?? "")
+  ) {
+    invalid.push("SLACK_DEPLOYMENT_CHANNEL_ID");
   }
   return invalid;
 }
@@ -1298,6 +1529,275 @@ export class HubSpotStageChangeHandler {
   }
 }
 
+export class DeploymentReadinessSlackNotifier implements ReadinessNotificationHandler {
+  constructor(private readonly cfg: DeploymentReadinessNotificationConfig) {}
+
+  get eventMode(): "dry_run" | "live" {
+    return this.cfg.mode === "dry-run" ? "dry_run" : "live";
+  }
+
+  async notify(claim: ReadinessNotificationClaim): Promise<SinkReceipt[]> {
+    const payload = slackDeploymentReadinessPayload(
+      claim,
+      this.cfg.deploymentSlackChannelId,
+    );
+    try {
+      return [
+        await withRetry(
+          () => this.postSlack(payload, claim),
+          this.cfg.slackRetry ?? DEFAULT_RETRY,
+        ),
+      ];
+    } catch (err) {
+      return [
+        {
+          system: "slack",
+          externalId: this.cfg.deploymentSlackChannelId,
+          detail: `deployment readiness notification failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          status: "warning",
+        },
+      ];
+    }
+  }
+
+  private async postSlack(
+    payload: { channel: string; text: string },
+    claim: ReadinessNotificationClaim,
+  ): Promise<SinkReceipt> {
+    if (this.cfg.mode === "dry-run") {
+      return {
+        system: "slack",
+        externalId: this.cfg.deploymentSlackChannelId,
+        detail: `would post redacted deployment readiness handoff for ${claim.dealId}`,
+      };
+    }
+
+    const token = this.cfg.slackBotToken;
+    if (!token) throw new TerminalSinkError("SLACK_BOT_TOKEN is missing");
+    let res: Response;
+    try {
+      res = await this.cfg.fetchImpl(
+        `${this.cfg.slackApiBase}/api/chat.postMessage`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+    } catch (err) {
+      throw new RetryableSinkError(
+        `slack network error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const body = await parseBody(res);
+    if (!res.ok) throw httpFailure("slack", res, body);
+    if (!isRecord(body)) {
+      throw new TerminalSinkError("slack response was not an object");
+    }
+    const parsed = body as SlackPostResponse;
+    if (parsed.ok !== true) {
+      const code = resultId(parsed.error, "unknown_error");
+      const msg = `slack API error: ${code}`;
+      if (isRetryableSlackError(code)) throw new RetryableSinkError(msg);
+      throw new TerminalSinkError(msg);
+    }
+    return {
+      system: "slack",
+      externalId: resultId(parsed.ts, this.cfg.deploymentSlackChannelId),
+      detail: `posted deployment readiness handoff to ${resultId(
+        parsed.channel,
+        this.cfg.deploymentSlackChannelId,
+      )}`,
+    };
+  }
+}
+
+export class DeploymentFallbackSlackNotifier implements FallbackNotificationHandler {
+  constructor(private readonly cfg: DeploymentReadinessNotificationConfig) {}
+
+  get eventMode(): "dry_run" | "live" {
+    return this.cfg.mode === "dry-run" ? "dry_run" : "live";
+  }
+
+  async notify(claim: ReadinessFallbackNotificationClaim): Promise<SinkReceipt[]> {
+    const payload = slackDeploymentHandoffFailedPayload(
+      claim,
+      this.cfg.slackChannelId,
+    );
+    try {
+      return [
+        await withRetry(
+          () => this.postSlack(payload, claim),
+          this.cfg.slackRetry ?? DEFAULT_RETRY,
+        ),
+      ];
+    } catch (err) {
+      return [
+        {
+          system: "slack",
+          externalId: this.cfg.slackChannelId,
+          detail: `deployment handoff fallback notification failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          status: "warning",
+        },
+      ];
+    }
+  }
+
+  private async postSlack(
+    payload: { channel: string; text: string },
+    claim: ReadinessFallbackNotificationClaim,
+  ): Promise<SinkReceipt> {
+    if (this.cfg.mode === "dry-run") {
+      return {
+        system: "slack",
+        externalId: this.cfg.slackChannelId,
+        detail: `would post deployment_handoff_failed alert for ${claim.dealId}`,
+      };
+    }
+
+    const token = this.cfg.slackBotToken;
+    if (!token) throw new TerminalSinkError("SLACK_BOT_TOKEN is missing");
+    let res: Response;
+    try {
+      res = await this.cfg.fetchImpl(
+        `${this.cfg.slackApiBase}/api/chat.postMessage`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+    } catch (err) {
+      throw new RetryableSinkError(
+        `slack network error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const body = await parseBody(res);
+    if (!res.ok) throw httpFailure("slack", res, body);
+    if (!isRecord(body)) {
+      throw new TerminalSinkError("slack response was not an object");
+    }
+    const parsed = body as SlackPostResponse;
+    if (parsed.ok !== true) {
+      const code = resultId(parsed.error, "unknown_error");
+      const msg = `slack API error: ${code}`;
+      if (isRetryableSlackError(code)) throw new RetryableSinkError(msg);
+      throw new TerminalSinkError(msg);
+    }
+    return {
+      system: "slack",
+      externalId: resultId(parsed.ts, this.cfg.slackChannelId),
+      detail: `posted deployment_handoff_failed to ${resultId(
+        parsed.channel,
+        this.cfg.slackChannelId,
+      )}`,
+    };
+  }
+}
+
+export class CommercialTerminalDriftSlackNotifier
+  implements TerminalDriftNotificationHandler
+{
+  constructor(private readonly cfg: DeploymentReadinessNotificationConfig) {}
+
+  get eventMode(): "dry_run" | "live" {
+    return this.cfg.mode === "dry-run" ? "dry_run" : "live";
+  }
+
+  async notify(claim: CommercialTerminalDriftAlertClaim): Promise<SinkReceipt[]> {
+    const payload = slackCommercialTerminalDriftPayload(
+      claim,
+      this.cfg.slackChannelId,
+    );
+    try {
+      return [
+        await withRetry(
+          () => this.postSlack(payload, claim),
+          this.cfg.slackRetry ?? DEFAULT_RETRY,
+        ),
+      ];
+    } catch (err) {
+      return [
+        {
+          system: "slack",
+          externalId: this.cfg.slackChannelId,
+          detail: `commercial terminal drift alert failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          status: "warning",
+        },
+      ];
+    }
+  }
+
+  private async postSlack(
+    payload: { channel: string; text: string },
+    claim: CommercialTerminalDriftAlertClaim,
+  ): Promise<SinkReceipt> {
+    if (this.cfg.mode === "dry-run") {
+      return {
+        system: "slack",
+        externalId: this.cfg.slackChannelId,
+        detail: `would post commercial_terminal_drift alert for ${claim.dealId}`,
+      };
+    }
+
+    const token = this.cfg.slackBotToken;
+    if (!token) throw new TerminalSinkError("SLACK_BOT_TOKEN is missing");
+    let res: Response;
+    try {
+      res = await this.cfg.fetchImpl(
+        `${this.cfg.slackApiBase}/api/chat.postMessage`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+    } catch (err) {
+      throw new RetryableSinkError(
+        `slack network error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const body = await parseBody(res);
+    if (!res.ok) throw httpFailure("slack", res, body);
+    if (!isRecord(body)) {
+      throw new TerminalSinkError("slack response was not an object");
+    }
+    const parsed = body as SlackPostResponse;
+    if (parsed.ok !== true) {
+      const code = resultId(parsed.error, "unknown_error");
+      const msg = `slack API error: ${code}`;
+      if (isRetryableSlackError(code)) throw new RetryableSinkError(msg);
+      throw new TerminalSinkError(msg);
+    }
+    return {
+      system: "slack",
+      externalId: resultId(parsed.ts, this.cfg.slackChannelId),
+      detail: `posted commercial_terminal_drift to ${resultId(
+        parsed.channel,
+        this.cfg.slackChannelId,
+      )}`,
+    };
+  }
+}
+
 export class HubSpotSlackSink implements OpportunitySink {
   readonly name: string;
 
@@ -1461,25 +1961,76 @@ export function integrationOptionsFromEnv(
   if (mode === "off") {
     throw new Error("integrationOptionsFromEnv cannot build mode=off");
   }
+  const configBundle = integrationConfigBundleFromEnv(mode, env);
   const cfg = integrationConfigFromEnv(mode, env, fetchImpl);
-  const stageCfg = stageChangeConfigFromEnv(mode, env, fetchImpl);
+  const stageCfg = stageChangeConfigFromEnv(mode, env, fetchImpl, configBundle);
 
   if (mode === "live") {
     const missing = missingLiveEnv(cfg, env);
     if (missing.length > 0) {
       throw new Error(`missing live integration env: ${missing.join(", ")}`);
     }
+    if (configBundle.hubspotStageMapSource === "none") {
+      throw new Error(
+        "missing live integration env: HUBSPOT_STAGE_MAP_JSON or HUBSPOT_STAGE_MAP_PATH",
+      );
+    }
     const invalid = invalidLiveEnv(cfg, env);
+    const unmappedNotifyStages = configBundle.hubspotNotifyStageIds.filter(
+      (stageId) => !Object.hasOwn(configBundle.hubspotStageMap, stageId),
+    );
+    if (unmappedNotifyStages.length > 0) {
+      invalid.push(
+        `HUBSPOT_NOTIFY_STAGE_IDS (unmapped: ${unmappedNotifyStages.join(", ")})`,
+      );
+    }
+    if (configBundle.allowUnsignedWebhooks) {
+      invalid.push("ALLOW_UNSIGNED_WEBHOOKS (not allowed in live mode)");
+    }
+    if (configBundle.allowLocalWriteEndpoints) {
+      invalid.push("ALLOW_LOCAL_WRITE_ENDPOINTS (not allowed in live mode)");
+    }
+    if (configBundle.allowExpectedRedPaths) {
+      invalid.push("ALLOW_EXPECTED_RED_PATHS (not allowed in live mode)");
+    }
     if (invalid.length > 0) {
       throw new Error(`invalid live integration env: ${invalid.join(", ")}`);
     }
   }
 
   const sink = new HubSpotSlackSink(cfg);
+  const readinessNotifications = new DeploymentReadinessSlackNotifier({
+    mode,
+    slackBotToken: cfg.slackBotToken,
+    slackChannelId: cfg.slackChannelId,
+    deploymentSlackChannelId: cfg.deploymentSlackChannelId ?? cfg.slackChannelId,
+    slackApiBase: cfg.slackApiBase,
+    fetchImpl: cfg.fetchImpl,
+  });
+  const fallbackNotifications = new DeploymentFallbackSlackNotifier({
+    mode,
+    slackBotToken: cfg.slackBotToken,
+    slackChannelId: cfg.slackChannelId,
+    deploymentSlackChannelId: cfg.deploymentSlackChannelId ?? cfg.slackChannelId,
+    slackApiBase: cfg.slackApiBase,
+    fetchImpl: cfg.fetchImpl,
+  });
+  const terminalDriftNotifications = new CommercialTerminalDriftSlackNotifier({
+    mode,
+    slackBotToken: cfg.slackBotToken,
+    slackChannelId: cfg.slackChannelId,
+    deploymentSlackChannelId: cfg.deploymentSlackChannelId ?? cfg.slackChannelId,
+    slackApiBase: cfg.slackApiBase,
+    fetchImpl: cfg.fetchImpl,
+  });
   return {
     dryRun: mode === "dry-run",
     sink,
     label: sink.name,
     stageChanges: new HubSpotStageChangeHandler(stageCfg),
+    readinessNotifications,
+    fallbackNotifications,
+    terminalDriftNotifications,
+    configBundle,
   };
 }
