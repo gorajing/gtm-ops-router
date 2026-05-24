@@ -379,6 +379,11 @@ function consoleHtml(sinkLabel: string): string {
  .empty{border:1px dashed var(--line);border-radius:5px;padding:14px;color:var(--muted);background:#fff}
  .mini-form{display:grid;gap:8px;margin-bottom:10px}.inline-actions{display:flex;gap:6px;flex-wrap:wrap}.inline-actions button{padding:5px 8px;font-size:12px}
  .action-status{font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);min-height:18px}
+ dialog{border:1px solid var(--line);border-radius:8px;padding:0;max-width:460px;width:calc(100% - 32px);color:var(--ink);box-shadow:0 14px 44px rgba(20,24,32,.24)}
+ dialog::backdrop{background:rgba(20,24,32,.42)}
+ .dialog-body{display:grid;gap:10px;padding:16px}
+ .dialog-body h3{margin:0;font-size:15px}
+ .dialog-detail{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);overflow-wrap:anywhere}
  .queue-wrap{max-height:560px;overflow:auto}.exceptions,.handoff-wrap{max-height:260px;overflow:auto}
  .footer{color:var(--muted);font-size:12px;margin-top:12px}
  @media(max-width:1180px){.layout,.top{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -463,6 +468,19 @@ function consoleHtml(sinkLabel: string): string {
  </section>
 </div>
 <div class="footer">State is loaded from SQLite. Integration health is loaded from the same doctor used by the CLI.</div>
+<dialog id="decision-dialog">
+ <form method="dialog" class="dialog-body">
+  <h3 id="decision-dialog-title">Decide suggestion</h3>
+  <div class="dialog-detail" id="decision-dialog-detail"></div>
+  <div class="dialog-detail" id="decision-dialog-meta"></div>
+  <div class="dialog-detail" id="decision-dialog-rationale"></div>
+  <label>Decision reason<textarea id="decision-dialog-reason" rows="3"></textarea></label>
+  <div class="inline-actions">
+   <button type="submit" value="confirm" id="decision-dialog-confirm">Confirm</button>
+   <button type="submit" value="cancel" class="secondary">Cancel</button>
+  </div>
+ </form>
+</dialog>
 </div>
 <script>
 const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -940,18 +958,63 @@ async function draftPolicyRecommendations(){
     button.disabled = false;
   }
 }
-async function decideSuggestion(suggestion, decision){
-  if (pendingSuggestionDecisions.has(suggestion.id)) return;
-  const defaultReason = decision === "accepted"
+function defaultDecisionReason(decision){
+  return decision === "accepted"
     ? "Accepted from operator console."
     : "Rejected from operator console.";
-  const reasonInput = window.prompt("Decision reason", defaultReason);
-  if (reasonInput === null) return;
-  const reason = reasonInput.trim() || defaultReason;
+}
+function openDecisionDialog(suggestion, decision){
+  // Resolves with the reason string on confirm, or null if the operator
+  // cancels (Cancel button, ESC, or backdrop). Replaces a blocking
+  // window.prompt with an in-page modal; the decision contract is unchanged.
+  return new Promise((resolve) => {
+    const defaultReason = defaultDecisionReason(decision);
+    const dialog = qs("#decision-dialog");
+    if (!dialog || typeof dialog.showModal !== "function") {
+      // Defensive fallback for environments without <dialog> support so a
+      // decision is never silently dropped.
+      const fallback = window.prompt("Decision reason", defaultReason);
+      resolve(fallback === null ? null : (fallback.trim() || defaultReason));
+      return;
+    }
+    if (dialog.open) {
+      // A decision modal is already open: never stack showModal() (it throws
+      // InvalidStateError) or attach a second close listener.
+      resolve(null);
+      return;
+    }
+    const verb = decision === "accepted" ? "Accept" : "Reject";
+    qs("#decision-dialog-title").textContent = verb + " suggestion";
+    qs("#decision-dialog-detail").textContent = suggestion.title || "(untitled suggestion)";
+    qs("#decision-dialog-meta").textContent =
+      (suggestionKindLabels[suggestion.kind] || suggestion.kind) + " | Deal " + suggestion.dealId;
+    qs("#decision-dialog-rationale").textContent = suggestion.rationale || "(no rationale provided)";
+    const reasonField = qs("#decision-dialog-reason");
+    reasonField.value = defaultReason;
+    qs("#decision-dialog-confirm").textContent = verb;
+    function onClose(){
+      dialog.removeEventListener("close", onClose);
+      resolve(dialog.returnValue === "confirm" ? (reasonField.value.trim() || defaultReason) : null);
+    }
+    dialog.addEventListener("close", onClose);
+    dialog.returnValue = "";
+    dialog.showModal();
+    reasonField.focus();
+    reasonField.select();
+  });
+}
+async function decideSuggestion(suggestion, decision){
+  if (pendingSuggestionDecisions.has(suggestion.id)) return;
+  // Lock BEFORE opening the async dialog. The old window.prompt was blocking,
+  // so it could not be re-entered; <dialog> is async, so without an early lock
+  // a rapid second click would re-open the modal and leak a close listener.
+  // The lock is released in finally on cancel, success, or any error.
   pendingSuggestionDecisions.add(suggestion.id);
-  renderAgentSuggestions();
-  setAgentActionStatus(decision + " " + suggestion.id + "...", "muted");
   try {
+    renderAgentSuggestions();
+    const reason = await openDecisionDialog(suggestion, decision);
+    if (reason === null) return; // operator cancelled; finally releases the lock
+    setAgentActionStatus(decision + " " + suggestion.id + "...", "muted");
     const result = await fetchJson("/agent-suggestions/" + encodeURIComponent(suggestion.id) + "/decision", {
       method: "POST",
       headers: localWriteHeaders(),
