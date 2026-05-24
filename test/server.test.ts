@@ -1,4 +1,5 @@
 import type { AddressInfo } from "node:net";
+import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_FUTURE_SKEW_MS } from "../src/constants.js";
 import type { Enricher } from "../src/enrich.js";
@@ -41,6 +42,140 @@ const enricher: Enricher = {
 };
 
 const open: Array<{ close(): Promise<void>; store: Store }> = [];
+
+type FakeConsoleChild = FakeConsoleElement | string;
+type FakeConsoleEvent = {
+  type: string;
+  target: FakeConsoleElement;
+  preventDefault(): void;
+  stopPropagation(): void;
+};
+type FakeConsoleEventHandler = (event: FakeConsoleEvent) => void;
+
+class FakeConsoleElement {
+  id = "";
+  className = "";
+  value = "";
+  disabled = false;
+  type = "";
+  href = "";
+  target = "";
+  rel = "";
+  returnValue = "";
+  open = false;
+  focused = false;
+  selected = false;
+  readonly tagName: string;
+  readonly children: FakeConsoleChild[] = [];
+  private readonly listeners = new Map<string, Set<FakeConsoleEventHandler>>();
+  private ownText = "";
+
+  constructor(tagName: string) {
+    this.tagName = tagName.toUpperCase();
+  }
+
+  get textContent(): string {
+    return [
+      this.ownText,
+      ...this.children.map((child) =>
+        typeof child === "string" ? child : child.textContent,
+      ),
+    ].join("");
+  }
+
+  set textContent(value: string) {
+    this.children.splice(0, this.children.length);
+    this.ownText = value;
+  }
+
+  append(...nodes: FakeConsoleChild[]): void {
+    this.children.push(...nodes);
+  }
+
+  replaceChildren(...nodes: FakeConsoleChild[]): void {
+    this.children.splice(0, this.children.length, ...nodes);
+    this.ownText = "";
+  }
+
+  addEventListener(event: string, handler: FakeConsoleEventHandler): void {
+    const handlers = this.listeners.get(event) ?? new Set();
+    handlers.add(handler);
+    this.listeners.set(event, handlers);
+  }
+
+  removeEventListener(event: string, handler: FakeConsoleEventHandler): void {
+    this.listeners.get(event)?.delete(handler);
+  }
+
+  dispatch(event: string): void {
+    const payload: FakeConsoleEvent = {
+      type: event,
+      target: this,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    };
+    for (const handler of [...(this.listeners.get(event) ?? [])]) handler(payload);
+  }
+
+  focus(): void {
+    this.focused = true;
+  }
+
+  select(): void {
+    this.selected = true;
+  }
+
+  showModal(): void {
+    if (this.open) throw new Error("InvalidStateError: dialog is already open");
+    this.open = true;
+  }
+
+  close(returnValue = ""): void {
+    if (!this.open) return;
+    this.returnValue = returnValue;
+    this.open = false;
+    this.dispatch("close");
+  }
+
+  get innerText(): string {
+    return [
+      this.ownText,
+      ...this.children.map((child) =>
+        typeof child === "string" ? child : child.innerText,
+      ),
+    ]
+      .filter((text) => text.length > 0)
+      .join("\n");
+  }
+}
+
+class FakeConsoleDocument {
+  private readonly elements = new Map<string, FakeConsoleElement>();
+
+  constructor(elements: Record<string, string>) {
+    for (const [id, tagName] of Object.entries(elements)) {
+      const element = new FakeConsoleElement(tagName);
+      element.id = id;
+      this.elements.set(id, element);
+    }
+  }
+
+  querySelector(selector: string): FakeConsoleElement | null {
+    if (!selector.startsWith("#")) {
+      throw new Error(`FakeConsoleDocument only supports id selectors: ${selector}`);
+    }
+    const id = selector.slice(1);
+    return this.elements.get(id) ?? null;
+  }
+
+  createElement(tagName: string): FakeConsoleElement {
+    return new FakeConsoleElement(tagName);
+  }
+
+  text(id: string): string {
+    return this.elements.get(id)?.innerText ?? "";
+  }
+}
 
 async function withEnv<T>(
   env: Partial<Record<(typeof ISOLATED_ENV_KEYS)[number], string>>,
@@ -1677,8 +1812,423 @@ describe("server dashboard", () => {
 
     const state = (await fetch(`${baseUrl}/state`).then((r) =>
       r.json(),
-    )) as { queue: Array<{ status: string }> };
+    )) as {
+      queue: Array<{ status: string }>;
+      exceptions: unknown[];
+      metrics: { partialSyncs: number };
+    };
     expect(state.queue[0]?.status).toBe("partial");
+    expect(state.exceptions).toEqual([]);
+    expect(state.metrics.partialSyncs).toBe(1);
+  });
+
+  it("renders the embedded dashboard script against a representative state payload", async () => {
+    const { baseUrl } = await app();
+    const dashboard = await fetch(`${baseUrl}/`).then((r) => r.text());
+    const dashboardScripts = [
+      ...dashboard.matchAll(
+        /<script\b[^>]*>([\s\S]*?)<\/script>/g,
+      ),
+    ]
+      .map((match) => match[1] ?? "")
+      .filter(
+        (candidate) =>
+          candidate.includes("void pollState();") &&
+          candidate.includes("void pollHealth();"),
+      );
+    expect(dashboardScripts).toHaveLength(1);
+    const script = dashboardScripts[0];
+    if (!script?.trim()) throw new Error("dashboard script is missing");
+
+    const document = new FakeConsoleDocument({
+      "agent-action-status": "div",
+      "agent-suggestions": "div",
+      "deal-form": "form",
+      "decision-dialog": "dialog",
+      "decision-dialog-body": "div",
+      "decision-dialog-confirm": "button",
+      "decision-dialog-detail": "div",
+      "decision-dialog-meta": "div",
+      "decision-dialog-rationale": "div",
+      "decision-dialog-reason": "textarea",
+      "decision-dialog-title": "h2",
+      "deployment-handoff": "div",
+      detail: "div",
+      "draft-policy-btn": "button",
+      exceptions: "div",
+      health: "div",
+      kpis: "div",
+      "last-refresh": "span",
+      "local-secret": "input",
+      "policy-evaluation": "div",
+      "policy-runs": "div",
+      preview: "pre",
+      "preview-btn": "button",
+      queue: "div",
+      "refresh-btn": "button",
+      "role-queues": "div",
+      "submit-btn": "button",
+    });
+    type DashboardStateBase = {
+      metrics: Record<string, unknown>;
+      roleQueues: Record<string, unknown>;
+      policyEvaluation: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    const baseState = (await fetch(`${baseUrl}/state`).then((r) =>
+      r.json(),
+    )) as DashboardStateBase;
+    const representativeState = {
+      ...baseState,
+      sinkLabel: "test",
+      integrity: { ok: true, detail: "ok" },
+      metrics: {
+        ...baseState.metrics,
+        routedArrUsd: 60000,
+        humanRoutedArrUsd: 60000,
+        routed: 1,
+        conversionPct: 100,
+        quarantined: 1,
+        quarantineRatePct: 50,
+        flags: { pricing_approval: 1, regulated_review: 1 },
+        autoHandled: 0,
+        partialSyncs: 0,
+        externallySyncedStoreErrors: 0,
+        stageNotificationAuditGaps: 0,
+        deploymentReadiness: {
+          not_required: 0,
+          pending: 1,
+          ready: 0,
+          blocked: 0,
+        },
+        readinessPendingOverSla: 0,
+        readinessFactsStaleProjected: 0,
+        readinessFactsStaleIgnored: 0,
+        deployedDeals: 0,
+        landedDeals: 0,
+        expandedArrDeltaUsd: 0,
+        expandedDeals: 0,
+        medianTimeClosedWonToDeployedHours: null,
+        medianTimeDeployedToLandedHours: null,
+        outcomeInvalidHistories: 0,
+        outcomeCommercialStateConflicts: 0,
+        outcomeChurnBeforeDeploy: 0,
+        latencyMsP95: 12,
+      },
+      queue: [
+        {
+          id: "D-console",
+          status: "dry_run",
+          company: "Console Co",
+          amount: 60000,
+          route: "human_assisted",
+          reason: "owner ae.morgan",
+          externalStage: {
+            externalId: "777",
+            stageId: "contact_made",
+            stageLabel: "Contact Made",
+            updatedAt: "2026-05-24T15:00:00.000Z",
+          },
+          scoreTotal: 0.9,
+          sourceChannel: "inbound_form",
+          statedNeed: "manual exception follow-up",
+          scoreNotes: ["ICP fit +1"],
+        },
+      ],
+      roleQueues: {
+        ...baseState.roleQueues,
+        ae_attention: [
+          {
+            queue: "ae_attention",
+            priority: "high",
+            dealId: "D-console",
+            company: "Console Co",
+            amount: 60000,
+            salesOwner: "ae.morgan",
+            status: "open",
+            reason: "needs follow-up",
+          },
+        ],
+        finance_review: [],
+        legal_review: [],
+        deployment_readiness: [],
+        growth_attribution: [],
+      },
+      roleQueueLimit: 50,
+      policyEvaluation: {
+        ...baseState.policyEvaluation,
+        candidateRouted: 1,
+        candidateLimit: 1,
+        signalBackfillRouted: 0,
+        signalBackfillLimitPerSignal: 0,
+        selfServeExpanded: [],
+        humanAssistedRisk: [
+          {
+            dealId: "D-console",
+            company: "Console Co",
+            amount: 60000,
+            routeKind: "human_assisted",
+            sourceChannel: "inbound_form",
+            salesOwner: "ae.morgan",
+            signal: "human_assisted_stalled",
+            signalObservedAt: "2026-05-24T15:00:00.000Z",
+            reason: "closed won but deployment has not started",
+            lastOutcomeAt: null,
+            arrDeltaUsd: null,
+          },
+        ],
+        sourceChannels: [
+          {
+            sourceChannel: "inbound_form",
+            routed: 1,
+            closedWon: 1,
+            deploymentStarted: 0,
+            deployed: 0,
+            landed: 0,
+            expanded: 0,
+            churned: 0,
+            expandedArrDeltaUsd: 0,
+          },
+        ],
+        flags: [
+          {
+            flag: "pricing_approval",
+            routed: 1,
+            closedWon: 1,
+            deploymentStarted: 0,
+            deployed: 0,
+            landed: 0,
+            expanded: 0,
+            churned: 0,
+            expandedArrDeltaUsd: 0,
+          },
+        ],
+      },
+      policyRecommendationRuns: [
+        {
+          id: "PRR-console",
+          status: "recorded",
+          createdBy: "policy-agent",
+          evaluatedAt: "2026-05-24T15:00:00.000Z",
+          limit: 5,
+          createdAt: "2026-05-24T15:01:00.000Z",
+          attempted: 1,
+          recorded: 1,
+          duplicate: 0,
+          idempotencyConflict: 0,
+          skipped: 0,
+          statusCounts: {
+            recorded: 1,
+            duplicate: 0,
+            idempotency_conflict: 0,
+            not_found: 0,
+            not_routed: 0,
+          },
+          results: [
+            {
+              dealId: "D-console",
+              signal: "human_assisted_stalled",
+              sourceEventId: "11111111-1111-4111-8111-111111111111",
+              status: "recorded",
+              suggestionId: "S-console",
+              title: "Unblock stalled deployment: Console Co",
+            },
+          ],
+        },
+      ],
+      agentSuggestions: [
+        {
+          id: "S-console",
+          dealId: "D-console",
+          kind: "policy_change_recommendation",
+          status: "proposed",
+          title: "Unblock stalled deployment: Console Co",
+          body: "Ask deployment to confirm owner and next milestone.",
+          rationale: "Closed won without deployment start.",
+          source: "local_agent",
+          sourceEventId: "11111111-1111-4111-8111-111111111111",
+          sourcePayloadHash: "hash",
+          createdBy: "policy-agent",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          createdAt: "2026-05-24T15:01:00.000Z",
+          decidedAt: null,
+          decidedBy: null,
+          decisionSourceEventId: null,
+          decisionPayloadHash: null,
+          decisionReason: null,
+        },
+      ],
+      exceptions: [
+        {
+          code: "schema_invalid",
+          dealId: "D-bad",
+          reason: "bad email",
+        },
+      ],
+      deploymentReadiness: [
+        {
+          dealId: "D-console",
+          readiness: "pending",
+          blockerCode: "deployment_use_case_unclear",
+          secondaryBlockerCodes: [],
+          factsStatus: "missing",
+          reason: "awaiting deployment facts",
+          updatedAt: "2026-05-24T15:02:00.000Z",
+        },
+      ],
+    };
+    const jsonResponse = (body: unknown): Response =>
+      new Response(JSON.stringify(body), {
+        headers: { "content-type": "application/json" },
+      });
+    const pendingFetches = new Set<Promise<unknown>>();
+    const expectedFetchUrls = new Set([
+      "/state",
+      "/integration-health",
+      "/deals/D-console/events",
+    ]);
+    let activeFetches = 0;
+    const fetchImpl = async (
+      input: unknown,
+      init?: unknown,
+    ): Promise<Response> => {
+      const fetchPromise = Promise.resolve().then(() => {
+        const method =
+          init && typeof init === "object" && "method" in init
+            ? String((init as { method?: unknown }).method ?? "GET")
+            : "GET";
+        if (method.toUpperCase() !== "GET") {
+          throw new Error(
+            `unexpected dashboard fetch init: ${JSON.stringify(init)}`,
+          );
+        }
+        const url = String(input);
+        expectedFetchUrls.delete(url);
+        if (url === "/state") return jsonResponse(representativeState);
+        if (url === "/integration-health") {
+          return jsonResponse([
+            {
+              system: "env",
+              name: "integration mode",
+              status: "warn",
+              detail: "test sink",
+            },
+          ]);
+        }
+        if (url === "/deals/D-console/events") {
+          return jsonResponse({
+            total: 1,
+            truncated: false,
+            events: [
+              {
+                from: "intake",
+                to: "routed",
+                detail: "agent_suggestion_proposed",
+                ts: "2026-05-24T15:01:00.000Z",
+                meta: { kind: "agent_suggestion_proposed" },
+              },
+            ],
+          });
+        }
+        throw new Error(`unexpected dashboard fetch url: ${url}`);
+      });
+      activeFetches += 1;
+      pendingFetches.add(fetchPromise);
+      void fetchPromise.finally(() => {
+        activeFetches -= 1;
+        pendingFetches.delete(fetchPromise);
+      });
+      return fetchPromise;
+    };
+    const waitForExpectedDashboardFetches = async (): Promise<void> => {
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        await Promise.allSettled([...pendingFetches]);
+        await Promise.resolve();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (!expectedFetchUrls.size && !activeFetches && !pendingFetches.size) return;
+      }
+      throw new Error(
+        `dashboard fetches did not settle: expected=${[
+          ...expectedFetchUrls,
+        ].join(",")} active=${activeFetches} pending=${pendingFetches.size}`,
+      );
+    };
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    const scheduledTimeoutDelays: Array<number | undefined> = [];
+    const sessionStorageValues = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => sessionStorageValues.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        sessionStorageValues.set(key, String(value));
+      },
+    };
+    let formDataConstructed = 0;
+    let promptCalls = 0;
+
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      runInNewContext(script, {
+        console,
+        document,
+        encodeURIComponent,
+        fetch: fetchImpl,
+        FormData: class FormData {
+          constructor() {
+            formDataConstructed += 1;
+          }
+
+          get(): never {
+            throw new Error("dashboard submit path is not covered by this smoke test");
+          }
+        },
+        Intl,
+        localStorage: storage,
+        sessionStorage: storage,
+        setTimeout: (_handler: unknown, delay?: number) => {
+          scheduledTimeoutDelays.push(delay);
+          return scheduledTimeoutDelays.length;
+        },
+        clearTimeout: () => {},
+        window: {
+          prompt: () => {
+            promptCalls += 1;
+            return null;
+          },
+        },
+      });
+      await waitForExpectedDashboardFetches();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+
+    expect(unhandledRejections).toEqual([]);
+    expect(scheduledTimeoutDelays.length).toBeGreaterThanOrEqual(2);
+    expect(
+      scheduledTimeoutDelays.every(
+        (delay) => typeof delay === "number" && delay > 0,
+      ),
+    ).toBe(true);
+    expect(formDataConstructed).toBe(0);
+    expect(promptCalls).toBe(0);
+    expect(document.text("queue")).toContain("Console Co");
+    expect(document.text("kpis")).toContain("$60,000");
+    expect(document.text("kpis")).toContain("50% loud failure");
+    expect(document.text("exceptions")).toContain("schema_invalid");
+    expect(document.text("policy-runs")).toContain("PRR-console");
+    expect(document.text("policy-runs")).toContain(
+      "Showing latest 1 policy runs.",
+    );
+    expect(document.text("agent-suggestions")).toContain(
+      "Unblock stalled deployment",
+    );
+    expect(document.text("deployment-handoff")).toContain("Use case unclear");
+    expect(document.text("detail")).toContain("Deal Journey");
+    expect(document.text("detail")).toContain("agent_suggestion_proposed");
+    expect(document.text("health")).toContain("integration mode: test sink");
   });
 
   it("exposes deployment readiness rows and counters in state and metrics", async () => {
