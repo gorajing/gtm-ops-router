@@ -1,7 +1,14 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import {
+  applyDemoOutcomeFixtures,
+  demoCommercialStateSourceEventIds,
+  demoOutcomeFixtureDealIds,
+  demoOutcomeSourceEventIds,
+} from "../src/demo-fixtures.js";
 import { FixtureEnricher, type FixtureEntry } from "../src/enrich.js";
+import { normalize } from "../src/intake.js";
 import { processBatch, processOne } from "../src/pipeline.js";
 import { FlakySink, type OpportunitySink } from "../src/sink.js";
 import { Store } from "../src/store.js";
@@ -193,6 +200,19 @@ describe("pipeline — idempotency (data accuracy by construction)", () => {
 });
 
 describe("pipeline — deterministic corpus metrics (the demo, asserted)", () => {
+  it("keeps demo outcome fixture ids aligned to the seed records", () => {
+    const idsByCompany = new Map<string, string>();
+    for (const raw of seed()) {
+      const normalized = normalize(raw);
+      if (normalized.ok) {
+        idsByCompany.set(normalized.deal.company, normalized.deal.id);
+      }
+    }
+
+    expect(idsByCompany.get("Ryder Digital")).toBe("D-fb65c15017ef");
+    expect(idsByCompany.get("Cargo Loop")).toBe("D-cdea8ac45022");
+  });
+
   it("the seed corpus produces exactly the documented numbers", async () => {
     const store = new Store(":memory:");
     const outcomes = await processBatch(seed(), store, new FixtureEnricher(fixture()));
@@ -248,6 +268,223 @@ describe("pipeline — deterministic corpus metrics (the demo, asserted)", () =>
       (o) => o.ok && o.deal.company === "Off Target Media",
     );
     expect(offTarget?.ok && offTarget.deal.route.kind).toBe("nurture");
+
+    store.close();
+  });
+
+  it("can layer deterministic post-sale outcome fixtures onto the demo corpus", async () => {
+    const store = new Store(":memory:");
+    await processBatch(seed(), store, new FixtureEnricher(fixture()));
+
+    const first = applyDemoOutcomeFixtures(store, store.routed());
+    const second = applyDemoOutcomeFixtures(store, store.routed());
+    const m = store.metrics();
+
+    expect(first).toEqual(expect.objectContaining({
+      fixturesResolved: 2,
+      commercialRecorded: 2,
+      commercialDuplicate: 0,
+      commercialClosedWonNoop: 0,
+      acceptedOutcomes: 6,
+      duplicateOutcomes: 0,
+      resolvedCompanies: ["Ryder Digital", "Cargo Loop"],
+      appliedCompanies: ["Ryder Digital", "Cargo Loop"],
+      missingCompanies: [],
+      errors: [],
+    }));
+    expect(second).toEqual(expect.objectContaining({
+      fixturesResolved: 2,
+      commercialRecorded: 0,
+      commercialDuplicate: 2,
+      commercialClosedWonNoop: 0,
+      acceptedOutcomes: 0,
+      duplicateOutcomes: 6,
+      resolvedCompanies: ["Ryder Digital", "Cargo Loop"],
+      appliedCompanies: ["Ryder Digital", "Cargo Loop"],
+      missingCompanies: [],
+      errors: [],
+    }));
+    expect(m.deploymentStartedDeals).toBe(2);
+    expect(m.deployedDeals).toBe(1);
+    expect(m.landedDeals).toBe(1);
+    expect(m.expandedDeals).toBe(1);
+    expect(m.expandedArrDeltaUsd).toBe(35_000);
+    expect(m.churnedDeals).toBe(1);
+    expect(m.outcomeChurnBeforeDeploy).toBe(1);
+    expect(m.outcomeCommercialStateConflicts).toBe(0);
+    expect(m.outcomeInvalidHistories).toBe(0);
+    expect(m.medianTimeClosedWonToDeployedHours).toBe(48);
+    expect(m.medianTimeDeployedToLandedHours).toBe(30);
+    expect(
+      store.nonDemoOutcomeEventCount(
+        demoOutcomeFixtureDealIds(),
+        demoOutcomeSourceEventIds(),
+      ),
+    ).toBe(0);
+    expect(
+      store.nonDemoProjectedCommercialStateEventCount(
+        demoOutcomeFixtureDealIds(),
+        demoCommercialStateSourceEventIds(),
+      ),
+    ).toBe(0);
+    expect(store.integrity().ok).toBe(true);
+
+    store.close();
+  });
+
+  it("treats demo commercial source-id conflicts as fixture errors", async () => {
+    const store = new Store(":memory:");
+    await processBatch(seed(), store, new FixtureEnricher(fixture()));
+    const ryder = store.routed().find((deal) => deal.company === "Ryder Digital");
+    const [ryderDemoCommercialSourceEventId] = demoCommercialStateSourceEventIds();
+    if (!ryder || !ryderDemoCommercialSourceEventId) {
+      throw new Error("expected Ryder Digital seed deal and fixture source id");
+    }
+
+    expect(
+      store.recordLocalCommercialState({
+        dealId: ryder.id,
+        commercialState: "closed_won",
+        sourceEventId: ryderDemoCommercialSourceEventId,
+        occurredAt: "2026-05-20T12:00:00.000Z",
+        reason: "conflicting replay payload",
+        expectedRedPath: false,
+      }).status,
+    ).toBe("recorded");
+
+    const result = applyDemoOutcomeFixtures(store, store.routed());
+
+    expect(result).toEqual(expect.objectContaining({
+      fixturesResolved: 2,
+      commercialRecorded: 1,
+      commercialDuplicate: 0,
+      commercialClosedWonNoop: 0,
+      acceptedOutcomes: 2,
+      appliedCompanies: ["Cargo Loop"],
+      errors: [
+        {
+          company: "Ryder Digital",
+          step: "commercial_state",
+          status: "idempotency_conflict",
+          sourceEventKey: "closed_won",
+          currentCommercialState: "closed_won",
+        },
+      ],
+    }));
+    expect(store.metrics().deploymentStartedDeals).toBe(1);
+
+    store.close();
+  });
+
+  it("scopes the non-demo outcome guard to fixture deals", async () => {
+    const store = new Store(":memory:");
+    await processBatch(seed(), store, new FixtureEnricher(fixture()));
+    const midwest = store.routed().find((deal) => deal.company === "Midwest 3PL");
+    if (!midwest) throw new Error("expected Midwest 3PL seed deal");
+
+    expect(
+      store.recordLocalCommercialState({
+        dealId: midwest.id,
+        commercialState: "closed_won",
+        sourceEventId: "66666666-6666-4666-8666-666666666666",
+        occurredAt: "2026-05-20T12:00:00.000Z",
+        reason: "real non-fixture closed_won",
+        expectedRedPath: false,
+      }).status,
+    ).toBe("recorded");
+    expect(
+      store.recordLocalOutcome({
+        dealId: midwest.id,
+        sourceEventId: "77777777-7777-4777-8777-777777777777",
+        outcome: "deployment_started",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        operator: "ops:user",
+        arrDeltaUsd: null,
+        reasonCategory: "customer_ready",
+      }).status,
+    ).toBe("recorded");
+
+    expect(store.outcomeEventCount()).toBe(1);
+    expect(
+      store.nonDemoOutcomeEventCount(
+        demoOutcomeFixtureDealIds(),
+        demoOutcomeSourceEventIds(),
+      ),
+    ).toBe(0);
+    expect(
+      store.nonDemoOutcomeEventCount([midwest.id], demoOutcomeSourceEventIds()),
+    ).toBe(1);
+
+    store.close();
+  });
+
+  it("keys demo outcome fixtures by router deal id, not company text", async () => {
+    const store = new Store(":memory:");
+    await processBatch(
+      [
+        validDeal,
+        {
+          ...validDeal,
+          contactEmail: "second@ryder-digital.com",
+          dealUSD: 121_000,
+          statedNeed: "second team needs autonomous after-hours dispatch calls",
+        },
+      ],
+      store,
+      new FixtureEnricher(fixture()),
+    );
+
+    const result = applyDemoOutcomeFixtures(store, store.routed());
+
+    expect(result).toEqual(expect.objectContaining({
+      fixturesResolved: 1,
+      commercialClosedWonNoop: 0,
+      acceptedOutcomes: 4,
+      resolvedCompanies: ["Ryder Digital"],
+      appliedCompanies: ["Ryder Digital"],
+      missingCompanies: ["Cargo Loop"],
+      errors: [],
+    }));
+    expect(store.metrics().deploymentStartedDeals).toBe(1);
+
+    store.close();
+  });
+
+  it("layers demo outcomes when a fixture deal is already closed_won", async () => {
+    const store = new Store(":memory:");
+    await processBatch(seed(), store, new FixtureEnricher(fixture()));
+    const ryder = store.routed().find((deal) => deal.company === "Ryder Digital");
+    if (!ryder) throw new Error("expected Ryder Digital seed deal");
+
+    expect(
+      store.recordLocalCommercialState({
+        dealId: ryder.id,
+        commercialState: "closed_won",
+        sourceEventId: "55555555-5555-4555-8555-555555555555",
+        occurredAt: "2026-05-20T12:00:00.000Z",
+        reason: "external closed_won already present",
+        expectedRedPath: false,
+      }).status,
+    ).toBe("recorded");
+    expect(
+      store.nonDemoProjectedCommercialStateEventCount(
+        demoOutcomeFixtureDealIds(),
+        demoCommercialStateSourceEventIds(),
+      ),
+    ).toBe(1);
+
+    const result = applyDemoOutcomeFixtures(store, store.routed());
+
+    expect(result).toEqual(expect.objectContaining({
+      fixturesResolved: 2,
+      commercialRecorded: 1,
+      commercialClosedWonNoop: 1,
+      acceptedOutcomes: 6,
+      appliedCompanies: ["Ryder Digital", "Cargo Loop"],
+      errors: [],
+    }));
+    expect(store.metrics().deploymentStartedDeals).toBe(2);
+    expect(store.metrics().medianTimeClosedWonToDeployedHours).toBeNull();
 
     store.close();
   });

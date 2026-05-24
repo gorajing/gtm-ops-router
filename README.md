@@ -34,14 +34,15 @@ universal; claiming honest about its floor.
 
 ```bash
 npm install
-npm run demo            # deterministic batch — no API keys, no ports (dry-run)
+npm run demo            # deterministic batch + post-sale outcomes — no API keys, no ports
+npm run demo -- --no-demo-outcomes # intake→route only, no in-memory outcome fixtures
 npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm run doctor          # live HubSpot/Slack setup check; no secrets printed
 npm test                # TypeScript suite, incl. every failure mode
 
 # Dashboard proof surface:
-npm run run -- data/inbound.seed.jsonl --integrations  # seed SQLite with HubSpot + Slack receipts
+npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes  # seed SQLite with receipts + post-sale outcomes
 npm run serve -- --integrations                       # open http://localhost:8787
 
 # Python side (stdlib only — the JD names Python explicitly):
@@ -50,10 +51,31 @@ python3 -m unittest test_ops_audit        # Python tests
 ```
 
 `npm run demo` prints the same proof in the terminal. The dashboard renders it
-as an operator view: KPIs, route mix, routed deals, quarantine ledger, and an
-event trail, all backed by the same SQLite store. Node prints one
+as an operator view: KPIs, route mix, routed deals, role-specific queues,
+policy evaluation, deployment readiness, quarantine ledger, and an event trail,
+all backed by the same SQLite store. Node prints one
 `ExperimentalWarning: SQLite ...` line — expected, the disclosed cost of zero
 native deps, not a defect.
+
+`--demo-outcomes` writes deterministic demo rows into the persistent
+`data/router.db`; outcome operators are prefixed with `demo:` and commercial
+state reasons include `demo outcome loop` so they are distinguishable from real
+local outcome writes. The command recognizes demo outcome and commercial-state
+rows by their deterministic fixture source-event ids and refuses to layer
+fixtures into a DB that already contains non-demo outcome rows or non-demo
+projected local commercial-state rows on the fixture deals. Fixture writes are
+idempotent and replay-safe, but not all-or-nothing across the whole demo
+overlay; rerunning reconciles any already-written demo rows and completes
+missing ones.
+
+Cycle-time medians are nullable: `/state` metrics and `ops_audit.py --json`
+emit `null` rather than `0` when there is no valid won-to-deployed or
+deployed-to-landed sample.
+
+Compatibility note: local write endpoints require canonical UTC timestamps in
+`YYYY-MM-DDTHH:mm:ss.sssZ` form. Valid ISO variants such as
+`2026-05-21T12:00:00Z` or `+00:00` offsets are rejected at the API boundary so
+SQLite text ordering, TypeScript metrics, and the Python audit stay aligned.
 
 ### Live HubSpot + Slack
 
@@ -122,6 +144,17 @@ route mix      nurture 1 · self_serve 2 · human_assisted 6
 human-gate     pricing_approval 4 · regulated_review 4
 quarantine     schema_invalid 1 · enrichment_unresolved 2 · insufficient_data 1
 business       routed ARR $508,000 · auto-handled 3 (routed, no rep touch)
+post-sale outcomes
+  deployment_started 2
+  deployed           1
+  landed             1
+  expanded           1 ($35,000 ARR delta)
+  churned            1
+  churn-before-deploy 1 warning
+  invalid events     0
+  state conflicts    0
+  won→deployed med   48h
+  deployed→landed med 30h
 ```
 
 14 input lines, 9 distinct routed rows: one line duplicates another and is
@@ -131,9 +164,12 @@ external writes, zero `sink_*` quarantines); `--flaky` injects deterministic
 retryable and terminal sink faults so the retry/terminal taxonomy is visible
 in the quarantine table, not just asserted in tests. `--integrations` swaps the
 sink to HubSpot + Slack dry-run mode, so the event trail shows the cross-system
-handoff without credentials. `POST /webhooks/hubspot` completes the loop in the
-other direction: manual HubSpot stage movement becomes router state and Slack
-signal, rather than a static CRM board.
+handoff without credentials. The demo also layers two deterministic post-sale
+journeys onto routed deals: Ryder Digital deploys, lands, and expands; Cargo
+Loop starts deployment and churns before deploy, which is a warning fact rather
+than an audit failure. `POST /webhooks/hubspot` completes the loop in the other
+direction: manual HubSpot stage movement becomes router state and Slack signal,
+rather than a static CRM board.
 
 ---
 
@@ -202,9 +238,16 @@ That boundary is a deliberate design output, not a missing feature.
   are already built — see `sink.ts`, `integrations.ts`, and `ops_audit.py`.)
 - Auth on `POST /deals`; structured log shipping; alerting wired to the
   existing audit gate.
-- **The self-improving loop:** score routing decisions against closed-won
-  outcomes, surface the false-positive / missed-pattern quadrants, and tune
-  the thresholds from data instead of by hand. (Same loop, pointed at ops.)
+- **The self-improving loop:** the dashboard now scores routing decisions
+  against closed-won and post-sale outcomes in read-only policy-evaluation
+  reports, and a local-only policy run can now draft human-reviewed
+  `policy_change_recommendation` suggestions from those signals. It still does
+  not change thresholds automatically. (Same loop, pointed at ops.)
+- **Agent inside typed rails:** Phase 5 adds a local-only agent suggestion
+  ledger. Agents can draft handoffs, missing-field questions, stale-deal
+  nudges, and policy recommendations; humans accept or reject them; nothing
+  mutates HubSpot, Slack, or routing policy automatically. See
+  [docs/PHASE5_AGENT_RAILS_SPEC.md](docs/PHASE5_AGENT_RAILS_SPEC.md).
 - A more detailed org-level roadmap is in
   [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md): the next production slice is
   a closed-loop deployment handoff, not a CRM clone.

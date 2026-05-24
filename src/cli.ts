@@ -1,15 +1,26 @@
 /**
  * CLI entrypoint.
  *
- *   npm run demo            deterministic in-memory replay of the seed corpus
+ *   npm run demo            deterministic in-memory replay + post-sale outcomes
  *   npm run run <file>      process a JSONL file into a persistent SQLite db
+ *     --demo-outcomes       bare flag: layer deterministic post-sale demo outcomes
  *   npm run serve [port]    HTTP server + live dashboard (default :8787)
  *
  * `demo` binds no port and needs no API keys — clone, install, run, done.
+ * It layers the in-memory outcome fixtures by default; integration flags still
+ * affect only intake→route sink receipts, not post-sale outcome writes.
+ * Pass --no-demo-outcomes to show only the intake→route surface.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import {
+  applyDemoOutcomeFixtures,
+  demoCommercialStateSourceEventIds,
+  demoOutcomeFixtureDealIds,
+  demoOutcomeSourceEventIds,
+  type DemoOutcomeFixtureResult,
+} from "./demo-fixtures.js";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
 import {
   type IntegrationBuild,
@@ -122,7 +133,120 @@ function pipelineOptions(
   return { label: "logging", opts: {}, configBundle };
 }
 
+function logDemoOutcomeFixtureResult(
+  result: DemoOutcomeFixtureResult,
+): void {
+  if (result.appliedCompanies.length > 0) {
+    console.log(
+      `[demo outcomes] reconciled: ${result.appliedCompanies.join(", ")} ` +
+        `(${result.commercialRecorded} commercial writes, ` +
+        `${result.commercialDuplicate} commercial duplicates, ` +
+        `${result.commercialClosedWonNoop} closed_won no-ops, ` +
+        `${result.acceptedOutcomes} outcome writes, ` +
+        `${result.duplicateOutcomes} outcome duplicates)`,
+    );
+    console.log(
+      `[demo outcomes] journey: ${result.appliedDescriptions.join("; ")}`,
+    );
+  }
+  if (result.commercialClosedWonNoop > 0) {
+    console.warn(
+      "[demo outcomes] layered onto existing closed_won state; cycle-time medians use the earliest projected close event and may render n/a if that close occurred after deployment",
+    );
+  }
+  const skippedResolved = result.resolvedCompanies.filter(
+    (company) => !result.appliedCompanies.includes(company),
+  );
+  if (skippedResolved.length > 0) {
+    console.warn(
+      `[demo outcomes] resolved but not fully applied; commercial close may remain: ${skippedResolved.join(", ")}`,
+    );
+  }
+  if (result.missingCompanies.length > 0) {
+    console.warn(
+      `[demo outcomes] skipped missing routed companies: ${result.missingCompanies.join(", ")}`,
+    );
+  }
+  if (result.errors.length > 0) {
+    const details = result.errors
+      .map((e) => {
+        const event = e.outcome ? `/${e.outcome}` : "";
+        const current =
+          e.currentCommercialState === undefined
+            ? ""
+            : ` current=${e.currentCommercialState ?? "none"}`;
+        return `${e.company} ${e.step}:${e.sourceEventKey}${event}=${e.status}${current}`;
+      })
+      .join("; ");
+    console.warn(`[demo outcomes] skipped failed fixture writes: ${details}`);
+  }
+}
+
+type DemoLayerEligibility =
+  | { ok: true }
+  | {
+      ok: false;
+      nonDemoOutcomes: number;
+      nonDemoCommercialStates: number;
+    };
+
+function checkPersistentDemoOutcomeEligibility(store: {
+  nonDemoOutcomeEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number;
+  nonDemoProjectedCommercialStateEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number;
+}): DemoLayerEligibility {
+  const fixtureDealIds = demoOutcomeFixtureDealIds();
+  const nonDemoOutcomes = store.nonDemoOutcomeEventCount(
+    fixtureDealIds,
+    demoOutcomeSourceEventIds(),
+  );
+  const nonDemoCommercialStates = store.nonDemoProjectedCommercialStateEventCount(
+    fixtureDealIds,
+    demoCommercialStateSourceEventIds(),
+  );
+  if (nonDemoOutcomes === 0 && nonDemoCommercialStates === 0) {
+    return { ok: true };
+  }
+  return { ok: false, nonDemoOutcomes, nonDemoCommercialStates };
+}
+
+function rejectPersistentDemoOutcomeLayering(
+  check: Exclude<DemoLayerEligibility, { ok: true }>,
+  store: { close(): void },
+  committedRoutedThisRun?: number,
+): void {
+  const committedDetail =
+    committedRoutedThisRun === undefined
+      ? ""
+      : ` ${committedRoutedThisRun} routed deal(s) from this run were already committed before the overlay was refused.`;
+  console.error(
+    `[demo outcomes] refusing to layer fixtures into data/router.db with ` +
+      `${check.nonDemoOutcomes} non-demo outcome rows on fixture deals and ` +
+      `${check.nonDemoCommercialStates} non-demo commercial-state events on fixture deals; ` +
+      "use a fresh data/router.db or rerun without --demo-outcomes." +
+      committedDetail,
+  );
+  store.close();
+  process.exitCode = 2;
+}
+
 async function cmdDemo(args: string[]): Promise<void> {
+  const wantsDemoOutcomes = args.includes("--demo-outcomes");
+  const skipsDemoOutcomes = args.includes("--no-demo-outcomes");
+  if (wantsDemoOutcomes && skipsDemoOutcomes) {
+    console.warn(
+      "[demo outcomes] both demo outcome flags passed; --no-demo-outcomes wins",
+    );
+  } else if (wantsDemoOutcomes) {
+    console.warn(
+      "[demo outcomes] demo layers outcomes by default; --demo-outcomes is a no-op here",
+    );
+  }
   const Store = await loadStore();
   const store = new Store(":memory:");
   const enricher = new FixtureEnricher(loadFixture());
@@ -132,20 +256,27 @@ async function cmdDemo(args: string[]): Promise<void> {
   if (label === "flaky") {
     console.log(
       "[--flaky] live sink: 1 retryable failure then success; " +
-        "EuroDist → terminal (see QUARANTINED: sink_terminal)\n",
+        "EuroDist → terminal (see QUARANTINED: sink_terminal)",
     );
   }
   if (label === "hubspot+slack:dry-run") {
     console.log(
       "[--integrations] dry-run HubSpot + Slack sink: no secrets, no network; " +
-        "event trail shows the cross-system handoff\n",
+        "event trail shows the cross-system handoff",
     );
   }
   if (label === "hubspot+slack") {
-    console.log("[--live-integrations] writing to HubSpot and Slack\n");
+    console.log("[--live-integrations] writing to HubSpot and Slack");
   }
 
   const outcomes = await processBatch(seed, store, enricher, opts);
+  if (!skipsDemoOutcomes) {
+    const demoOutcomes = applyDemoOutcomeFixtures(
+      store,
+      store.routedByIds(demoOutcomeFixtureDealIds()),
+    );
+    logDemoOutcomeFixtureResult(demoOutcomes);
+  }
 
   console.log(renderMetricsTable(store.metrics()));
   console.log("\nROUTED");
@@ -173,18 +304,57 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
   const store = new Store(`${ROOT}data/router.db`);
   const enricher = new FixtureEnricher(loadFixture());
   const { opts, configBundle } = pipelineOptions(args);
+  const skipsDemoOutcomes = args.includes("--no-demo-outcomes");
+  const wantsDemoOutcomes =
+    args.includes("--demo-outcomes") && !skipsDemoOutcomes;
+  if (args.includes("--demo-outcomes") && skipsDemoOutcomes) {
+    console.warn(
+      "[demo outcomes] both demo outcome flags passed; --no-demo-outcomes wins",
+    );
+  }
+  if (wantsDemoOutcomes) {
+    const check = checkPersistentDemoOutcomeEligibility(store);
+    if (!check.ok) {
+      rejectPersistentDemoOutcomeLayering(check, store);
+      return;
+    }
+  }
   store.recordIntegrationConfigBundle(configBundle);
-  await processBatch(
+  const outcomes = await processBatch(
     loadJsonl(file),
     store,
     enricher,
     opts,
   );
+  if (wantsDemoOutcomes) {
+    // Fast-fail above catches pre-existing DB history; this second check keeps
+    // fixture layering safe if a future intake path records post-sale state.
+    // Revisit when processBatch can emit commercial-state or outcome rows.
+    const check = checkPersistentDemoOutcomeEligibility(store);
+    if (!check.ok) {
+      rejectPersistentDemoOutcomeLayering(
+        check,
+        store,
+        outcomes.filter((outcome) => outcome.ok).length,
+      );
+      return;
+    }
+    const demoOutcomes = applyDemoOutcomeFixtures(
+      store,
+      store.routedByIds(demoOutcomeFixtureDealIds()),
+    );
+    logDemoOutcomeFixtureResult(demoOutcomes);
+  }
   console.log(renderMetricsTable(store.metrics()));
   store.close();
 }
 
 async function cmdServe(portArg: string | undefined, args: string[]): Promise<void> {
+  if (args.includes("--demo-outcomes") || args.includes("--no-demo-outcomes")) {
+    console.warn(
+      "[demo outcomes] serve reads the existing SQLite state; ignoring demo outcome flags",
+    );
+  }
   const port = Number(portArg ?? 8787);
   if (!Number.isInteger(port) || port <= 0) {
     console.error(`invalid port: ${portArg}`);
@@ -278,7 +448,7 @@ async function main(): Promise<void> {
     default:
       console.error(
         `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve | doctor` +
-          ` (flags: --flaky | --integrations | --live-integrations | --send-test)`,
+          ` (flags: --flaky | --integrations | --live-integrations | --demo-outcomes | --no-demo-outcomes | --send-test)`,
       );
       process.exitCode = 2;
   }

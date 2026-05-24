@@ -201,16 +201,37 @@ describe("local commercial-state endpoint", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
+      const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const suggestionDecision = await fetch(
+        `${baseUrl}/agent-suggestions/S-1/decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
       const commercialBody = (await commercial.json()) as { error: string };
       const deploymentBody = (await deployment.json()) as { error: string };
       const outcomeBody = (await outcome.json()) as { error: string };
+      const suggestionBody = (await suggestion.json()) as { error: string };
+      const suggestionDecisionBody = (await suggestionDecision.json()) as {
+        error: string;
+      };
 
       expect(commercial.status).toBe(404);
       expect(deployment.status).toBe(404);
       expect(outcome.status).toBe(404);
+      expect(suggestion.status).toBe(404);
+      expect(suggestionDecision.status).toBe(404);
       expect(commercialBody.error).toBe("not found");
       expect(deploymentBody.error).toBe("not found");
       expect(outcomeBody.error).toBe("not found");
+      expect(suggestionBody.error).toBe("not found");
+      expect(suggestionDecisionBody.error).toBe("not found");
     });
   });
 
@@ -325,8 +346,111 @@ describe("local commercial-state endpoint", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
+        const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const recommendationRun = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          },
+        );
         expect(deployment.status).toBe(401);
         expect(outcome.status).toBe(401);
+        expect(suggestion.status).toBe(401);
+        expect(recommendationRun.status).toBe(401);
+      },
+    );
+  });
+
+  it("requires canonical UTC ISO timestamps on local write endpoints", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const dealId = await postRoutedDeal(baseUrl);
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const commercial = await fetch(`${baseUrl}/commercial-state`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            commercialState: "closed_won",
+            sourceEventId: "11111111-1111-4111-8111-111111111119",
+            occurredAt: "2026-05-21T12:00:00Z",
+          }),
+        });
+        const deployment = await fetch(`${baseUrl}/deployment-facts`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            sourceEventId: "22222222-2222-4222-8222-222222222229",
+            useCaseClear: true,
+            integrationsKnown: true,
+            dataReady: true,
+            operator: "DS",
+            occurredAt: "2026-05-21T14:00:00+02:00",
+          }),
+        });
+
+        await postClosedWon(baseUrl, dealId);
+        const outcome = await fetch(`${baseUrl}/outcomes`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            sourceEventId: "33333333-3333-4333-8333-333333333339",
+            outcome: "deployment_started",
+            occurredAt: "2026-05-21T12:00:00Z",
+            operator: "DS",
+          }),
+        });
+        const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            sourceEventId: "44444444-4444-4444-8444-444444444449",
+            kind: "handoff_summary",
+            title: "Draft handoff",
+            body: "Summarize the deal.",
+            rationale: "AE needs context.",
+            createdBy: "local-agent",
+            occurredAt: "2026-05-21T12:00:00Z",
+          }),
+        });
+        const recommendationRun = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "policy-agent",
+              evaluatedAt: "2026-05-21T12:00:00Z",
+            }),
+          },
+        );
+
+        expect(commercial.status).toBe(400);
+        expect(deployment.status).toBe(400);
+        expect(outcome.status).toBe(400);
+        expect(suggestion.status).toBe(400);
+        expect(recommendationRun.status).toBe(400);
+        expect(store.deploymentFacts(dealId)).toBeNull();
+        expect(store.outcomeEvents(dealId)).toHaveLength(0);
+        expect(store.agentSuggestions()).toHaveLength(0);
       },
     );
   });
@@ -972,6 +1096,7 @@ describe("local commercial-state endpoint", () => {
           method: "POST",
           headers,
           body: JSON.stringify({
+            dealId: "",
             hubspotDealId: "991",
             sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
             outcome: "deployment_started",
@@ -1025,6 +1150,298 @@ describe("local commercial-state endpoint", () => {
         expect(retry.status).toBe(200);
         expect(retryBody.status).toBe("recorded");
         expect(store.outcomeEvents(dealId)).toHaveLength(1);
+      },
+    );
+  });
+
+  it("records agent suggestions and human decisions in state", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const dealId = await postRoutedDeal(baseUrl);
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const proposalBody = {
+          dealId,
+          sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
+          kind: "handoff_summary",
+          title: "  Draft AE handoff  ",
+          body: "Highlight scheduling automation pain and legal review flag.",
+          rationale: "High-value human-assisted deal needs a tight handoff.",
+          createdBy: "local-agent",
+          occurredAt: "2026-05-22T13:00:00.000Z",
+        };
+
+        const proposed = await fetch(`${baseUrl}/agent-suggestions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(proposalBody),
+        });
+        const proposedBody = (await proposed.json()) as {
+          status: string;
+          suggestion: { id: string; status: string; title: string };
+        };
+        const duplicate = await fetch(`${baseUrl}/agent-suggestions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(proposalBody),
+        });
+        const conflict = await fetch(`${baseUrl}/agent-suggestions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...proposalBody, rationale: "mutated replay" }),
+        });
+        const missingDecision = await fetch(
+          `${baseUrl}/agent-suggestions/S-missing/decision`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee0",
+              decision: "accepted",
+              humanPrincipal: "ops@example.com",
+              reason: "No such suggestion.",
+            }),
+          },
+        );
+        const decision = await fetch(
+          `${baseUrl}/agent-suggestions/${encodeURIComponent(
+            proposedBody.suggestion.id,
+          )}/decision`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2",
+              decision: "accepted",
+              humanPrincipal: "ops@example.com",
+              reason: "Good enough for the account owner.",
+            }),
+          },
+        );
+        const decisionBody = (await decision.json()) as {
+          status: string;
+          suggestion: {
+            status: string;
+            decidedAt: string;
+            decidedBy: string;
+            decisionReason: string;
+          };
+        };
+        const laterDecision = await fetch(
+          `${baseUrl}/agent-suggestions/${encodeURIComponent(
+            proposedBody.suggestion.id,
+          )}/decision`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee3",
+              decision: "rejected",
+              humanPrincipal: "ops@example.com",
+              reason: "Second decision should not overwrite the first.",
+            }),
+          },
+        );
+        const state = (await fetch(`${baseUrl}/state`).then((r) =>
+          r.json(),
+        )) as {
+          agentSuggestions: Array<{
+            id: string;
+            dealId: string;
+            status: string;
+            title: string;
+            decidedBy: string | null;
+          }>;
+        };
+
+        expect(proposed.status).toBe(200);
+        expect(proposedBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            suggestion: expect.objectContaining({
+              status: "proposed",
+              title: "Draft AE handoff",
+            }),
+          }),
+        );
+        expect(duplicate.status).toBe(200);
+        expect(((await duplicate.json()) as { status: string }).status).toBe(
+          "duplicate",
+        );
+        expect(conflict.status).toBe(409);
+        expect(missingDecision.status).toBe(404);
+        expect(
+          ((await missingDecision.json()) as { status: string }).status,
+        ).toBe("not_found");
+        expect(decision.status).toBe(200);
+        expect(decisionBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            suggestion: expect.objectContaining({
+              status: "accepted",
+              decidedAt: expect.stringMatching(
+                /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+              ),
+              decidedBy: "ops@example.com",
+              decisionReason: "Good enough for the account owner.",
+            }),
+          }),
+        );
+        expect(laterDecision.status).toBe(409);
+        expect(((await laterDecision.json()) as { status: string }).status).toBe(
+          "already_decided",
+        );
+        expect(state.agentSuggestions).toEqual([
+          expect.objectContaining({
+            id: proposedBody.suggestion.id,
+            dealId,
+            status: "accepted",
+            title: "Draft AE handoff",
+            decidedBy: "ops@example.com",
+          }),
+        ]);
+        expect(store.agentSuggestions()).toHaveLength(1);
+        expect(store.events(dealId).map((event) => event.detail)).toEqual(
+          expect.arrayContaining([
+            "agent_suggestion_proposed",
+            "agent_suggestion_decided",
+          ]),
+        );
+      },
+    );
+  });
+
+  it("generates policy recommendation suggestions from evaluation signals", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const noSignals = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "policy-agent",
+              limit: 5,
+            }),
+          },
+        );
+        const noSignalsBody = (await noSignals.json()) as {
+          status: string;
+          attempted: number;
+        };
+        const dealId = await postRoutedDeal(baseUrl);
+        await postClosedWon(
+          baseUrl,
+          dealId,
+          "cccccccc-cccc-4ccc-8ccc-ccccccccccd1",
+        );
+
+        const first = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "policy-agent",
+              evaluatedAt: "2026-05-23T13:00:00.000Z",
+              limit: 5,
+            }),
+          },
+        );
+        const firstBody = (await first.json()) as {
+          status: string;
+          attempted: number;
+          recorded: number;
+          duplicate: number;
+          results: Array<{ signal: string; sourceEventId: string }>;
+        };
+        const replay = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "policy-agent",
+              evaluatedAt: "2026-05-23T13:00:00.000Z",
+              limit: 5,
+            }),
+          },
+        );
+        const replayBody = (await replay.json()) as {
+          status: string;
+          attempted: number;
+          recorded: number;
+          duplicate: number;
+        };
+        const state = (await fetch(`${baseUrl}/state`).then((r) =>
+          r.json(),
+        )) as {
+          agentSuggestions: Array<{
+            dealId: string;
+            kind: string;
+            status: string;
+            title: string;
+          }>;
+        };
+
+        expect(noSignals.status).toBe(200);
+        expect(noSignalsBody).toEqual(
+          expect.objectContaining({
+            status: "no_signals",
+            attempted: 0,
+          }),
+        );
+        expect(first.status).toBe(200);
+        expect(firstBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            attempted: 1,
+            recorded: 1,
+            duplicate: 0,
+          }),
+        );
+        expect(firstBody.results[0]).toEqual(
+          expect.objectContaining({
+            signal: "human_assisted_stalled",
+            sourceEventId: expect.stringMatching(
+              /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+            ),
+          }),
+        );
+        expect(replay.status).toBe(200);
+        expect(replayBody).toEqual(
+          expect.objectContaining({
+            status: "duplicate",
+            attempted: 1,
+            recorded: 0,
+            duplicate: 1,
+          }),
+        );
+        expect(state.agentSuggestions).toEqual([
+          expect.objectContaining({
+            dealId,
+            kind: "policy_change_recommendation",
+            status: "proposed",
+            title: expect.stringContaining("Unblock stalled deployment"),
+          }),
+        ]);
+        expect(store.agentSuggestions()).toHaveLength(1);
       },
     );
   });
@@ -1213,7 +1630,7 @@ describe("server dashboard", () => {
             dealId,
             commercialState: "closed_won",
             sourceEventId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            occurredAt: new Date().toISOString(),
+            occurredAt: "2026-05-21T12:00:00.000Z",
           }),
         });
 
@@ -1230,6 +1647,27 @@ describe("server dashboard", () => {
           metrics: {
             deploymentReadiness: Record<string, number>;
           };
+          roleQueues: {
+            ae_attention: Array<{ dealId: string }>;
+            deployment_readiness: Array<{
+              dealId: string;
+              status: string;
+              reason: string;
+            }>;
+            growth_attribution: Array<{ dealId: string; sourceChannel: string }>;
+          };
+          policyEvaluation: {
+            humanAssistedRisk: Array<{
+              dealId: string;
+              signal: string;
+              reason: string;
+            }>;
+            sourceChannels: Array<{
+              sourceChannel: string;
+              routed: number;
+              closedWon: number;
+            }>;
+          };
         };
         expect(pendingState.deploymentReadiness).toEqual([
           expect.objectContaining({
@@ -1241,6 +1679,37 @@ describe("server dashboard", () => {
           }),
         ]);
         expect(pendingState.metrics.deploymentReadiness.pending).toBe(1);
+        expect(pendingState.roleQueues.ae_attention).toEqual([]);
+        expect(pendingState.roleQueues.deployment_readiness).toEqual([
+          expect.objectContaining({
+            dealId,
+            status: "pending",
+            reason: "awaiting deployment facts",
+          }),
+        ]);
+        expect(pendingState.roleQueues.growth_attribution).toEqual([
+          expect.objectContaining({
+            dealId,
+            sourceChannel: "website_chat",
+          }),
+        ]);
+        expect(pendingState.policyEvaluation.humanAssistedRisk).toEqual([
+          expect.objectContaining({
+            dealId,
+            signal: "human_assisted_stalled",
+            reason: "awaiting deployment facts",
+          }),
+        ]);
+        expect(
+          pendingState.policyEvaluation.sourceChannels.find(
+            (summary) => summary.sourceChannel === "website_chat",
+          ),
+        ).toEqual(
+          expect.objectContaining({
+            routed: 1,
+            closedWon: 1,
+          }),
+        );
 
         await fetch(`${baseUrl}/deployment-facts`, {
           method: "POST",
@@ -2391,6 +2860,11 @@ describe("server dashboard", () => {
 
     const dashboard = await fetch(`${baseUrl}/`).then((r) => r.text());
     expect(dashboard).toContain("Deployment Handoff");
+    expect(dashboard).toContain("Draft Policy Recommendations");
+    expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
+    expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
+    expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");
+    expect(dashboard).toContain("sessionStorage");
     expect(dashboard).not.toContain(payload.company);
     expect(dashboard).not.toContain(`alert("owned")`);
     expect(dashboard).not.toContain("innerHTML");

@@ -9,6 +9,9 @@
  *   POST /preview             validate/enrich/score/route without persistence
  *   POST /deals               ingest one deal or an array
  *   POST /webhooks/hubspot    receive HubSpot dealstage changes
+ *   POST /agent-suggestions   local-only agent draft ledger
+ *   POST /agent-suggestions/:id/decision
+ *   POST /agent-suggestion-runs/policy-evaluation
  *
  * This is a local/operator-console surface. Put auth in front of it before
  * exposing it beyond localhost or a trusted internal network.
@@ -38,21 +41,35 @@ import { enrichWithGate, processBatch, scoreAndRoute } from "./pipeline.js";
 import type { PipelineOptions } from "./pipeline.js";
 import type { Store } from "./store.js";
 import type {
+  AgentSuggestionRecord,
   DeploymentReadinessState,
   CommercialTerminalDriftAlertClaim,
   CommercialTerminalDriftAlertRetryCandidate,
   Metrics,
+  PolicyEvaluationReports,
   Quarantine,
   ReadinessFallbackNotificationClaim,
   ReadinessNotificationClaim,
+  RoleQueues,
   RoutedDeal,
 } from "./types.js";
-import { CommercialState, OutcomeReasonCategory, OutcomeState } from "./types.js";
+import {
+  AgentSuggestionKind,
+  AgentSuggestionDecision,
+  CommercialState,
+  OutcomeReasonCategory,
+  OutcomeState,
+} from "./types.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 const STATE_DEAL_LIMIT = 200;
 const STATE_EXCEPTION_LIMIT = 100;
 const STATE_EVENTS_PER_DEAL = 50;
+const STATE_ROLE_QUEUE_LIMIT = 50;
+const STATE_AGENT_SUGGESTION_LIMIT = 50;
+// Local-console cache only. Mutating handlers invalidate after successful
+// processing; failed writes do not thrash the dashboard read cache.
+const STATE_CACHE_TTL_MS = 1_000;
 const HEALTH_TTL_MS = 35_000;
 const MAX_BATCH_DEALS = 250;
 const MAX_LIVE_BATCH_DEALS = 5;
@@ -138,11 +155,37 @@ interface ConsoleState {
   queue: ConsoleDeal[];
   exceptions: Quarantine[];
   deploymentReadiness: DeploymentReadinessState[];
+  agentSuggestions: AgentSuggestionRecord[];
+  roleQueues: RoleQueues;
+  roleQueueLimit: number;
+  policyEvaluation: PolicyEvaluationReports;
 }
 
 type PreviewResult =
   | { ok: true; deal: RoutedDeal }
   | { ok: false; stage: "intake" | "enriched"; reason: string };
+
+const CANONICAL_UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function parseCanonicalOccurredAt(value: string): Date | null {
+  if (!CANONICAL_UTC_ISO.test(value)) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString() === value ? parsed : null;
+}
+
+function resolveCanonicalTimestamp(
+  value: string | undefined,
+): { value: string; date: Date } | null {
+  const resolved = value ?? new Date().toISOString();
+  const date = parseCanonicalOccurredAt(resolved);
+  return date ? { value: resolved, date } : null;
+}
+
+const CanonicalUtcIsoString = z.string().refine(
+  (value) => parseCanonicalOccurredAt(value) !== null,
+  "must be a canonical UTC ISO timestamp",
+);
 
 const LocalCommercialStateBody = z.object({
   dealId: z.string().min(1),
@@ -150,7 +193,7 @@ const LocalCommercialStateBody = z.object({
   sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
   reason: z.string().min(1).max(500).optional(),
   expectedRedPath: z.boolean().optional(),
-  occurredAt: z.string().min(1),
+  occurredAt: CanonicalUtcIsoString,
 });
 
 const LocalDeploymentFactsBody = z.object({
@@ -160,17 +203,42 @@ const LocalDeploymentFactsBody = z.object({
   integrationsKnown: z.boolean(),
   dataReady: z.boolean(),
   operator: z.string().trim().min(1).max(120),
-  occurredAt: z.string().min(1),
+  occurredAt: CanonicalUtcIsoString,
 });
 
 const LocalOutcomeBody = z.object({
   dealId: z.string().min(1),
   sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
   outcome: OutcomeState,
-  occurredAt: z.string().min(1),
+  occurredAt: CanonicalUtcIsoString,
   operator: z.string().trim().min(1).max(120),
   arrDeltaUsd: z.number().int("arrDeltaUsd must be an integer").optional(),
   reasonCategory: OutcomeReasonCategory.optional(),
+});
+
+const LocalAgentSuggestionBody = z.object({
+  dealId: z.string().trim().min(1),
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  kind: AgentSuggestionKind,
+  title: z.string().trim().min(1).max(160),
+  body: z.string().trim().min(1).max(4000),
+  rationale: z.string().trim().min(1).max(1000),
+  createdBy: z.string().trim().min(1).max(120),
+  occurredAt: CanonicalUtcIsoString,
+});
+
+const LocalAgentSuggestionDecisionBody = z.object({
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  decision: AgentSuggestionDecision,
+  humanPrincipal: z.string().trim().min(1).max(200),
+  reason: z.string().trim().min(1).max(1000),
+  occurredAt: CanonicalUtcIsoString.optional(),
+});
+
+const LocalPolicyRecommendationRunBody = z.object({
+  createdBy: z.string().trim().min(1).max(120),
+  evaluatedAt: CanonicalUtcIsoString.optional(),
+  limit: z.number().int().min(1).max(25).optional(),
 });
 
 const NotificationRetryBody = z.object({
@@ -179,6 +247,10 @@ const NotificationRetryBody = z.object({
   alertKey: z.string().min(1).optional(),
   limit: z.number().int().optional(),
 });
+
+function unreachableStatus(status: never): never {
+  throw new Error(`unhandled local endpoint status: ${String(status)}`);
+}
 
 function quarantineCompany(q: Quarantine, intakeLabels: Map<string, string>): string {
   const intake = intakeLabels.get(q.dealId);
@@ -232,6 +304,8 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     b.updatedAt.localeCompare(a.updatedAt),
   );
   const integrity = store.integrity();
+  const now = new Date().toISOString();
+  const deploymentReadiness = store.deploymentReadinessRecords(now);
 
   return {
     metrics,
@@ -239,7 +313,15 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     integrity,
     queue,
     exceptions: quarantined.map((record) => record.quarantine),
-    deploymentReadiness: store.deploymentReadinessRecords(),
+    deploymentReadiness,
+    agentSuggestions: store.agentSuggestions(STATE_AGENT_SUGGESTION_LIMIT),
+    roleQueues: store.roleQueues(STATE_ROLE_QUEUE_LIMIT, deploymentReadiness),
+    roleQueueLimit: STATE_ROLE_QUEUE_LIMIT,
+    policyEvaluation: store.policyEvaluation(
+      STATE_ROLE_QUEUE_LIMIT,
+      deploymentReadiness,
+      now,
+    ),
   };
 }
 
@@ -295,6 +377,8 @@ function consoleHtml(sinkLabel: string): string {
  .journey{display:grid;gap:8px}.event{border:1px solid var(--line);background:#fff;border-radius:5px;padding:8px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap}
  .receipts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.receipt{border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;font-size:11px}
  .empty{border:1px dashed var(--line);border-radius:5px;padding:14px;color:var(--muted);background:#fff}
+ .mini-form{display:grid;gap:8px;margin-bottom:10px}.inline-actions{display:flex;gap:6px;flex-wrap:wrap}.inline-actions button{padding:5px 8px;font-size:12px}
+ .action-status{font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);min-height:18px}
  .queue-wrap{max-height:560px;overflow:auto}.exceptions,.handoff-wrap{max-height:260px;overflow:auto}
  .footer{color:var(--muted);font-size:12px;margin-top:12px}
  @media(max-width:1180px){.layout,.top{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -346,6 +430,25 @@ function consoleHtml(sinkLabel: string): string {
   <h2>Active Deal Queue</h2>
   <div class="queue-wrap" id="queue"></div>
   <div class="section">
+   <h2>Role Queues</h2>
+   <div class="handoff-wrap" id="role-queues"></div>
+  </div>
+  <div class="section">
+   <h2>Policy Evaluation</h2>
+   <div class="handoff-wrap" id="policy-evaluation"></div>
+  </div>
+  <div class="section">
+   <h2>Agent Suggestions</h2>
+   <div class="mini-form">
+    <label>Local Secret<input id="local-secret" type="password" autocomplete="off" placeholder="LOCAL_ENDPOINT_SECRET"></label>
+    <div class="actions">
+     <button type="button" class="secondary" id="draft-policy-btn">Draft Policy Recommendations</button>
+    </div>
+    <div class="action-status" id="agent-action-status"></div>
+   </div>
+   <div class="handoff-wrap" id="agent-suggestions"></div>
+  </div>
+  <div class="section">
    <h2>Exceptions Inbox</h2>
    <div class="exceptions" id="exceptions"></div>
   </div>
@@ -363,11 +466,16 @@ function consoleHtml(sinkLabel: string): string {
 </div>
 <script>
 const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+const LOCAL_SECRET_STORAGE_KEY = "gtm_ops_router_local_secret";
+const AGENT_SUGGESTION_DRAFT_LIMIT = 10;
+const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
+const OPERATOR_PRINCIPAL = "operator-console";
 let state = null;
 let selectedId = null;
 let stateRequestSeq = 0;
 let healthRequestSeq = 0;
 let detailRequestSeq = 0;
+const pendingSuggestionDecisions = new Set();
 
 function qs(sel){ return document.querySelector(sel); }
 function el(tag, className, text){
@@ -384,18 +492,25 @@ function statusClass(status){
 function routeText(deal){
   return deal.route;
 }
+function fmtHours(value){
+  if (value == null) return "n/a";
+  if (value > 0 && value < 0.01) return "<0.01h";
+  return Number(Number(value).toFixed(2)).toString() + "h";
+}
 function payloadFromForm(){
   const fd = new FormData(qs("#deal-form"));
   const optionalString = (name) => {
     const value = String(fd.get(name) || "").trim();
     return value.length ? value : undefined;
   };
+  const dealUSD = Number(fd.get("dealUSD") || 0);
+  if (!Number.isFinite(dealUSD)) throw new Error("Deal USD must be a finite number.");
   return {
     company: String(fd.get("company") || ""),
     domain: optionalString("domain"),
     contactName: String(fd.get("contactName") || ""),
     contactEmail: String(fd.get("contactEmail") || ""),
-    dealUSD: Number(fd.get("dealUSD") || 0),
+    dealUSD,
     region: String(fd.get("region") || "NA"),
     sourceChannel: String(fd.get("sourceChannel") || "website_chat"),
     statedNeed: String(fd.get("statedNeed") || "")
@@ -412,13 +527,63 @@ async function fetchJson(url, init){
   }
   if (!res.ok) {
     const detail = body && typeof body === "object" && body.error ? body.error : body || res.statusText;
-    throw new Error("HTTP " + res.status + ": " + detail);
+    const detailText = typeof detail === "string" ? detail : JSON.stringify(detail);
+    throw new Error("HTTP " + res.status + ": " + (detailText || res.statusText));
   }
   return body;
+}
+function hash32(input, seed){
+  // FNV-1a-style deterministic browser key material; the server still treats
+  // the formatted value only as an idempotency key, never as randomness.
+  let hash = seed >>> 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+function deterministicUuidV4(input){
+  const hex =
+    hash32(input, 0x811c9dc5) +
+    hash32(input, 0x9e3779b9) +
+    hash32(input, 0x85ebca6b) +
+    hash32(input, 0xc2b2ae35);
+  const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+  const normalized = hex.slice(0, 12) + "4" + hex.slice(13, 16) + variant + hex.slice(17);
+  return normalized.slice(0, 8) + "-" + normalized.slice(8, 12) + "-" + normalized.slice(12, 16) + "-" + normalized.slice(16, 20) + "-" + normalized.slice(20);
+}
+function localWriteHeaders(){
+  const input = qs("#local-secret");
+  const secret = input ? String(input.value || "").trim() : "";
+  if (!secret) throw new Error("LOCAL_ENDPOINT_SECRET required");
+  sessionStorage.setItem(LOCAL_SECRET_STORAGE_KEY, secret);
+  return {"content-type":"application/json","x-local-endpoint-secret":secret};
+}
+function setAgentActionStatus(message, className){
+  const root = qs("#agent-action-status");
+  root.className = "action-status" + (className ? " " + className : "");
+  root.textContent = message;
 }
 function renderKpis(){
   const m = state.metrics;
   const readiness = m.deploymentReadiness || {not_required:0,pending:0,ready:0,blocked:0};
+  const roleQueues = state.roleQueues || {};
+  const policyEvaluation = state.policyEvaluation || {candidateRouted:0,candidateLimit:0,signalBackfillRouted:0,signalBackfillLimitPerSignal:0,selfServeExpanded:[],humanAssistedRisk:[],sourceChannels:[],flags:[]};
+  const actionRoleDealCount = new Set(
+    [
+      ...(roleQueues.ae_attention || []),
+      ...(roleQueues.finance_review || []),
+      ...(roleQueues.legal_review || []),
+      ...(roleQueues.deployment_readiness || [])
+    ].map((row) => row.dealId)
+  ).size;
+  const policySignalCount =
+    (policyEvaluation.selfServeExpanded || []).length +
+    (policyEvaluation.humanAssistedRisk || []).length;
+  const churnRiskDetail =
+    m.outcomeChurnBeforeDeploy === 1
+      ? "churn-before-deploy warning"
+      : "churn-before-deploy warnings";
   const cards = [
     ["Routed ARR", fmtMoney.format(m.routedArrUsd), fmtMoney.format(m.humanRoutedArrUsd) + " human-owned"],
     ["Open Queue", state.queue.length, "visible work items"],
@@ -431,9 +596,17 @@ function renderKpis(){
     ["Partial Syncs", m.partialSyncs, "routed with downstream warning"],
     ["Sync Gaps", m.externallySyncedStoreErrors, "external sync succeeded, local store failed"],
     ["Audit Gaps", m.stageNotificationAuditGaps, "stage notification audit rows needing attention"],
+    ["Visible Role Work", actionRoleDealCount, "unique shown deals needing attention"],
+    ["Policy Signals", policySignalCount, "routing-outcome patterns"],
     ["Deploy Ready", readiness.ready, readiness.blocked + " blocked"],
     ["Deploy Pending", readiness.pending, m.readinessPendingOverSla + " over SLA"],
     ["Fact Risk", m.readinessFactsStaleProjected, m.readinessFactsStaleIgnored + " stale ignored"],
+    ["Deployed", m.deployedDeals, m.landedDeals + " landed"],
+    ["Expansion ARR", fmtMoney.format(m.expandedArrDeltaUsd), m.expandedDeals + " expanded"],
+    ["Won → Deployed", fmtHours(m.medianTimeClosedWonToDeployedHours), "median cycle time"],
+    ["Deployed → Landed", fmtHours(m.medianTimeDeployedToLandedHours), "median cycle time"],
+    ["Invalid Events", m.outcomeInvalidHistories, m.outcomeCommercialStateConflicts + " state conflicts"],
+    ["Churned Early", m.outcomeChurnBeforeDeploy, churnRiskDetail],
     ["p95 Latency", m.latencyMsP95 + "ms", state.sinkLabel]
   ];
   const root = qs("#kpis");
@@ -539,6 +712,268 @@ function renderExceptions(){
   }
   root.replaceChildren(table);
 }
+const roleQueueLabels = {
+  ae_attention: "AE",
+  finance_review: "Finance",
+  legal_review: "Legal",
+  deployment_readiness: "Deployment",
+  growth_attribution: "Growth"
+};
+function rolePriorityClass(priority){
+  if (priority === "high") return "fail";
+  if (priority === "medium") return "warn";
+  return "muted";
+}
+function renderRoleQueues(){
+  const root = qs("#role-queues");
+  const queues = state.roleQueues || {};
+  const actionQueueKeys = ["ae_attention", "finance_review", "legal_review", "deployment_readiness"];
+  const actionRows = actionQueueKeys.flatMap((queue) => queues[queue] || []);
+  const growthRows = queues.growth_attribution || [];
+  if (!actionRows.length && !growthRows.length) {
+    root.replaceChildren(el("div", "empty", "No role-specific queue items."));
+    return;
+  }
+  const renderTable = (rows, headers, buildCells) => {
+    const table = el("table");
+    const head = document.createElement("tr");
+    headers.forEach((h) => head.append(el("th", null, h)));
+    table.append(head);
+    for (const item of rows) {
+      const row = el("tr", "selectable" + (item.dealId === selectedId ? " selected" : ""));
+      row.addEventListener("click", () => selectDeal(item.dealId));
+      row.append(...buildCells(item));
+      table.append(row);
+    }
+    return table;
+  };
+  const nodes = [];
+  if (actionRows.length) {
+    nodes.push(renderTable(
+      actionRows,
+      ["Queue", "Priority", "Company", "ARR", "Sales Owner", "Status", "Reason"],
+      (item) => [
+        cell(roleQueueLabels[item.queue] || item.queue),
+        cell(item.priority, rolePriorityClass(item.priority)),
+        cell(item.company),
+        cell(fmtMoney.format(item.amount)),
+        cell(item.salesOwner || "-"),
+        cell(item.status),
+        cell(item.reason)
+      ]
+    ));
+  }
+  if (growthRows.length) {
+    nodes.push(el("div", "muted", "Growth attribution view"));
+    nodes.push(renderTable(
+      growthRows,
+      ["Company", "ARR", "Source", "Route", "Status"],
+      (item) => [
+        cell(item.company),
+        cell(fmtMoney.format(item.amount)),
+        cell(item.sourceChannel),
+        cell(item.routeKind),
+        cell(item.status)
+      ]
+    ));
+  }
+  nodes.push(el("div", "muted", "Showing up to " + (state.roleQueueLimit || 50) + " rows per role from a bounded dashboard candidate set."));
+  root.replaceChildren(...nodes);
+}
+const policySignalLabels = {
+  self_serve_expanded: "Self-serve expanded",
+  human_assisted_churned: "Human-assisted churned",
+  human_assisted_stalled: "Human-assisted stalled",
+  human_assisted_ready_not_started: "Ready, not started"
+};
+function renderPolicyEvaluation(){
+  const root = qs("#policy-evaluation");
+  const report = state.policyEvaluation || {};
+  const selfServeRows = report.selfServeExpanded || [];
+  const riskRows = report.humanAssistedRisk || [];
+  const sourceRows = (report.sourceChannels || []).filter((row) => row.routed > 0);
+  const flagRows = (report.flags || []).filter((row) => row.routed > 0);
+  const nodes = [];
+  if (!selfServeRows.length && !riskRows.length && !sourceRows.length && !flagRows.length) {
+    nodes.push(el("div", "empty", "No policy evaluation signals yet."));
+  }
+  const renderDealSignals = (title, rows) => {
+    nodes.push(el("div", "muted", title));
+    const table = el("table");
+    const head = document.createElement("tr");
+    ["Signal", "Company", "ARR", "Source", "Owner", "Reason"].forEach((h) => head.append(el("th", null, h)));
+    table.append(head);
+    for (const item of rows) {
+      const row = el("tr", "selectable" + (item.dealId === selectedId ? " selected" : ""));
+      row.addEventListener("click", () => selectDeal(item.dealId));
+      row.append(
+        cell(policySignalLabels[item.signal] || item.signal),
+        cell(item.company),
+        cell(fmtMoney.format(item.amount)),
+        cell(item.sourceChannel),
+        cell(item.salesOwner || "-"),
+        cell(item.reason)
+      );
+      table.append(row);
+    }
+    nodes.push(table);
+  };
+  const renderSummary = (title, rows, labelKey) => {
+    nodes.push(el("div", "muted", title));
+    const table = el("table");
+    const head = document.createElement("tr");
+    ["Segment", "Routed", "Won", "Started", "Deployed", "Landed", "Expanded Deals", "Churned", "Total Expansion ARR"].forEach((h) => head.append(el("th", null, h)));
+    table.append(head);
+    for (const item of rows) {
+      const row = document.createElement("tr");
+      row.append(
+        cell(item[labelKey]),
+        cell(item.routed),
+        cell(item.closedWon),
+        cell(item.deploymentStarted),
+        cell(item.deployed),
+        cell(item.landed),
+        cell(item.expanded),
+        cell(item.churned),
+        cell(fmtMoney.format(item.expandedArrDeltaUsd))
+      );
+      table.append(row);
+    }
+    nodes.push(table);
+  };
+  if (selfServeRows.length) renderDealSignals("Self-serve expansion signals", selfServeRows);
+  if (riskRows.length) renderDealSignals("Human-assisted risk signals", riskRows);
+  if (sourceRows.length) renderSummary("Candidate-set source-channel outcomes", sourceRows, "sourceChannel");
+  if (flagRows.length) renderSummary("Candidate-set flag outcomes", flagRows, "flag");
+  nodes.push(el("div", "muted", "Read-only evaluation over " + (report.candidateRouted || 0) + " routed candidates: recent cap " + (report.candidateLimit || 0) + " plus " + (report.signalBackfillRouted || 0) + " signal backfills, capped at " + (report.signalBackfillLimitPerSignal || 0) + " per signal type. Routing thresholds are not changed automatically."));
+  root.replaceChildren(...nodes);
+}
+const suggestionKindLabels = {
+  handoff_summary: "Handoff",
+  missing_field_question: "Missing field",
+  stale_deal_nudge: "Stale deal",
+  policy_change_recommendation: "Policy"
+};
+function suggestionStatusClass(status){
+  if (status === "accepted") return "pass";
+  if (status === "rejected") return "muted";
+  return "warn";
+}
+function renderAgentSuggestions(){
+  const root = qs("#agent-suggestions");
+  const rows = state.agentSuggestions || [];
+  if (!rows.length) {
+    root.replaceChildren(el("div", "empty", "No agent suggestions."));
+    return;
+  }
+  const table = el("table");
+  const head = document.createElement("tr");
+  ["Status", "Kind", "Deal", "Title", "Rationale", "Decision", "Action"].forEach((h) => head.append(el("th", null, h)));
+  table.append(head);
+  for (const suggestion of rows) {
+    const row = el("tr", "selectable" + (selectedId && suggestion.dealId === selectedId ? " selected" : ""));
+    row.addEventListener("click", () => selectDeal(suggestion.dealId));
+    const decision = suggestion.status === "proposed"
+      ? "awaiting human"
+      : (suggestion.decidedBy || "-") + ": " + (suggestion.decisionReason || "-");
+    const actionCell = document.createElement("td");
+    const pendingDecision = pendingSuggestionDecisions.has(suggestion.id);
+    if (suggestion.status === "proposed" && pendingDecision) {
+      actionCell.textContent = "Deciding...";
+    } else if (suggestion.status === "proposed") {
+      const actions = el("div", "inline-actions");
+      const accept = el("button", "secondary", "Accept");
+      const reject = el("button", "secondary", "Reject");
+      accept.type = "button";
+      reject.type = "button";
+      accept.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void decideSuggestion(suggestion, "accepted");
+      });
+      reject.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void decideSuggestion(suggestion, "rejected");
+      });
+      actions.append(accept, reject);
+      actionCell.append(actions);
+    } else {
+      actionCell.textContent = "-";
+    }
+    row.append(
+      cell(suggestion.status, suggestionStatusClass(suggestion.status)),
+      cell(suggestionKindLabels[suggestion.kind] || suggestion.kind),
+      cell(suggestion.dealId),
+      cell(suggestion.title),
+      cell(suggestion.rationale),
+      cell(decision),
+      actionCell
+    );
+    table.append(row);
+  }
+  root.replaceChildren(table);
+}
+async function draftPolicyRecommendations(){
+  const button = qs("#draft-policy-btn");
+  if (!button) {
+    setAgentActionStatus("Draft button is not available.", "fail");
+    return;
+  }
+  button.disabled = true;
+  setAgentActionStatus("Drafting policy recommendations...", "muted");
+  try {
+    const result = await fetchJson("/agent-suggestion-runs/policy-evaluation", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        createdBy: AGENT_SUGGESTION_RUNNER,
+        limit: AGENT_SUGGESTION_DRAFT_LIMIT
+      })
+    });
+    setAgentActionStatus(
+      "Policy run: " + result.recorded + " recorded, " + result.duplicate + " duplicate, " + result.skipped + " skipped.",
+      result.recorded > 0 ? "pass" : "muted"
+    );
+    await loadState();
+  } catch (err) {
+    setAgentActionStatus(String(err), "fail");
+  } finally {
+    button.disabled = false;
+  }
+}
+async function decideSuggestion(suggestion, decision){
+  if (pendingSuggestionDecisions.has(suggestion.id)) return;
+  const defaultReason = decision === "accepted"
+    ? "Accepted from operator console."
+    : "Rejected from operator console.";
+  const reasonInput = window.prompt("Decision reason", defaultReason);
+  if (reasonInput === null) return;
+  const reason = reasonInput.trim() || defaultReason;
+  pendingSuggestionDecisions.add(suggestion.id);
+  renderAgentSuggestions();
+  setAgentActionStatus(decision + " " + suggestion.id + "...", "muted");
+  try {
+    const result = await fetchJson("/agent-suggestions/" + encodeURIComponent(suggestion.id) + "/decision", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        sourceEventId: deterministicUuidV4("agent-suggestion-decision:" + suggestion.id + ":" + decision),
+        decision,
+        humanPrincipal: OPERATOR_PRINCIPAL,
+        reason
+      })
+    });
+    setAgentActionStatus(
+      "Suggestion " + result.status + ": " + suggestion.title,
+      result.status === "recorded" ? "pass" : "warn"
+    );
+    await loadState();
+  } catch (err) {
+    setAgentActionStatus(String(err), "fail");
+  } finally {
+    pendingSuggestionDecisions.delete(suggestion.id);
+    if (state) renderAgentSuggestions();
+  }
+}
 const blockerLabels = {
   deployment_use_case_unclear: "Use case unclear",
   deployment_integration_unknown: "Integration unknown",
@@ -602,6 +1037,9 @@ function renderDeploymentHandoff(){
 function selectDeal(dealId){
   selectedId = dealId;
   renderQueue();
+  renderRoleQueues();
+  renderPolicyEvaluation();
+  renderAgentSuggestions();
   renderDeploymentHandoff();
   void renderDetail();
 }
@@ -702,6 +1140,9 @@ async function loadState(){
     qs("#last-refresh").textContent = new Date().toLocaleTimeString();
     renderKpis();
     renderQueue();
+    renderRoleQueues();
+    renderPolicyEvaluation();
+    renderAgentSuggestions();
     renderExceptions();
     renderDeploymentHandoff();
     void renderDetail();
@@ -712,6 +1153,8 @@ async function loadState(){
       const msg = "State load failed: " + String(err);
       qs("#kpis").replaceChildren(el("div", "empty", msg));
       qs("#queue").replaceChildren(el("div", "empty", msg));
+      qs("#role-queues").replaceChildren(el("div", "empty", msg));
+      qs("#agent-suggestions").replaceChildren(el("div", "empty", msg));
       qs("#exceptions").replaceChildren(el("div", "empty", msg));
       qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
       qs("#detail").replaceChildren(el("div", "empty", msg));
@@ -754,8 +1197,11 @@ async function preview(){
     root.textContent = "ERROR\\n" + String(err);
   }
 }
+const savedLocalSecret = sessionStorage.getItem(LOCAL_SECRET_STORAGE_KEY);
+if (savedLocalSecret) qs("#local-secret").value = savedLocalSecret;
 qs("#preview-btn").addEventListener("click", preview);
 qs("#refresh-btn").addEventListener("click", () => { loadState(); loadHealth(); });
+qs("#draft-policy-btn").addEventListener("click", () => { void draftPolicyRecommendations(); });
 qs("#deal-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const root = qs("#preview");
@@ -1003,6 +1449,7 @@ export function startServer(
     | { at: number; ttlMs: number; checks: IntegrationCheck[] }
     | undefined;
   let healthInFlight: Promise<IntegrationCheck[]> | undefined;
+  let stateCache: { at: number; state: ConsoleState } | undefined;
   const requestUrlOptions: RequestUrlOptions = {
     publicBaseUrl: process.env.PUBLIC_BASE_URL,
     trustProxy: process.env.TRUST_PROXY === "1",
@@ -1036,6 +1483,18 @@ export function startServer(
       });
     return healthInFlight;
   };
+  const loadState = (): ConsoleState => {
+    const now = Date.now();
+    if (stateCache && now - stateCache.at < STATE_CACHE_TTL_MS) {
+      return stateCache.state;
+    }
+    const state = buildState(store, sinkLabel);
+    stateCache = { at: now, state };
+    return state;
+  };
+  const invalidateStateCache = (): void => {
+    stateCache = undefined;
+  };
   const html = consoleHtml(sinkLabel);
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -1045,6 +1504,8 @@ export function startServer(
       store,
       enricher,
       loadHealth,
+      loadState,
+      invalidateStateCache,
       html,
       options,
       requestUrlOptions,
@@ -1537,6 +1998,7 @@ async function handleLocalCommercialState(
   readinessNotifications: ReadinessNotificationHandler,
   fallbackNotifications: FallbackNotificationHandler,
   terminalDriftNotifications: TerminalDriftNotificationHandler,
+  invalidateStateCache: () => void,
 ): Promise<void> {
   if (!guardLocalWriteRequest(req, res, localWrites, "/commercial-state")) return;
   if (!acceptsJsonBody(req)) {
@@ -1561,12 +2023,14 @@ async function handleLocalCommercialState(
     return;
   }
 
-  const occurredAt = new Date(body.data.occurredAt);
-  if (Number.isNaN(occurredAt.getTime())) {
-    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+  const occurredAt = resolveCanonicalTimestamp(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
     return;
   }
-  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+  if (occurredAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
     json(res, 422, {
       error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
     });
@@ -1585,10 +2049,11 @@ async function handleLocalCommercialState(
     dealId: body.data.dealId,
     commercialState: body.data.commercialState,
     sourceEventId: body.data.sourceEventId,
-    occurredAt: occurredAt.toISOString(),
+    occurredAt: body.data.occurredAt,
     reason: body.data.reason ?? null,
     expectedRedPath,
   });
+  if (localCommercialStateMutated(result.status)) invalidateStateCache();
   const readinessNotificationResult = await deliverReadinessNotification(
     store,
     readinessNotifications,
@@ -1615,6 +2080,28 @@ function localDeploymentFactsStatusCode(
   return 200;
 }
 
+function localCommercialStateMutated(
+  status: ReturnType<Store["recordLocalCommercialState"]>["status"],
+): boolean {
+  return status !== "not_routed" && status !== "duplicate";
+}
+
+function localDeploymentFactsMutated(
+  status: ReturnType<Store["recordLocalDeploymentFacts"]>["status"],
+): boolean {
+  return status !== "not_found" && status !== "duplicate";
+}
+
+function localOutcomeMutated(
+  status: ReturnType<Store["recordLocalOutcome"]>["status"],
+): boolean {
+  return (
+    status !== "not_found" &&
+    status !== "not_closed_won" &&
+    status !== "duplicate"
+  );
+}
+
 function localOutcomeStatusCode(
   status: ReturnType<Store["recordLocalOutcome"]>["status"],
 ): number {
@@ -1632,6 +2119,76 @@ function localOutcomeStatusCode(
   return 200;
 }
 
+function localAgentSuggestionMutated(
+  status: ReturnType<Store["recordLocalAgentSuggestion"]>["status"],
+): boolean {
+  switch (status) {
+    case "recorded":
+      return true;
+    case "duplicate":
+    case "idempotency_conflict":
+    case "not_found":
+    case "not_routed":
+      return false;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localAgentSuggestionStatusCode(
+  status: ReturnType<Store["recordLocalAgentSuggestion"]>["status"],
+): number {
+  switch (status) {
+    case "not_found":
+      return 404;
+    case "not_routed":
+      return 409;
+    case "idempotency_conflict":
+      return 409;
+    case "recorded":
+    case "duplicate":
+      return 200;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localAgentSuggestionDecisionMutated(
+  status: ReturnType<Store["recordLocalAgentSuggestionDecision"]>["status"],
+): boolean {
+  switch (status) {
+    case "recorded":
+      return true;
+    case "duplicate":
+    case "idempotency_conflict":
+    case "not_found":
+    case "already_decided":
+    case "decision_before_proposal":
+      return false;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localAgentSuggestionDecisionStatusCode(
+  status: ReturnType<Store["recordLocalAgentSuggestionDecision"]>["status"],
+): number {
+  switch (status) {
+    case "not_found":
+      return 404;
+    case "idempotency_conflict":
+    case "already_decided":
+      return 409;
+    case "decision_before_proposal":
+      return 422;
+    case "recorded":
+    case "duplicate":
+      return 200;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
 async function handleLocalDeploymentFacts(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1639,6 +2196,7 @@ async function handleLocalDeploymentFacts(
   localWrites: LocalWriteEndpointOptions,
   readinessNotifications: ReadinessNotificationHandler,
   fallbackNotifications: FallbackNotificationHandler,
+  invalidateStateCache: () => void,
 ): Promise<void> {
   if (!guardLocalWriteRequest(req, res, localWrites, "/deployment-facts")) return;
   if (!acceptsJsonBody(req)) {
@@ -1663,12 +2221,14 @@ async function handleLocalDeploymentFacts(
     return;
   }
 
-  const occurredAt = new Date(body.data.occurredAt);
-  if (Number.isNaN(occurredAt.getTime())) {
-    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+  const occurredAt = resolveCanonicalTimestamp(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
     return;
   }
-  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+  if (occurredAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
     json(res, 422, {
       error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
     });
@@ -1682,8 +2242,9 @@ async function handleLocalDeploymentFacts(
     integrationsKnown: body.data.integrationsKnown,
     dataReady: body.data.dataReady,
     operator: body.data.operator,
-    occurredAt: occurredAt.toISOString(),
+    occurredAt: body.data.occurredAt,
   });
+  if (localDeploymentFactsMutated(result.status)) invalidateStateCache();
   const readinessNotificationResult = await deliverReadinessNotification(
     store,
     readinessNotifications,
@@ -1697,10 +2258,19 @@ async function handleLocalDeploymentFacts(
 }
 
 function outcomeBodyError(parsed: unknown): string {
-  if (parsed && typeof parsed === "object" && !("dealId" in parsed)) {
+  if (parsed && typeof parsed === "object") {
     const record = parsed as Record<string, unknown>;
-    if ("hubspotDealId" in record || "externalDealId" in record) {
+    const hasMissingOrEmptyDealId =
+      !("dealId" in record) ||
+      (typeof record.dealId === "string" && record.dealId.trim() === "");
+    if (
+      hasMissingOrEmptyDealId &&
+      ("hubspotDealId" in record || "externalDealId" in record)
+    ) {
       return "router dealId required";
+    }
+    if (typeof record.dealId !== "string" || record.dealId.trim() === "") {
+      return "dealId required";
     }
   }
   return "invalid outcome request";
@@ -1711,6 +2281,7 @@ async function handleLocalOutcome(
   res: ServerResponse,
   store: Store,
   localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
 ): Promise<void> {
   if (!guardLocalWriteRequest(req, res, localWrites, "/outcomes")) return;
   if (!acceptsJsonBody(req)) {
@@ -1735,9 +2306,11 @@ async function handleLocalOutcome(
     return;
   }
 
-  const occurredAt = new Date(body.data.occurredAt);
-  if (Number.isNaN(occurredAt.getTime())) {
-    json(res, 400, { error: "occurredAt must be a valid ISO timestamp" });
+  const occurredAt = parseCanonicalOccurredAt(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
     return;
   }
   if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
@@ -1751,12 +2324,218 @@ async function handleLocalOutcome(
     dealId: body.data.dealId,
     sourceEventId: body.data.sourceEventId,
     outcome: body.data.outcome,
-    occurredAt: occurredAt.toISOString(),
+    occurredAt: body.data.occurredAt,
     operator: body.data.operator,
     arrDeltaUsd: body.data.arrDeltaUsd ?? null,
     reasonCategory: body.data.reasonCategory ?? null,
   });
+  if (localOutcomeMutated(result.status)) invalidateStateCache();
   json(res, localOutcomeStatusCode(result.status), result);
+}
+
+async function handleLocalAgentSuggestion(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/agent-suggestions")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalAgentSuggestionBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid agent-suggestion request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = parseCanonicalOccurredAt(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (occurredAt.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  // Phase 5 is local-only: createdBy is a self-reported operator/agent label
+  // from the holder of LOCAL_ENDPOINT_SECRET, not an authenticated principal.
+  // Do not reuse this field for non-local identity without an auth layer.
+  const result = store.recordLocalAgentSuggestion({
+    dealId: body.data.dealId,
+    sourceEventId: body.data.sourceEventId,
+    kind: body.data.kind,
+    title: body.data.title,
+    body: body.data.body,
+    rationale: body.data.rationale,
+    createdBy: body.data.createdBy,
+    occurredAt: body.data.occurredAt,
+  });
+  if (localAgentSuggestionMutated(result.status)) invalidateStateCache();
+  json(res, localAgentSuggestionStatusCode(result.status), result);
+}
+
+async function handleLocalAgentSuggestionDecision(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  suggestionId: string,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (
+    !guardLocalWriteRequest(
+      req,
+      res,
+      localWrites,
+      "/agent-suggestions/:id/decision",
+    )
+  ) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalAgentSuggestionDecisionBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid agent-suggestion decision request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = resolveCanonicalTimestamp(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (occurredAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  // Phase 5 is local-only: humanPrincipal is self-reported by the operator
+  // holding LOCAL_ENDPOINT_SECRET. Production must bind it to authenticated
+  // identity before exposing this route outside loopback.
+  const result = await store.recordLocalAgentSuggestionDecision({
+    suggestionId,
+    sourceEventId: body.data.sourceEventId,
+    decision: body.data.decision,
+    humanPrincipal: body.data.humanPrincipal,
+    reason: body.data.reason,
+    occurredAt: occurredAt.value,
+  });
+  if (localAgentSuggestionDecisionMutated(result.status)) invalidateStateCache();
+  json(res, localAgentSuggestionDecisionStatusCode(result.status), result);
+}
+
+async function handleLocalPolicyRecommendationRun(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (
+    !guardLocalWriteRequest(
+      req,
+      res,
+      localWrites,
+      "/agent-suggestion-runs/policy-evaluation",
+    )
+  ) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalPolicyRecommendationRunBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid policy recommendation run request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const evaluatedAt = resolveCanonicalTimestamp(body.data.evaluatedAt);
+  if (!evaluatedAt) {
+    json(res, 400, {
+      error: "evaluatedAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (evaluatedAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `evaluatedAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  // Local-only generator: createdBy is a self-reported agent/operator label.
+  // The generated suggestions still require human accept/reject decisions.
+  const recommendationInput = {
+    createdBy: body.data.createdBy,
+    evaluatedAt: evaluatedAt.value,
+    ...(body.data.limit === undefined ? {} : { limit: body.data.limit }),
+  };
+  const result = await store.recordPolicyEvaluationRecommendations(recommendationInput);
+  if (result.recorded > 0) invalidateStateCache();
+  json(res, 200, {
+    status:
+      result.recorded > 0
+        ? "recorded"
+        : result.duplicate > 0
+          ? "duplicate"
+          : result.idempotencyConflict > 0
+            ? "idempotency_conflict"
+            : "no_signals",
+    ...result,
+  });
 }
 
 async function handleNotificationRetry(
@@ -1951,6 +2730,8 @@ async function handleRequest(
   store: Store,
   enricher: Enricher,
   loadHealth: HealthLoader,
+  loadState: () => ConsoleState,
+  invalidateStateCache: () => void,
   html: string,
   options: ServerOptions,
   requestUrlOptions: RequestUrlOptions,
@@ -1962,6 +2743,9 @@ async function handleRequest(
   const url = new URL(req.url ?? "/", "http://localhost").pathname;
   const method = req.method === "HEAD" ? "GET" : req.method;
   const head = req.method === "HEAD";
+  const invalidateIfSuccessful = (): void => {
+    if (res.statusCode < 400) invalidateStateCache();
+  };
   if (method === "GET" && url === "/healthz") {
     json(res, 200, { ok: true }, head);
     return;
@@ -1976,7 +2760,7 @@ async function handleRequest(
     return;
   }
   if (method === "GET" && url === "/state") {
-    json(res, 200, buildState(store, options.sinkLabel ?? "logging"), head);
+    json(res, 200, loadState(), head);
     return;
   }
   const eventsMatch = url.match(/^\/deals\/([^/]+)\/events$/);
@@ -2028,6 +2812,7 @@ async function handleRequest(
       options.stageChanges,
       requestUrlOptions,
     );
+    invalidateIfSuccessful();
     return;
   }
   if (method === "POST" && url === "/commercial-state") {
@@ -2039,6 +2824,7 @@ async function handleRequest(
       readinessNotifications,
       fallbackNotifications,
       terminalDriftNotifications,
+      invalidateStateCache,
     );
     return;
   }
@@ -2050,11 +2836,53 @@ async function handleRequest(
       localWrites,
       readinessNotifications,
       fallbackNotifications,
+      invalidateStateCache,
     );
     return;
   }
   if (method === "POST" && url === "/outcomes") {
-    await handleLocalOutcome(req, res, store, localWrites);
+    await handleLocalOutcome(req, res, store, localWrites, invalidateStateCache);
+    return;
+  }
+  if (method === "POST" && url === "/agent-suggestions") {
+    await handleLocalAgentSuggestion(
+      req,
+      res,
+      store,
+      localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/agent-suggestion-runs/policy-evaluation") {
+    await handleLocalPolicyRecommendationRun(
+      req,
+      res,
+      store,
+      localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  const agentSuggestionDecisionMatch = url.match(
+    /^\/agent-suggestions\/([^/]+)\/decision$/,
+  );
+  if (method === "POST" && agentSuggestionDecisionMatch) {
+    const suggestionId = safeDecodeURIComponent(
+      agentSuggestionDecisionMatch[1] ?? "",
+    );
+    if (suggestionId === null) {
+      json(res, 400, { error: "suggestion id is not valid URL encoding" });
+      return;
+    }
+    await handleLocalAgentSuggestionDecision(
+      req,
+      res,
+      store,
+      localWrites,
+      suggestionId,
+      invalidateStateCache,
+    );
     return;
   }
   if (method === "POST" && url === "/notification-retry") {
@@ -2067,6 +2895,7 @@ async function handleRequest(
       fallbackNotifications,
       terminalDriftNotifications,
     );
+    invalidateIfSuccessful();
     return;
   }
   if (method === "POST" && url === "/deals") {
@@ -2096,6 +2925,7 @@ async function handleRequest(
       enricher,
       options.pipelineOptions ?? {},
     );
+    invalidateStateCache();
     json(res, 200, {
       processed: outcomes.length,
       routed: outcomes.filter((o) => o.ok).length,

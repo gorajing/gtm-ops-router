@@ -2365,38 +2365,130 @@ projection.
 **Goal:** Turn the ledger into focused work queues without creating separate
 apps.
 
-Possible queues:
+First shipped slice: read-only queues derived from the existing ledger. Phase 3
+does not add new workflow state, assignments, waivers, or resolution actions.
+Those semantics are a later implementation contract because the router does not
+yet know which internal owner is allowed to clear finance, legal, deployment,
+or growth work.
 
-- AE attention queue.
-- finance review queue.
-- legal review queue.
-- deployment readiness queue.
-- growth/source attribution view.
+Queue membership rules:
 
-Before coding Phase 3, specify multi-owner blocker semantics, queue membership
-rules, and who can resolve or waive work.
+- `ae_attention`: routed `human_assisted` deals whose commercial projection is
+  not terminal. High priority when ARR is at least `$50K` or finance/legal flags
+  are present; otherwise medium. Owner is the routed `salesOwner`.
+- `finance_review`: non-terminal `human_assisted` deals with
+  `financeFlag=pricing_approval`. High priority at `$50K+`, otherwise medium.
+- `legal_review`: non-terminal `human_assisted` deals with
+  `legalFlag=regulated_review`. High priority at `$50K+`, otherwise medium.
+- `deployment_readiness`: `closed_won` human-assisted deals with readiness
+  `pending` or `blocked`. Blocked is high priority, pending is medium.
+  `ready` and `not_required` rows are intentionally omitted because they are
+  status facts, not open work.
+- `growth_attribution`: routed deals in the bounded dashboard candidate set,
+  preserving `sourceChannel`, `routeKind`, ARR, and latest commercial status so
+  Growth, Field Marketing, and PMM can inspect recent source quality without
+  asking for a new app. It is a low-priority view, not an action queue.
+
+The queues are sorted by priority, ARR, freshness, and deal id. They are a
+bounded dashboard view over the latest routed records, not a queue engine or
+complete historical export. The local console exposes up to 50 rows per role
+from a bounded candidate set; a production queue engine would need pagination,
+materialized queue state, or an explicit "older work not shown" count.
+
+Before adding mutable Phase 3 work, specify:
+
+- multi-owner blocker semantics.
+- queue resolution and waiver authority by role.
+- whether waivers are time-bound or permanent.
+- how queue actions map back to HubSpot, Slack, finance, legal, or deployment
+  systems.
+- how audit treats a resolved item that reappears because upstream facts change.
 
 ## Phase 4: Policy evaluation
 
 **Goal:** Make routing policy measurable before making it self-adjusting.
 
-Possible reports:
+First shipped slice: read-only dashboard reports derived from a bounded recent
+routed candidate set plus explicit backfills for older deals that already have
+policy signals, commercial state, deployment readiness, and accepted post-sale
+outcomes. Phase 4 does not change scoring weights, `$10K` human-routing
+threshold, `$50K` priority gate, or finance/legal flagging.
 
-- self-serve deals that later expanded.
-- human-assisted deals that stalled or churned.
-- source channels that produced successful deployments.
-- finance/legal flags correlated with delay, waiver, or success.
+Report rules:
 
-No production thresholds should change automatically in this phase. Simulations
-are read-only.
+- `selfServeExpanded`: self-serve deals with at least one accepted `expanded`
+  outcome after `landed`, including total expansion ARR delta.
+- `humanAssistedRisk`: human-assisted deals that either recorded `churned` or
+  reached `closed_won` at least one readiness SLA window ago without a
+  `deployment_started` outcome while deployment readiness remains `pending`,
+  `blocked`, `ready`, or missing. `ready` with no start is a separate signal
+  because the gate is satisfied but the deployment action has not happened.
+- `sourceChannels`: one candidate-set summary row per source channel with
+  routed, closed-won, deployment-started, deployed, landed, expanded, churned,
+  and expansion ARR counts. These are explicitly candidate-set rollups, not
+  warehouse-wide source attribution. Outcome counts are deal counts, not raw
+  event counts; expansion ARR is the total accepted expansion ARR across those
+  candidate deals.
+- `flags`: the same candidate-set outcome summary for `pricing_approval` and
+  `regulated_review` routed deals.
 
-## Later: Agent inside typed rails
+The dashboard exposes the reports under "Policy Evaluation" beside role queues.
+It also exposes the routed candidate cap, signal-backfill count, and per-signal
+backfill cap so operators know these are console signals, not a warehouse-grade
+historical export. The reports are intentionally retrospective and read-only:
+they make the false-positive / missed-pattern quadrants visible without giving
+an agent or operator permission to mutate production routing policy.
 
-Only after outcomes and policy evaluation exist, an agent can draft handoff
-summaries, missing-field questions, stale-deal nudges, and policy-change
-recommendations. Before any code, specify human acceptance, rejected-suggestion
-storage, and how accepted agent work is tied to an authenticated human
-principal.
+## Phase 5: Agent inside typed rails
+
+**Goal:** Let an agent draft operational work while keeping execution authority
+with humans and typed systems.
+
+The shipped Phase 5 contract is
+[Phase 5 Spec: Agent Rails](PHASE5_AGENT_RAILS_SPEC.md).
+
+First shipped slice: a local-only suggestion ledger for agent-authored drafts.
+Agents can propose:
+
+- `handoff_summary`
+- `missing_field_question`
+- `stale_deal_nudge`
+- `policy_change_recommendation`
+
+Humans can mark each suggestion `accepted` or `rejected`. Accepted suggestions do
+not move HubSpot stages, post to Slack, change routing thresholds, or assign
+deployment work. They only record that a human accepted the drafted work.
+Rejected suggestions remain stored with the reason, which matters because bad
+agent drafts are outcome data too.
+
+Second shipped slice: a local-only policy-recommendation run. It reads the
+Phase 4 policy-evaluation report, turns the highest-priority current signals
+into deterministic `policy_change_recommendation` drafts, and writes them into
+the Phase 5 suggestion ledger. Replays duplicate by signal-derived source-event
+id. The run still does not accept suggestions, mutate routing thresholds, move
+HubSpot stages, post to Slack, or assign downstream work.
+
+Ledger rules:
+
+- Suggestions attach only to routed deals.
+- Proposal and decision writes each have their own UUIDv4 `sourceEventId`.
+- Same source-event id plus same payload is an idempotent replay.
+- Same source-event id plus different payload writes `idempotency_violations`
+  with either `agent_suggestion` or `agent_suggestion_decision` scope.
+- A second distinct decision for an already decided suggestion returns
+  `already_decided` without claiming the new source event.
+- `/agent-suggestion-runs/policy-evaluation` can draft policy recommendations
+  from current evaluation signals, but those drafts still require human
+  accept/reject decisions.
+- `GET /state` exposes a bounded mix of proposed and recently decided
+  `agentSuggestions`; the dashboard shows the global ledger beside policy
+  evaluation and role queues.
+
+The current identity boundary is deliberately local: `createdBy` and
+`humanPrincipal` are self-reported by the holder of `LOCAL_ENDPOINT_SECRET`
+because the endpoint is loopback-only and disabled in live-integration mode.
+Before any non-local deployment, both fields must come from authenticated
+identity, not request JSON.
 
 ## Deferred specification checklist
 

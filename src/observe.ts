@@ -18,6 +18,23 @@ function money(n: number): string {
   return "$" + Math.round(n).toLocaleString("en-US");
 }
 
+function compactNumber(n: number): string {
+  if (n > 0 && n < 0.01) return "<0.01";
+  return Number(n.toFixed(2)).toString();
+}
+
+function hoursOrNA(value: number | null): string {
+  return value === null ? "n/a" : `${compactNumber(value)}h`;
+}
+
+function plural(n: number, singular: string, pluralText = `${singular}s`): string {
+  return `${n} ${n === 1 ? singular : pluralText}`;
+}
+
+function outcomeLine(label: string, value: string | number): string {
+  return `    ${label.padEnd(24)} ${value}`;
+}
+
 export function renderMetricsTable(m: Metrics): string {
   const lines = [
     rule(),
@@ -48,6 +65,30 @@ export function renderMetricsTable(m: Metrics): string {
     `    partial syncs ..... ${m.partialSyncs}`,
     `    sync gaps ......... ${m.externallySyncedStoreErrors} external/local mismatches`,
     `    audit gaps ........ ${m.stageNotificationAuditGaps} stage-notify rows needing attention`,
+    "",
+    "  post-sale outcomes",
+    outcomeLine("deployment_started", m.deploymentStartedDeals),
+    outcomeLine("deployed", m.deployedDeals),
+    outcomeLine("landed", m.landedDeals),
+    outcomeLine(
+      "expanded",
+      `${m.expandedDeals} (${money(m.expandedArrDeltaUsd)} ARR delta)`,
+    ),
+    outcomeLine("churned", m.churnedDeals),
+    outcomeLine(
+      "churn-before-deploy",
+      plural(m.outcomeChurnBeforeDeploy, "warning"),
+    ),
+    outcomeLine("invalid events", m.outcomeInvalidHistories),
+    outcomeLine("state conflicts", m.outcomeCommercialStateConflicts),
+    outcomeLine(
+      "won→deployed med",
+      hoursOrNA(m.medianTimeClosedWonToDeployedHours),
+    ),
+    outcomeLine(
+      "deployed→landed med",
+      hoursOrNA(m.medianTimeDeployedToLandedHours),
+    ),
     "",
     `  latency  p50 ${m.latencyMsP50}ms   p95 ${m.latencyMsP95}ms`,
     rule(),

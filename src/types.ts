@@ -386,6 +386,126 @@ export interface LocalOutcomeWriteResult {
   rejection: OutcomeRejectionRecord | null;
 }
 
+export const AGENT_SUGGESTION_KINDS = [
+  "handoff_summary",
+  "missing_field_question",
+  "stale_deal_nudge",
+  "policy_change_recommendation",
+] as const;
+export const AgentSuggestionKind = z.enum(AGENT_SUGGESTION_KINDS);
+export type AgentSuggestionKind = z.infer<typeof AgentSuggestionKind>;
+
+export const AGENT_SUGGESTION_STATUSES = [
+  "proposed",
+  "accepted",
+  "rejected",
+] as const;
+export const AgentSuggestionStatus = z.enum(AGENT_SUGGESTION_STATUSES);
+export type AgentSuggestionStatus = z.infer<typeof AgentSuggestionStatus>;
+
+export const AGENT_SUGGESTION_DECISIONS = [
+  "accepted",
+  "rejected",
+] as const satisfies readonly Exclude<AgentSuggestionStatus, "proposed">[];
+export const AgentSuggestionDecision = z.enum(AGENT_SUGGESTION_DECISIONS);
+export type AgentSuggestionDecision = z.infer<typeof AgentSuggestionDecision>;
+
+export type AgentSuggestionSource = "local_agent";
+
+export interface LocalAgentSuggestionInput {
+  dealId: string;
+  sourceEventId: string;
+  kind: AgentSuggestionKind;
+  title: string;
+  body: string;
+  rationale: string;
+  createdBy: string;
+  occurredAt: string;
+}
+
+export interface LocalAgentSuggestionDecisionInput {
+  suggestionId: string;
+  sourceEventId: string;
+  decision: AgentSuggestionDecision;
+  humanPrincipal: string;
+  reason: string;
+  occurredAt: string;
+}
+
+export interface AgentSuggestionRecord {
+  id: string;
+  dealId: string;
+  kind: AgentSuggestionKind;
+  status: AgentSuggestionStatus;
+  title: string;
+  body: string;
+  rationale: string;
+  source: AgentSuggestionSource;
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  createdBy: string;
+  occurredAt: string;
+  createdAt: string;
+  decidedAt: string | null;
+  decidedBy: string | null;
+  decisionSourceEventId: string | null;
+  decisionPayloadHash: string | null;
+  decisionReason: string | null;
+}
+
+export type LocalAgentSuggestionWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "not_routed";
+
+export interface LocalAgentSuggestionWriteResult {
+  status: LocalAgentSuggestionWriteStatus;
+  eventKey: string;
+  suggestion: AgentSuggestionRecord | null;
+}
+
+export type LocalAgentSuggestionDecisionStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "already_decided"
+  | "decision_before_proposal";
+
+export interface LocalAgentSuggestionDecisionResult {
+  status: LocalAgentSuggestionDecisionStatus;
+  eventKey: string;
+  suggestion: AgentSuggestionRecord | null;
+}
+
+export interface PolicyRecommendationRunInput {
+  createdBy: string;
+  evaluatedAt: string;
+  limit?: number;
+}
+
+export interface PolicyRecommendationDraftResult {
+  dealId: string;
+  signal: PolicyEvaluationSignal;
+  sourceEventId: string;
+  status: LocalAgentSuggestionWriteStatus;
+  suggestionId: string | null;
+  title: string;
+}
+
+export interface PolicyRecommendationRunResult {
+  evaluatedAt: string;
+  attempted: number;
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+  statusCounts: Record<LocalAgentSuggestionWriteStatus, number>;
+  results: PolicyRecommendationDraftResult[];
+}
+
 export type Stage =
   | "intake"
   | "enriched"
@@ -465,6 +585,96 @@ export type Route =
       legalFlag: "regulated_review" | null;
       slaHours: number;
     };
+
+export const ROLE_QUEUE_KINDS = [
+  "ae_attention",
+  "finance_review",
+  "legal_review",
+  "deployment_readiness",
+  "growth_attribution",
+] as const;
+export type RoleQueueKind = (typeof ROLE_QUEUE_KINDS)[number];
+// Action queues currently use high/medium; low is reserved for passive
+// attribution views such as growth_attribution.
+export type RoleQueuePriority = "high" | "medium" | "low";
+export type RoleQueueStatus =
+  | CommercialState
+  | DeploymentReadiness
+  | "no_commercial_state";
+
+export interface RoleQueueItem {
+  queue: RoleQueueKind;
+  dealId: string;
+  company: string;
+  amount: number;
+  routeKind: Route["kind"];
+  sourceChannel: SourceChannel;
+  salesOwner: string | null;
+  priority: RoleQueuePriority;
+  reason: string;
+  status: RoleQueueStatus;
+  updatedAt: string;
+}
+
+export type RoleQueues = Record<RoleQueueKind, RoleQueueItem[]>;
+
+export type PolicyEvaluationSignal =
+  | "self_serve_expanded"
+  | "human_assisted_churned"
+  | "human_assisted_stalled"
+  | "human_assisted_ready_not_started";
+
+export interface PolicyEvaluationDeal {
+  dealId: string;
+  company: string;
+  amount: number;
+  routeKind: Route["kind"];
+  sourceChannel: SourceChannel;
+  salesOwner: string | null;
+  signal: PolicyEvaluationSignal;
+  signalObservedAt: string;
+  reason: string;
+  lastOutcomeAt: string | null;
+  arrDeltaUsd: number | null;
+}
+
+export interface SourceChannelPolicySummary {
+  sourceChannel: SourceChannel;
+  routed: number;
+  closedWon: number;
+  deploymentStarted: number;
+  deployed: number;
+  landed: number;
+  expanded: number;
+  churned: number;
+  expandedArrDeltaUsd: number;
+}
+
+export type PolicyFlag = "pricing_approval" | "regulated_review";
+
+export interface FlagPolicySummary {
+  flag: PolicyFlag;
+  routed: number;
+  closedWon: number;
+  deploymentStarted: number;
+  deployed: number;
+  landed: number;
+  expanded: number;
+  churned: number;
+  expandedArrDeltaUsd: number;
+}
+
+export interface PolicyEvaluationReports {
+  candidateRouted: number;
+  candidateLimit: number;
+  signalBackfillRouted: number;
+  signalBackfillLimitPerSignal: number;
+  selfServeExpanded: PolicyEvaluationDeal[];
+  humanAssistedRisk: PolicyEvaluationDeal[];
+  sourceChannels: SourceChannelPolicySummary[];
+  flags: FlagPolicySummary[];
+}
+
 export type RoutedDeal = ScoredDeal & { route: Route };
 
 // ── Failure is typed, never silent ──────────────────────────────────────────
@@ -655,6 +865,27 @@ export type PipelineEventMeta =
         }
     ))
   | {
+      kind: "agent_suggestion_proposed";
+      source: AgentSuggestionSource;
+      eventKey: string;
+      sourceEventId: string;
+      suggestionId: string;
+      suggestionKind: AgentSuggestionKind;
+      createdBy: string;
+      occurredAt: string;
+    }
+  | {
+      kind: "agent_suggestion_decided";
+      source: AgentSuggestionSource;
+      eventKey: string;
+      sourceEventId: string;
+      suggestionId: string;
+      decision: AgentSuggestionDecision;
+      humanPrincipal: string;
+      occurredAt: string;
+      reason: string;
+    }
+  | {
       kind: "deployment_handoff_failed";
       mode: "dry_run" | "live";
       fingerprint: string;
@@ -722,7 +953,9 @@ export interface Metrics {
   churnedDeals: number;
   outcomeChurnBeforeDeploy: number;
   outcomeCommercialStateConflicts: number;
+  // Invalid accepted outcome rows; UI surfaces this as "Invalid Events".
   outcomeInvalidHistories: number;
-  medianTimeClosedWonToDeployedHours: number;
-  medianTimeDeployedToLandedHours: number;
+  // Null means there is no valid sample yet; callers should render "n/a".
+  medianTimeClosedWonToDeployedHours: number | null;
+  medianTimeDeployedToLandedHours: number | null;
 }
