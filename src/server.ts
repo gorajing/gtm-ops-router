@@ -47,6 +47,7 @@ import type {
   CommercialTerminalDriftAlertRetryCandidate,
   Metrics,
   PolicyEvaluationReports,
+  PolicyRecommendationRunRecord,
   Quarantine,
   ReadinessFallbackNotificationClaim,
   ReadinessNotificationClaim,
@@ -67,6 +68,7 @@ const STATE_EXCEPTION_LIMIT = 100;
 const STATE_EVENTS_PER_DEAL = 50;
 const STATE_ROLE_QUEUE_LIMIT = 50;
 const STATE_AGENT_SUGGESTION_LIMIT = 50;
+const STATE_POLICY_RECOMMENDATION_RUN_LIMIT = 25;
 // Local-console cache only. Mutating handlers invalidate after successful
 // processing; failed writes do not thrash the dashboard read cache.
 const STATE_CACHE_TTL_MS = 1_000;
@@ -159,6 +161,7 @@ interface ConsoleState {
   roleQueues: RoleQueues;
   roleQueueLimit: number;
   policyEvaluation: PolicyEvaluationReports;
+  policyRecommendationRuns: PolicyRecommendationRunRecord[];
 }
 
 type PreviewResult =
@@ -322,6 +325,9 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
       deploymentReadiness,
       now,
     ),
+    policyRecommendationRuns: store.policyRecommendationRuns(
+      STATE_POLICY_RECOMMENDATION_RUN_LIMIT,
+    ),
   };
 }
 
@@ -443,6 +449,10 @@ function consoleHtml(sinkLabel: string): string {
   <div class="section">
    <h2>Policy Evaluation</h2>
    <div class="handoff-wrap" id="policy-evaluation"></div>
+  </div>
+  <div class="section">
+   <h2>Recent Policy Runs</h2>
+   <div class="handoff-wrap" id="policy-runs"></div>
   </div>
   <div class="section">
    <h2>Agent Suggestions</h2>
@@ -871,6 +881,54 @@ function renderPolicyEvaluation(){
   nodes.push(el("div", "muted", "Read-only evaluation over " + (report.candidateRouted || 0) + " routed candidates: recent cap " + (report.candidateLimit || 0) + " plus " + (report.signalBackfillRouted || 0) + " signal backfills, capped at " + (report.signalBackfillLimitPerSignal || 0) + " per signal type. Routing thresholds are not changed automatically."));
   root.replaceChildren(...nodes);
 }
+function policyRunStatusClass(status){
+  const classes = {
+    recorded: "pass",
+    idempotency_conflict: "fail",
+    all_skipped: "warn",
+    duplicate: "muted",
+    no_signals: "muted"
+  };
+  return classes[status] || "muted";
+}
+function renderPolicyRuns(){
+  const root = qs("#policy-runs");
+  const runs = state.policyRecommendationRuns || [];
+  if (!runs.length) {
+    root.replaceChildren(el("div", "empty", "No policy recommendation runs yet."));
+    return;
+  }
+  const table = el("table");
+  const head = document.createElement("tr");
+  ["Status", "Run", "Recorded At", "Evaluated At", "By", "Limit", "Attempted", "Recorded", "Duplicate", "Conflicts", "Skipped", "Signals"].forEach((h) => head.append(el("th", null, h)));
+  table.append(head);
+  for (const run of runs) {
+    const row = document.createElement("tr");
+    const signals = run.results.map((result) => {
+      const label = policySignalLabels[result.signal] || result.signal;
+      return label + " -> " + (result.suggestionId || result.status);
+    });
+    row.append(
+      cell(run.status, policyRunStatusClass(run.status)),
+      cell(run.id),
+      cell(run.createdAt),
+      cell(run.evaluatedAt),
+      cell(run.createdBy),
+      cell(run.limit),
+      cell(run.attempted),
+      cell(run.recorded),
+      cell(run.duplicate),
+      cell(run.idempotencyConflict),
+      cell(run.skipped),
+      cell(signals.length ? signals.join(", ") : "-")
+    );
+    table.append(row);
+  }
+  root.replaceChildren(
+    table,
+    el("div", "muted", "Showing latest " + runs.length + " policy runs.")
+  );
+}
 const suggestionKindLabels = {
   handoff_summary: "Handoff",
   missing_field_question: "Missing field",
@@ -1108,6 +1166,7 @@ function selectDeal(dealId){
   renderQueue();
   renderRoleQueues();
   renderPolicyEvaluation();
+  renderPolicyRuns();
   renderAgentSuggestions();
   renderDeploymentHandoff();
   void renderDetail();
@@ -1211,6 +1270,7 @@ async function loadState(){
     renderQueue();
     renderRoleQueues();
     renderPolicyEvaluation();
+    renderPolicyRuns();
     renderAgentSuggestions();
     renderExceptions();
     renderDeploymentHandoff();
@@ -1223,6 +1283,8 @@ async function loadState(){
       qs("#kpis").replaceChildren(el("div", "empty", msg));
       qs("#queue").replaceChildren(el("div", "empty", msg));
       qs("#role-queues").replaceChildren(el("div", "empty", msg));
+      qs("#policy-evaluation").replaceChildren(el("div", "empty", msg));
+      qs("#policy-runs").replaceChildren(el("div", "empty", msg));
       qs("#agent-suggestions").replaceChildren(el("div", "empty", msg));
       qs("#exceptions").replaceChildren(el("div", "empty", msg));
       qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
@@ -2593,18 +2655,9 @@ async function handleLocalPolicyRecommendationRun(
     ...(body.data.limit === undefined ? {} : { limit: body.data.limit }),
   };
   const result = await store.recordPolicyEvaluationRecommendations(recommendationInput);
-  if (result.recorded > 0) invalidateStateCache();
-  json(res, 200, {
-    status:
-      result.recorded > 0
-        ? "recorded"
-        : result.duplicate > 0
-          ? "duplicate"
-          : result.idempotencyConflict > 0
-            ? "idempotency_conflict"
-            : "no_signals",
-    ...result,
-  });
+  // Even duplicate/no-signal runs append policy_recommendation_runs rows.
+  invalidateStateCache();
+  json(res, 200, result);
 }
 
 async function handleNotificationRetry(

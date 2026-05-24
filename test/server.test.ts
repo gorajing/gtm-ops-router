@@ -455,6 +455,38 @@ describe("local commercial-state endpoint", () => {
     );
   });
 
+  it("rejects invalid policy recommendation run limits before writing", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const res = await fetch(
+          `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+            },
+            body: JSON.stringify({
+              createdBy: "policy-agent",
+              evaluatedAt: "2026-05-23T13:00:00.000Z",
+              limit: 0,
+            }),
+          },
+        );
+        const body = (await res.json()) as { error: string };
+
+        expect(res.status).toBe(400);
+        expect(body.error).toBe("invalid policy recommendation run request");
+        expect(store.policyRecommendationRuns()).toHaveLength(0);
+      },
+    );
+  });
+
   it("records a routed deal commercial state and makes replay idempotent", async () => {
     await withEnv(
       {
@@ -1398,6 +1430,15 @@ describe("local commercial-state endpoint", () => {
             status: string;
             title: string;
           }>;
+          policyRecommendationRuns: Array<{
+            status: string;
+            attempted: number;
+            recorded: number;
+            duplicate: number;
+            createdBy: string;
+            limit: number;
+            results: Array<{ signal: string; status: string }>;
+          }>;
         };
 
         expect(noSignals.status).toBe(200);
@@ -1441,6 +1482,36 @@ describe("local commercial-state endpoint", () => {
             title: expect.stringContaining("Unblock stalled deployment"),
           }),
         ]);
+        expect(state.policyRecommendationRuns).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              status: "no_signals",
+              attempted: 0,
+              recorded: 0,
+              createdBy: "policy-agent",
+              limit: 5,
+              results: [],
+            }),
+            expect.objectContaining({
+              status: "recorded",
+              attempted: 1,
+              recorded: 1,
+              duplicate: 0,
+              results: [
+                expect.objectContaining({
+                  signal: "human_assisted_stalled",
+                  status: "recorded",
+                }),
+              ],
+            }),
+            expect.objectContaining({
+              status: "duplicate",
+              attempted: 1,
+              recorded: 0,
+              duplicate: 1,
+            }),
+          ]),
+        );
         expect(store.agentSuggestions()).toHaveLength(1);
       },
     );
@@ -2860,6 +2931,8 @@ describe("server dashboard", () => {
 
     const dashboard = await fetch(`${baseUrl}/`).then((r) => r.text());
     expect(dashboard).toContain("Deployment Handoff");
+    expect(dashboard).toContain("Recent Policy Runs");
+    expect(dashboard).toContain("policy-runs");
     expect(dashboard).toContain("Draft Policy Recommendations");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
     expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');

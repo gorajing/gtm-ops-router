@@ -3275,6 +3275,128 @@ describe("Store readiness derivation", () => {
           }),
         }),
       );
+      const policyRuns = store.policyRecommendationRuns(10);
+      expect(policyRuns.map((run) => run.status)).toEqual([
+        "duplicate",
+        "recorded",
+      ]);
+      expect(policyRuns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: expect.stringMatching(/^PRR-/),
+            status: "recorded",
+            createdBy: "policy-agent",
+            evaluatedAt: "2026-05-23T13:00:00.000Z",
+            limit: 5,
+            attempted: 2,
+            recorded: 2,
+            duplicate: 0,
+            results: expect.arrayContaining([
+              expect.objectContaining({
+                signal: "human_assisted_stalled",
+                status: "recorded",
+              }),
+            ]),
+          }),
+          expect.objectContaining({
+            id: expect.stringMatching(/^PRR-/),
+            status: "duplicate",
+            attempted: 2,
+            recorded: 0,
+            duplicate: 2,
+          }),
+        ]),
+      );
+    });
+  });
+
+  it("records no-signal policy recommendation runs for auditability", () => {
+    withTempStore((store) => {
+      const result = store.recordPolicyEvaluationRecommendations({
+        createdBy: "policy-agent",
+        evaluatedAt: "2026-05-23T13:00:00.000Z",
+      });
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          limit: 10,
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+          skipped: 0,
+        }),
+      );
+      expect(store.policyRecommendationRuns()).toEqual([
+        expect.objectContaining({
+          id: result.id,
+          status: "no_signals",
+          createdBy: "policy-agent",
+          evaluatedAt: "2026-05-23T13:00:00.000Z",
+          limit: 10,
+          attempted: 0,
+          results: [],
+        }),
+      ]);
+    });
+  });
+
+  it("marks policy recommendation runs all_skipped when candidates are not writable", () => {
+    withTempStore((store) => {
+      const originalPolicyEvaluation = store.policyEvaluation.bind(store);
+      store.policyEvaluation = (() => ({
+        candidateRouted: 1,
+        candidateLimit: 1,
+        signalBackfillRouted: 0,
+        signalBackfillLimitPerSignal: 0,
+        selfServeExpanded: [
+          {
+            dealId: "D-missing-policy-candidate",
+            company: "Missing Policy Candidate",
+            amount: 42_000,
+            routeKind: "self_serve",
+            sourceChannel: "inbound_form",
+            salesOwner: null,
+            signal: "self_serve_expanded",
+            signalObservedAt: "2026-05-23T12:00:00.000Z",
+            reason: "synthetic stale candidate",
+            lastOutcomeAt: null,
+            arrDeltaUsd: 5_000,
+          },
+        ],
+        humanAssistedRisk: [],
+        sourceChannels: [],
+        flags: [],
+      })) as Store["policyEvaluation"];
+      try {
+        const result = store.recordPolicyEvaluationRecommendations({
+          createdBy: "policy-agent",
+          evaluatedAt: "2026-05-23T13:00:00.000Z",
+          limit: 1,
+        });
+
+        expect(result).toEqual(
+          expect.objectContaining({
+            status: "all_skipped",
+            attempted: 1,
+            recorded: 0,
+            skipped: 1,
+            statusCounts: expect.objectContaining({
+              not_found: 1,
+              not_routed: 0,
+            }),
+          }),
+        );
+        expect(store.policyRecommendationRuns()).toEqual([
+          expect.objectContaining({
+            status: "all_skipped",
+            skipped: 1,
+          }),
+        ]);
+      } finally {
+        store.policyEvaluation =
+          originalPolicyEvaluation as Store["policyEvaluation"];
+      }
     });
   });
 

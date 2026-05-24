@@ -453,12 +453,19 @@ export interface AgentSuggestionRecord {
   decisionReason: string | null;
 }
 
-export type LocalAgentSuggestionWriteStatus =
-  | "recorded"
-  | "duplicate"
-  | "idempotency_conflict"
-  | "not_found"
-  | "not_routed";
+export const LOCAL_AGENT_SUGGESTION_WRITE_STATUSES = [
+  "recorded",
+  "duplicate",
+  "idempotency_conflict",
+  "not_found",
+  "not_routed",
+] as const;
+export const LocalAgentSuggestionWriteStatus = z.enum(
+  LOCAL_AGENT_SUGGESTION_WRITE_STATUSES,
+);
+export type LocalAgentSuggestionWriteStatus = z.infer<
+  typeof LocalAgentSuggestionWriteStatus
+>;
 
 export interface LocalAgentSuggestionWriteResult {
   status: LocalAgentSuggestionWriteStatus;
@@ -486,25 +493,52 @@ export interface PolicyRecommendationRunInput {
   limit?: number;
 }
 
-export interface PolicyRecommendationDraftResult {
-  dealId: string;
-  signal: PolicyEvaluationSignal;
-  sourceEventId: string;
-  status: LocalAgentSuggestionWriteStatus;
-  suggestionId: string | null;
-  title: string;
-}
+export const POLICY_RECOMMENDATION_RUN_STATUSES = [
+  "recorded",
+  "duplicate",
+  "idempotency_conflict",
+  "all_skipped",
+  "no_signals",
+] as const;
+export const PolicyRecommendationRunStatus = z.enum(
+  POLICY_RECOMMENDATION_RUN_STATUSES,
+);
+export type PolicyRecommendationRunStatus = z.infer<
+  typeof PolicyRecommendationRunStatus
+>;
+
+export const PolicyRecommendationRunStatusCounts = z.object(
+  Object.fromEntries(
+    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [
+      status,
+      z.number().int().nonnegative().optional().default(0),
+    ]),
+  ) as Record<
+    LocalAgentSuggestionWriteStatus,
+    z.ZodDefault<z.ZodOptional<z.ZodNumber>>
+  >,
+);
+export type PolicyRecommendationRunStatusCounts = z.infer<
+  typeof PolicyRecommendationRunStatusCounts
+>;
 
 export interface PolicyRecommendationRunResult {
+  id: string;
+  status: PolicyRecommendationRunStatus;
+  createdBy: string;
+  limit: number;
   evaluatedAt: string;
+  createdAt: string;
   attempted: number;
   recorded: number;
   duplicate: number;
   idempotencyConflict: number;
   skipped: number;
-  statusCounts: Record<LocalAgentSuggestionWriteStatus, number>;
+  statusCounts: PolicyRecommendationRunStatusCounts;
   results: PolicyRecommendationDraftResult[];
 }
+
+export type PolicyRecommendationRunRecord = PolicyRecommendationRunResult;
 
 export type Stage =
   | "intake"
@@ -618,11 +652,26 @@ export interface RoleQueueItem {
 
 export type RoleQueues = Record<RoleQueueKind, RoleQueueItem[]>;
 
-export type PolicyEvaluationSignal =
-  | "self_serve_expanded"
-  | "human_assisted_churned"
-  | "human_assisted_stalled"
-  | "human_assisted_ready_not_started";
+export const POLICY_EVALUATION_SIGNALS = [
+  "self_serve_expanded",
+  "human_assisted_churned",
+  "human_assisted_stalled",
+  "human_assisted_ready_not_started",
+] as const;
+export const PolicyEvaluationSignal = z.enum(POLICY_EVALUATION_SIGNALS);
+export type PolicyEvaluationSignal = z.infer<typeof PolicyEvaluationSignal>;
+
+export const PolicyRecommendationDraftResult = z.object({
+  dealId: z.string(),
+  signal: PolicyEvaluationSignal,
+  sourceEventId: z.string(),
+  status: LocalAgentSuggestionWriteStatus,
+  suggestionId: z.string().nullable(),
+  title: z.string(),
+});
+export type PolicyRecommendationDraftResult = z.infer<
+  typeof PolicyRecommendationDraftResult
+>;
 
 export interface PolicyEvaluationDeal {
   dealId: string;

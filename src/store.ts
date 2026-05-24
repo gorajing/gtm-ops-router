@@ -68,8 +68,13 @@ import {
   type PolicyEvaluationDeal,
   type PolicyEvaluationReports,
   type PolicyFlag,
+  PolicyRecommendationDraftResult as PolicyRecommendationDraftResultSchema,
+  type PolicyRecommendationRunRecord,
   type PolicyRecommendationRunInput,
   type PolicyRecommendationRunResult,
+  PolicyRecommendationRunStatus as PolicyRecommendationRunStatusSchema,
+  PolicyRecommendationRunStatusCounts,
+  type PolicyRecommendationRunStatus,
   type SourceChannelPolicySummary,
   type FlagPolicySummary,
   type PreviousDeploymentReadiness,
@@ -131,6 +136,8 @@ const POLICY_CLOSED_WON_STALLED_SLA_HOURS = READINESS_PENDING_SLA_HOURS;
 const POLICY_RECOMMENDATION_VERSION = 1;
 const DEFAULT_POLICY_RECOMMENDATION_LIMIT = 10;
 const MAX_POLICY_RECOMMENDATION_LIMIT = 25;
+const DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 25;
+const MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 100;
 const POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER = 4;
 type NotifiableReadiness = Exclude<DeploymentReadiness, "not_required">;
 type OutcomeMetricRow = {
@@ -737,6 +744,34 @@ const SCHEMA: string[] = [
      ),
      CHECK (decided_at IS NULL OR decided_at >= occurred_at)
    )`,
+  `CREATE TABLE IF NOT EXISTS policy_recommendation_runs (
+     id TEXT PRIMARY KEY,
+     status TEXT NOT NULL,
+     created_by TEXT NOT NULL,
+     evaluated_at TEXT NOT NULL,
+     limit_count INTEGER NOT NULL,
+     attempted INTEGER NOT NULL,
+     recorded INTEGER NOT NULL,
+     duplicate INTEGER NOT NULL,
+     idempotency_conflict INTEGER NOT NULL,
+     skipped INTEGER NOT NULL,
+     status_counts_json TEXT NOT NULL,
+     results_json TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     CHECK (status IN (
+       'recorded',
+       'duplicate',
+       'idempotency_conflict',
+       'all_skipped',
+       'no_signals'
+     )),
+     CHECK (limit_count >= 1),
+     CHECK (attempted >= 0),
+     CHECK (recorded >= 0),
+     CHECK (duplicate >= 0),
+     CHECK (idempotency_conflict >= 0),
+     CHECK (skipped >= 0)
+   )`,
   `CREATE TABLE IF NOT EXISTS deployment_readiness (
      deal_id TEXT PRIMARY KEY,
      readiness TEXT NOT NULL,
@@ -882,6 +917,7 @@ const SCHEMA: string[] = [
   "CREATE INDEX IF NOT EXISTS idx_outcome_rejections_deal ON outcome_rejections(deal_id, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_status ON agent_suggestions(status, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_deal ON agent_suggestions(deal_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
 ];
 
 function percentile(sorted: number[], p: number): number {
@@ -951,6 +987,43 @@ function stableUuidV4(seed: string): string {
   )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+function policyRecommendationRunStatus(counts: {
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+}): PolicyRecommendationRunStatus {
+  // Idempotency conflicts are correctness incidents, so they dominate even
+  // when the same run also recorded useful suggestions; callers still receive
+  // the full count breakdown for operator triage.
+  if (counts.idempotencyConflict > 0) return "idempotency_conflict";
+  if (counts.recorded > 0) return "recorded";
+  if (counts.duplicate > 0) return "duplicate";
+  if (counts.skipped > 0) return "all_skipped";
+  return "no_signals";
+}
+
+function policyRecommendationLimit(value: number | undefined): number {
+  const raw = value ?? DEFAULT_POLICY_RECOMMENDATION_LIMIT;
+  if (!Number.isFinite(raw)) {
+    throw new Error("policy recommendation limit must be finite");
+  }
+  return Math.max(
+    1,
+    Math.min(Math.trunc(raw), MAX_POLICY_RECOMMENDATION_LIMIT),
+  );
+}
+
+function policyRecommendationRunPageLimit(value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new Error("policy recommendation run page limit must be finite");
+  }
+  return Math.max(
+    0,
+    Math.min(Math.trunc(value), MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT),
+  );
+}
+
 function truncateField(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return value.slice(0, Math.max(0, maxLength - 3)).trimEnd() + "...";
@@ -1017,6 +1090,7 @@ function factFreshness(
 
 export class Store {
   private db: DatabaseSyncT;
+  private transactionDepth = 0;
 
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
@@ -1058,6 +1132,7 @@ export class Store {
     this.ensureColumn("external_event_keys", "payload_hash", "TEXT");
     this.ensureExternalEventKeyGuards();
     this.ensureIdempotencyViolationScopes();
+    this.ensurePolicyRecommendationRunStatuses();
     this.backfillExternalNotificationLeases();
     this.backfillDerivedColumns();
     this.backfillSinkColumns();
@@ -1226,8 +1301,96 @@ export class Store {
     });
   }
 
+  private ensurePolicyRecommendationRunStatuses(): void {
+    const row = this.db
+      .prepare(
+        `SELECT sql
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name = 'policy_recommendation_runs'`,
+      )
+      .get() as { sql: string | null } | undefined;
+    const expectedStatuses = [
+      "'recorded'",
+      "'duplicate'",
+      "'idempotency_conflict'",
+      "'all_skipped'",
+      "'no_signals'",
+    ];
+    const tableSql = row?.sql;
+    if (
+      !tableSql ||
+      expectedStatuses.every((status) => tableSql.includes(status))
+    ) {
+      return;
+    }
+
+    // Recreate if an earlier local branch created the CHECK before the final
+    // run-status vocabulary was settled.
+    this.transactionImmediate(() => {
+      this.db
+        .prepare(
+          `CREATE TABLE policy_recommendation_runs_next (
+             id TEXT PRIMARY KEY,
+             status TEXT NOT NULL,
+             created_by TEXT NOT NULL,
+             evaluated_at TEXT NOT NULL,
+             limit_count INTEGER NOT NULL,
+             attempted INTEGER NOT NULL,
+             recorded INTEGER NOT NULL,
+             duplicate INTEGER NOT NULL,
+             idempotency_conflict INTEGER NOT NULL,
+             skipped INTEGER NOT NULL,
+             status_counts_json TEXT NOT NULL,
+             results_json TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             CHECK (status IN (
+               'recorded',
+               'duplicate',
+               'idempotency_conflict',
+               'all_skipped',
+               'no_signals'
+             )),
+             CHECK (limit_count >= 1),
+             CHECK (attempted >= 0),
+             CHECK (recorded >= 0),
+             CHECK (duplicate >= 0),
+             CHECK (idempotency_conflict >= 0),
+             CHECK (skipped >= 0)
+           )`,
+        )
+        .run();
+      this.db
+        .prepare(
+          `INSERT INTO policy_recommendation_runs_next (
+             id, status, created_by, evaluated_at, limit_count, attempted,
+             recorded, duplicate, idempotency_conflict, skipped,
+             status_counts_json, results_json, created_at
+           )
+           SELECT
+             id, status, created_by, evaluated_at, limit_count, attempted,
+             recorded, duplicate, idempotency_conflict, skipped,
+             status_counts_json, results_json, created_at
+           FROM policy_recommendation_runs`,
+        )
+        .run();
+      this.db.prepare("DROP TABLE policy_recommendation_runs").run();
+      this.db
+        .prepare(
+          "ALTER TABLE policy_recommendation_runs_next RENAME TO policy_recommendation_runs",
+        )
+        .run();
+      this.db
+        .prepare(
+          "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
+        )
+        .run();
+    });
+  }
+
   private transaction<T>(fn: () => T): T {
     this.db.prepare("BEGIN").run();
+    this.transactionDepth += 1;
     try {
       const result = fn();
       if (result instanceof Promise) {
@@ -1238,6 +1401,8 @@ export class Store {
     } catch (err) {
       this.db.prepare("ROLLBACK").run();
       throw err;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -1964,6 +2129,7 @@ export class Store {
 
   private transactionImmediate<T>(fn: () => T): T {
     this.db.prepare("BEGIN IMMEDIATE").run();
+    this.transactionDepth += 1;
     try {
       const result = fn();
       if (result instanceof Promise) {
@@ -1974,6 +2140,8 @@ export class Store {
     } catch (err) {
       this.db.prepare("ROLLBACK").run();
       throw err;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -2845,6 +3013,22 @@ export class Store {
     return rows.map((row) => this.agentSuggestionFromRow(row));
   }
 
+  policyRecommendationRuns(
+    limit = DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT,
+  ): PolicyRecommendationRunRecord[] {
+    const boundedLimit = policyRecommendationRunPageLimit(limit);
+    if (boundedLimit === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM policy_recommendation_runs
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(boundedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.policyRecommendationRunFromRow(row));
+  }
+
   nonDemoOutcomeEventCount(
     dealIds: readonly string[],
     demoSourceEventIds: readonly string[],
@@ -3237,6 +3421,21 @@ export class Store {
   recordLocalAgentSuggestion(
     input: LocalAgentSuggestionInput,
   ): LocalAgentSuggestionWriteResult {
+    return this.transactionImmediate(() =>
+      this.recordLocalAgentSuggestionInTransaction(input),
+    );
+  }
+
+  private recordLocalAgentSuggestionInTransaction(
+    input: LocalAgentSuggestionInput,
+  ): LocalAgentSuggestionWriteResult {
+    // Precondition: caller owns the transaction. This lets batch operations
+    // atomically record suggestions and their parent audit row.
+    if (this.transactionDepth === 0) {
+      throw new Error(
+        "recordLocalAgentSuggestionInTransaction requires an active transaction",
+      );
+    }
     assertCanonicalIsoUtc(input.occurredAt, "agent suggestion occurredAt");
     const eventKey = JSON.stringify([
       "agent_suggestion",
@@ -3244,97 +3443,95 @@ export class Store {
       input.sourceEventId,
     ]);
     const payloadHash = sha256Hex(canonicalJson(input));
-    return this.transactionImmediate(() => {
-      const existingKey = this.db
-        .prepare("SELECT payload_hash FROM external_event_keys WHERE key = ?")
-        .get(eventKey) as { payload_hash: string | null } | undefined;
-      if (existingKey) {
-        if (existingKey.payload_hash === payloadHash) {
-          const suggestion = this.agentSuggestionBySourceEvent(input.sourceEventId);
-          if (!suggestion) {
-            throw new Error(
-              "agent suggestion source event was claimed without a suggestion row",
-            );
-          }
-          return this.localAgentSuggestionResult(
-            "duplicate",
-            eventKey,
-            suggestion,
+    const existingKey = this.db
+      .prepare("SELECT payload_hash FROM external_event_keys WHERE key = ?")
+      .get(eventKey) as { payload_hash: string | null } | undefined;
+    if (existingKey) {
+      if (existingKey.payload_hash === payloadHash) {
+        const suggestion = this.agentSuggestionBySourceEvent(input.sourceEventId);
+        if (!suggestion) {
+          throw new Error(
+            "agent suggestion source event was claimed without a suggestion row",
           );
         }
-        this.recordIdempotencyViolation(
-          input.sourceEventId,
-          "agent_suggestion",
-          existingKey.payload_hash ?? "[legacy-null]",
-          payloadHash,
-          "source event id replayed with a different agent suggestion payload",
-          LOCAL_AGENT_SUGGESTION_SOURCE,
-        );
         return this.localAgentSuggestionResult(
-          "idempotency_conflict",
+          "duplicate",
           eventKey,
-          null,
+          suggestion,
         );
       }
-
-      const deal = this.db
-        .prepare("SELECT id, stage FROM deals WHERE id = ?")
-        .get(input.dealId) as { id: string; stage: Stage } | undefined;
-      if (!deal) {
-        return this.localAgentSuggestionResult("not_found", eventKey, null);
-      }
-      if (deal.stage !== "routed") {
-        return this.localAgentSuggestionResult("not_routed", eventKey, null);
-      }
-
-      const now = new Date().toISOString();
-      const suggestionId = `S-${sha256Hex(eventKey).slice(0, 20)}`;
-      this.claimLocalAgentSuggestionEvent(eventKey, payloadHash, now);
-      this.db
-        .prepare(
-          `INSERT INTO agent_suggestions (
-             id, deal_id, kind, status, title, body, rationale, source,
-             source_event_id, source_payload_hash, created_by, occurred_at,
-             created_at
-           )
-           VALUES (?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          suggestionId,
-          input.dealId,
-          input.kind,
-          input.title,
-          input.body,
-          input.rationale,
-          LOCAL_AGENT_SUGGESTION_SOURCE,
-          input.sourceEventId,
-          payloadHash,
-          input.createdBy,
-          input.occurredAt,
-          now,
-        );
-      this.appendEvent(
-        input.dealId,
-        "routed",
-        "routed",
-        "agent_suggestion_proposed",
-        {
-          kind: "agent_suggestion_proposed",
-          source: LOCAL_AGENT_SUGGESTION_SOURCE,
-          eventKey,
-          sourceEventId: input.sourceEventId,
-          suggestionId,
-          suggestionKind: input.kind,
-          createdBy: input.createdBy,
-          occurredAt: input.occurredAt,
-        },
+      this.recordIdempotencyViolation(
+        input.sourceEventId,
+        "agent_suggestion",
+        existingKey.payload_hash ?? "[legacy-null]",
+        payloadHash,
+        "source event id replayed with a different agent suggestion payload",
+        LOCAL_AGENT_SUGGESTION_SOURCE,
       );
       return this.localAgentSuggestionResult(
-        "recorded",
+        "idempotency_conflict",
         eventKey,
-        this.agentSuggestionById(suggestionId),
+        null,
       );
-    });
+    }
+
+    const deal = this.db
+      .prepare("SELECT id, stage FROM deals WHERE id = ?")
+      .get(input.dealId) as { id: string; stage: Stage } | undefined;
+    if (!deal) {
+      return this.localAgentSuggestionResult("not_found", eventKey, null);
+    }
+    if (deal.stage !== "routed") {
+      return this.localAgentSuggestionResult("not_routed", eventKey, null);
+    }
+
+    const now = new Date().toISOString();
+    const suggestionId = `S-${sha256Hex(eventKey).slice(0, 20)}`;
+    this.claimLocalAgentSuggestionEvent(eventKey, payloadHash, now);
+    this.db
+      .prepare(
+        `INSERT INTO agent_suggestions (
+           id, deal_id, kind, status, title, body, rationale, source,
+           source_event_id, source_payload_hash, created_by, occurred_at,
+           created_at
+         )
+         VALUES (?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        suggestionId,
+        input.dealId,
+        input.kind,
+        input.title,
+        input.body,
+        input.rationale,
+        LOCAL_AGENT_SUGGESTION_SOURCE,
+        input.sourceEventId,
+        payloadHash,
+        input.createdBy,
+        input.occurredAt,
+        now,
+      );
+    this.appendEvent(
+      input.dealId,
+      "routed",
+      "routed",
+      "agent_suggestion_proposed",
+      {
+        kind: "agent_suggestion_proposed",
+        source: LOCAL_AGENT_SUGGESTION_SOURCE,
+        eventKey,
+        sourceEventId: input.sourceEventId,
+        suggestionId,
+        suggestionKind: input.kind,
+        createdBy: input.createdBy,
+        occurredAt: input.occurredAt,
+      },
+    );
+    return this.localAgentSuggestionResult(
+      "recorded",
+      eventKey,
+      this.agentSuggestionById(suggestionId),
+    );
   }
 
   recordLocalAgentSuggestionDecision(
@@ -5545,13 +5742,7 @@ export class Store {
     input: PolicyRecommendationRunInput,
   ): PolicyRecommendationRunResult {
     assertCanonicalIsoUtc(input.evaluatedAt, "policy recommendation evaluatedAt");
-    const limit = Math.max(
-      1,
-      Math.min(
-        Math.trunc(input.limit ?? DEFAULT_POLICY_RECOMMENDATION_LIMIT),
-        MAX_POLICY_RECOMMENDATION_LIMIT,
-      ),
-    );
+    const limit = policyRecommendationLimit(input.limit);
     const prefetchLimit = Math.min(
       250,
       Math.max(limit * POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER, limit),
@@ -5561,48 +5752,124 @@ export class Store {
       ...report.humanAssistedRisk,
       ...report.selfServeExpanded,
     ]).slice(0, limit);
-    const results = candidates.map((candidate) => {
-      const suggestionInput: LocalAgentSuggestionInput = {
-        dealId: candidate.dealId,
-        sourceEventId: policyRecommendationSourceEventId(candidate),
-        kind: "policy_change_recommendation",
-        title: policyRecommendationTitle(candidate),
-        body: policyRecommendationBody(candidate),
-        rationale: policyRecommendationRationale(candidate),
+
+    // Audit rows are useful only if they describe exactly the suggestions that
+    // committed, so a hard write error aborts the whole run instead of keeping
+    // partial suggestions with no trustworthy parent record.
+    return this.transactionImmediate(() => {
+      const results = candidates.map((candidate) => {
+        const suggestionInput: LocalAgentSuggestionInput = {
+          dealId: candidate.dealId,
+          sourceEventId: policyRecommendationSourceEventId(candidate),
+          kind: "policy_change_recommendation",
+          title: policyRecommendationTitle(candidate),
+          body: policyRecommendationBody(candidate),
+          rationale: policyRecommendationRationale(candidate),
+          createdBy: input.createdBy,
+          occurredAt: candidate.signalObservedAt,
+        };
+        const result =
+          this.recordLocalAgentSuggestionInTransaction(suggestionInput);
+        return {
+          dealId: candidate.dealId,
+          signal: candidate.signal,
+          sourceEventId: suggestionInput.sourceEventId,
+          status: result.status,
+          suggestionId: result.suggestion?.id ?? null,
+          title: suggestionInput.title,
+        };
+      });
+
+      const statusCounts: Record<LocalAgentSuggestionWriteResult["status"], number> = {
+        recorded: 0,
+        duplicate: 0,
+        idempotency_conflict: 0,
+        not_found: 0,
+        not_routed: 0,
+      };
+      for (const result of results) {
+        statusCounts[result.status] += 1;
+      }
+      const recorded = statusCounts.recorded;
+      const duplicate = statusCounts.duplicate;
+      const idempotencyConflict = statusCounts.idempotency_conflict;
+      const skipped = statusCounts.not_found + statusCounts.not_routed;
+      const status = policyRecommendationRunStatus({
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+      });
+      const createdAt = new Date().toISOString();
+      const runId = `PRR-${randomUUID()}`;
+      const run: PolicyRecommendationRunResult = {
+        id: runId,
+        status,
         createdBy: input.createdBy,
-        occurredAt: candidate.signalObservedAt,
+        limit,
+        evaluatedAt: input.evaluatedAt,
+        createdAt,
+        attempted: results.length,
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+        statusCounts,
+        results,
       };
-      const result = this.recordLocalAgentSuggestion(suggestionInput);
-      return {
-        dealId: candidate.dealId,
-        signal: candidate.signal,
-        sourceEventId: suggestionInput.sourceEventId,
-        status: result.status,
-        suggestionId: result.suggestion?.id ?? null,
-        title: suggestionInput.title,
-      };
+      this.insertPolicyRecommendationRun(run);
+      return run;
     });
+  }
 
-    const statusCounts: Record<LocalAgentSuggestionWriteResult["status"], number> = {
-      recorded: 0,
-      duplicate: 0,
-      idempotency_conflict: 0,
-      not_found: 0,
-      not_routed: 0,
-    };
-    for (const result of results) {
-      statusCounts[result.status] += 1;
-    }
+  private insertPolicyRecommendationRun(run: PolicyRecommendationRunResult): void {
+    this.db
+      .prepare(
+        `INSERT INTO policy_recommendation_runs (
+           id, status, created_by, evaluated_at, limit_count, attempted,
+           recorded, duplicate, idempotency_conflict, skipped,
+           status_counts_json, results_json, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        run.id,
+        run.status,
+        run.createdBy,
+        run.evaluatedAt,
+        run.limit,
+        run.attempted,
+        run.recorded,
+        run.duplicate,
+        run.idempotencyConflict,
+        run.skipped,
+        JSON.stringify(run.statusCounts),
+        JSON.stringify(run.results),
+        run.createdAt,
+      );
+  }
 
+  private policyRecommendationRunFromRow(
+    row: Record<string, unknown>,
+  ): PolicyRecommendationRunRecord {
     return {
-      evaluatedAt: input.evaluatedAt,
-      attempted: results.length,
-      recorded: statusCounts.recorded,
-      duplicate: statusCounts.duplicate,
-      idempotencyConflict: statusCounts.idempotency_conflict,
-      skipped: statusCounts.not_found + statusCounts.not_routed,
-      statusCounts,
-      results,
+      id: String(row.id),
+      status: PolicyRecommendationRunStatusSchema.parse(row.status),
+      createdBy: String(row.created_by),
+      evaluatedAt: String(row.evaluated_at),
+      limit: Number(row.limit_count),
+      createdAt: String(row.created_at),
+      attempted: Number(row.attempted),
+      recorded: Number(row.recorded),
+      duplicate: Number(row.duplicate),
+      idempotencyConflict: Number(row.idempotency_conflict),
+      skipped: Number(row.skipped),
+      statusCounts: PolicyRecommendationRunStatusCounts.parse(
+        JSON.parse(String(row.status_counts_json)),
+      ),
+      results: PolicyRecommendationDraftResultSchema.array().parse(
+        JSON.parse(String(row.results_json)),
+      ),
     };
   }
 
