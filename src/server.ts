@@ -384,6 +384,8 @@ function consoleHtml(sinkLabel: string): string {
  .dialog-body{display:grid;gap:10px;padding:16px}
  .dialog-body h3{margin:0;font-size:15px}
  .dialog-detail{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);overflow-wrap:anywhere}
+ .dialog-caption{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+ .dialog-draft{border:1px solid var(--line);background:var(--soft);border-radius:5px;padding:9px 10px;max-height:160px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
  .queue-wrap{max-height:560px;overflow:auto}.exceptions,.handoff-wrap{max-height:260px;overflow:auto}
  .footer{color:var(--muted);font-size:12px;margin-top:12px}
  @media(max-width:1180px){.layout,.top{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -473,6 +475,9 @@ function consoleHtml(sinkLabel: string): string {
   <h3 id="decision-dialog-title">Decide suggestion</h3>
   <div class="dialog-detail" id="decision-dialog-detail"></div>
   <div class="dialog-detail" id="decision-dialog-meta"></div>
+  <div class="dialog-caption">Draft</div>
+  <div class="dialog-draft" id="decision-dialog-body"></div>
+  <div class="dialog-caption">Rationale</div>
   <div class="dialog-detail" id="decision-dialog-rationale"></div>
   <label>Decision reason<textarea id="decision-dialog-reason" rows="3"></textarea></label>
   <div class="inline-actions">
@@ -988,6 +993,7 @@ function openDecisionDialog(suggestion, decision){
     qs("#decision-dialog-detail").textContent = suggestion.title || "(untitled suggestion)";
     qs("#decision-dialog-meta").textContent =
       (suggestionKindLabels[suggestion.kind] || suggestion.kind) + " | Deal " + suggestion.dealId;
+    qs("#decision-dialog-body").textContent = suggestion.body || "(no draft body)";
     qs("#decision-dialog-rationale").textContent = suggestion.rationale || "(no rationale provided)";
     const reasonField = qs("#decision-dialog-reason");
     reasonField.value = defaultReason;
