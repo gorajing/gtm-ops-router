@@ -504,6 +504,7 @@ function consoleHtml(sinkLabel: string): string {
 const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 const LOCAL_SECRET_STORAGE_KEY = "gtm_ops_router_local_secret";
 const AGENT_SUGGESTION_DRAFT_LIMIT = 10;
+const DEAL_DETAIL_SUGGESTION_LIMIT = 5;
 const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
 let state = null;
@@ -962,6 +963,32 @@ function suggestionDetailCell(suggestion){
   );
   return detail;
 }
+function suggestionActionCell(suggestion){
+  const actionCell = document.createElement("td");
+  const pendingDecision = pendingSuggestionDecisions.has(suggestion.id);
+  if (suggestion.status === "proposed" && pendingDecision) {
+    actionCell.textContent = "Deciding...";
+  } else if (suggestion.status === "proposed") {
+    const actions = el("div", "inline-actions");
+    const accept = el("button", "secondary", "Accept");
+    const reject = el("button", "secondary", "Reject");
+    accept.type = "button";
+    reject.type = "button";
+    accept.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void decideSuggestion(suggestion, "accepted");
+    });
+    reject.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void decideSuggestion(suggestion, "rejected");
+    });
+    actions.append(accept, reject);
+    actionCell.append(actions);
+  } else {
+    actionCell.textContent = "-";
+  }
+  return actionCell;
+}
 function renderAgentSuggestions(){
   const root = qs("#agent-suggestions");
   const rows = state.agentSuggestions || [];
@@ -976,36 +1003,13 @@ function renderAgentSuggestions(){
   for (const suggestion of rows) {
     const row = el("tr", "selectable" + (selectedId && suggestion.dealId === selectedId ? " selected" : ""));
     row.addEventListener("click", () => selectDeal(suggestion.dealId));
-    const actionCell = document.createElement("td");
-    const pendingDecision = pendingSuggestionDecisions.has(suggestion.id);
-    if (suggestion.status === "proposed" && pendingDecision) {
-      actionCell.textContent = "Deciding...";
-    } else if (suggestion.status === "proposed") {
-      const actions = el("div", "inline-actions");
-      const accept = el("button", "secondary", "Accept");
-      const reject = el("button", "secondary", "Reject");
-      accept.type = "button";
-      reject.type = "button";
-      accept.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void decideSuggestion(suggestion, "accepted");
-      });
-      reject.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void decideSuggestion(suggestion, "rejected");
-      });
-      actions.append(accept, reject);
-      actionCell.append(actions);
-    } else {
-      actionCell.textContent = "-";
-    }
     row.append(
       cell(suggestion.status, suggestionStatusClass(suggestion.status)),
       cell(suggestionKindLabels[suggestion.kind] || suggestion.kind),
       cell(suggestion.dealId),
       suggestionDetailCell(suggestion),
       cell(suggestionDecisionText(suggestion)),
-      actionCell
+      suggestionActionCell(suggestion)
     );
     table.append(row);
   }
@@ -1179,6 +1183,46 @@ function renderDeploymentHandoff(){
   }
   root.replaceChildren(table);
 }
+function dealSuggestionSection(dealId){
+  const section = el("div", "section");
+  section.append(el("h2", null, "Agent Suggestions"));
+  const rows = (state.agentSuggestions || [])
+    .filter((suggestion) => suggestion.dealId === dealId)
+    .sort((a, b) => {
+      const aRank = a.status === "proposed" ? 0 : 1;
+      const bRank = b.status === "proposed" ? 0 : 1;
+      if (aRank !== bRank) return aRank - bRank;
+      const aTime = a.status === "proposed" ? a.createdAt : (a.decidedAt || a.createdAt);
+      const bTime = b.status === "proposed" ? b.createdAt : (b.decidedAt || b.createdAt);
+      if (aTime !== bTime) return bTime.localeCompare(aTime);
+      return b.id.localeCompare(a.id);
+    });
+  if (!rows.length) {
+    section.append(el("div", "empty", "No recent agent suggestions for this deal."));
+    return section;
+  }
+  const visibleRows = rows.slice(0, DEAL_DETAIL_SUGGESTION_LIMIT);
+  const table = el("table");
+  const head = document.createElement("tr");
+  ["Status", "Kind", "Suggestion", "Decision", "Action"].forEach((h) => head.append(el("th", null, h)));
+  table.append(head);
+  for (const suggestion of visibleRows) {
+    const row = document.createElement("tr");
+    row.append(
+      cell(suggestion.status, suggestionStatusClass(suggestion.status)),
+      cell(suggestionKindLabels[suggestion.kind] || suggestion.kind),
+      suggestionDetailCell(suggestion),
+      cell(suggestionDecisionText(suggestion)),
+      suggestionActionCell(suggestion)
+    );
+    table.append(row);
+  }
+  section.append(table);
+  if (rows.length > DEAL_DETAIL_SUGGESTION_LIMIT) {
+    section.append(el("div", "muted", "Showing " + visibleRows.length + " of " + rows.length + " recent suggestions for this deal."));
+  }
+  return section;
+}
 function selectDeal(dealId){
   selectedId = dealId;
   renderQueue();
@@ -1263,6 +1307,7 @@ async function renderDetail(){
   } else {
     scoreBox.append(el("div", "empty", "No score notes available."));
   }
+  const suggestions = dealSuggestionSection(detailId);
   const journey = el("div", "section");
   journey.append(el("h2", null, "Deal Journey"));
   const list = el("div", "journey");
@@ -1273,7 +1318,7 @@ async function renderDetail(){
     list.append(el("div", "event", event.from + " -> " + event.to + " | " + event.detail + "\\n" + event.ts));
   }
   journey.append(list);
-  root.replaceChildren(title, scoreBox, journey);
+  root.replaceChildren(title, scoreBox, suggestions, journey);
 }
 async function loadState(){
   const seq = ++stateRequestSeq;

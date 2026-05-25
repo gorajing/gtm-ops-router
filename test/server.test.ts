@@ -2234,6 +2234,10 @@ describe("server dashboard", () => {
     expect(document.text("deployment-handoff")).toContain("Use case unclear");
     expect(document.text("detail")).toContain("Deal Journey");
     expect(document.text("detail")).toContain("agent_suggestion_proposed");
+    expect(document.text("detail")).toContain("Agent Suggestions");
+    expect(document.text("detail")).toContain(
+      "Ask deployment to confirm owner and next milestone.",
+    );
     expect(document.text("health")).toContain("integration mode: test sink");
   });
 
