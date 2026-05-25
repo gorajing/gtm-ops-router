@@ -65,6 +65,16 @@ class FakeConsoleElement {
   open = false;
   focused = false;
   selected = false;
+  dataset: Record<string, string> = new Proxy<Record<string, string>>(
+    {},
+    {
+      set(target, property, value) {
+        if (typeof property !== "string") return true;
+        target[property] = String(value);
+        return true;
+      },
+    },
+  );
   readonly tagName: string;
   readonly children: FakeConsoleChild[] = [];
   private readonly listeners = new Map<string, Set<FakeConsoleEventHandler>>();
@@ -105,6 +115,20 @@ class FakeConsoleElement {
 
   removeEventListener(event: string, handler: FakeConsoleEventHandler): void {
     this.listeners.get(event)?.delete(handler);
+  }
+
+  querySelector(selector: string): FakeConsoleElement | null {
+    if (selector === "[data-deal-suggestion-section='true']") {
+      return findConsoleElement(
+        this,
+        (node) => node.dataset.dealSuggestionSection === "true",
+      );
+    }
+    if (selector.startsWith("#")) {
+      const id = selector.slice(1);
+      return findConsoleElement(this, (node) => node.id === id);
+    }
+    throw new Error(`FakeConsoleElement unsupported selector: ${selector}`);
   }
 
   dispatch(event: string): void {
@@ -175,6 +199,19 @@ class FakeConsoleDocument {
   text(id: string): string {
     return this.elements.get(id)?.innerText ?? "";
   }
+}
+
+function findConsoleElement(
+  root: FakeConsoleElement,
+  predicate: (node: FakeConsoleElement) => boolean,
+): FakeConsoleElement | null {
+  if (predicate(root)) return root;
+  for (const child of root.children) {
+    if (typeof child === "string") continue;
+    const match = findConsoleElement(child, predicate);
+    if (match) return match;
+  }
+  return null;
 }
 
 async function withEnv<T>(
@@ -2153,6 +2190,18 @@ describe("server dashboard", () => {
         ].join(",")} active=${activeFetches} pending=${pendingFetches.size}`,
       );
     };
+    const waitForDashboardText = async (
+      id: string,
+      text: string,
+    ): Promise<void> => {
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (document.text(id).includes(text)) return;
+        await Promise.allSettled([...pendingFetches]);
+        await Promise.resolve();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      throw new Error(`dashboard text ${id} did not include ${text}`);
+    };
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
       unhandledRejections.push(reason);
@@ -2239,6 +2288,28 @@ describe("server dashboard", () => {
       "Ask deployment to confirm owner and next milestone.",
     );
     expect(document.text("health")).toContain("integration mode: test sink");
+
+    const detail = document.querySelector("#detail");
+    if (!detail) throw new Error("detail root missing from fake DOM");
+    const detailSuggestions = detail.querySelector(
+      "[data-deal-suggestion-section='true']",
+    );
+    if (!detailSuggestions) throw new Error("detail suggestions section missing");
+    const detailAccept = findConsoleElement(
+      detailSuggestions,
+      (node) => node.tagName === "BUTTON" && node.textContent === "Accept",
+    );
+    if (!detailAccept) throw new Error("detail accept button missing");
+    detailAccept.dispatch("click");
+    await waitForDashboardText("detail", "Deciding...");
+    const dialog = document.querySelector("#decision-dialog");
+    if (!dialog) throw new Error("decision dialog missing from fake DOM");
+    expect(dialog.open).toBe(true);
+    dialog.close("cancel");
+    await waitForExpectedDashboardFetches();
+    await waitForDashboardText("detail", "Accept");
+    expect(document.text("detail")).not.toContain("Deciding...");
+    expect(unhandledRejections).toEqual([]);
   });
 
   it("exposes deployment readiness rows and counters in state and metrics", async () => {

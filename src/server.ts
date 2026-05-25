@@ -1015,6 +1015,35 @@ function renderAgentSuggestions(){
   }
   root.replaceChildren(table);
 }
+function renderSelectedDealSuggestions(){
+  const detail = qs("#detail");
+  const section = detail?.querySelector("[data-deal-suggestion-section='true']");
+  if (!state || selectedId == null || !section || section.dataset.dealId !== String(selectedId)) return;
+  populateDealSuggestionSection(section, selectedId);
+}
+// Local fallback only patches the suggestion rows the operator just touched.
+// Other dashboard sections stay on the last full /state payload until refresh.
+function applySuggestionDecisionResult(result, expectedSuggestionId){
+  if (!state || !result || !result.suggestion) return false;
+  if (result.suggestion.id !== expectedSuggestionId) {
+    console.warn("agent suggestion decision response id mismatch", result.suggestion.id, expectedSuggestionId);
+    return false;
+  }
+  const rows = state.agentSuggestions || [];
+  const index = rows.findIndex((row) => row.id === result.suggestion.id);
+  if (index < 0) return false;
+  state.agentSuggestions = [
+    ...rows.slice(0, index),
+    result.suggestion,
+    ...rows.slice(index + 1),
+  ];
+  return true;
+}
+function renderSuggestionSurfaces(options){
+  if (!state) return;
+  renderAgentSuggestions();
+  if (!options || options.detail !== false) renderSelectedDealSuggestions();
+}
 async function draftPolicyRecommendations(){
   const button = qs("#draft-policy-btn");
   if (!button) {
@@ -1094,12 +1123,19 @@ async function decideSuggestion(suggestion, decision){
   // Lock BEFORE opening the async dialog. The old window.prompt was blocking,
   // so it could not be re-entered; <dialog> is async, so without an early lock
   // a rapid second click would re-open the modal and leak a close listener.
-  // The lock is released in finally on cancel, success, or any error.
+  // The lock spans the dialog and decision POST. If the POST response can be
+  // patched into local state, the patched render releases the lock before the
+  // reload; otherwise the finally block releases and repaints.
+  let lockReleased = false;
+  let refreshStatus = null;
   pendingSuggestionDecisions.add(suggestion.id);
   try {
-    renderAgentSuggestions();
+    renderSuggestionSurfaces();
     const reason = await openDecisionDialog(suggestion, decision);
-    if (reason === null) return; // operator cancelled; finally releases the lock
+    if (reason === null) {
+      setAgentActionStatus("Decision cancelled.", "muted");
+      return; // operator cancelled; finally releases the lock
+    }
     setAgentActionStatus(decision + " " + suggestion.id + "...", "muted");
     const result = await fetchJson("/agent-suggestions/" + encodeURIComponent(suggestion.id) + "/decision", {
       method: "POST",
@@ -1115,12 +1151,25 @@ async function decideSuggestion(suggestion, decision){
       "Suggestion " + result.status + ": " + suggestion.title,
       result.status === "recorded" ? "pass" : "warn"
     );
-    await loadState();
+    const patchedBeforeReload = applySuggestionDecisionResult(result, suggestion.id);
+    if (patchedBeforeReload) {
+      pendingSuggestionDecisions.delete(suggestion.id);
+      lockReleased = true;
+      renderSuggestionSurfaces();
+    }
+    refreshStatus = await loadState();
+    if (refreshStatus === "error") {
+      const localState = patchedBeforeReload
+        ? "local suggestion row was patched"
+        : (state ? "local suggestion row was not found" : "local state is unavailable");
+      setAgentActionStatus("Decision " + result.status + " for " + suggestion.title + ". Refresh failed after the decision response; " + localState + ". Refresh to sync the rest of the dashboard.", "warn");
+    }
   } catch (err) {
     setAgentActionStatus(String(err), "fail");
   } finally {
-    pendingSuggestionDecisions.delete(suggestion.id);
-    if (state) renderAgentSuggestions();
+    const releasedHere = !lockReleased;
+    if (releasedHere) pendingSuggestionDecisions.delete(suggestion.id);
+    if (releasedHere || refreshStatus !== "ok") renderSuggestionSurfaces();
   }
 }
 const blockerLabels = {
@@ -1183,9 +1232,8 @@ function renderDeploymentHandoff(){
   }
   root.replaceChildren(table);
 }
-function dealSuggestionSection(dealId){
-  const section = el("div", "section");
-  section.append(el("h2", null, "Agent Suggestions"));
+function populateDealSuggestionSection(section, dealId){
+  section.replaceChildren(el("h2", null, "Agent Suggestions"));
   const rows = (state.agentSuggestions || [])
     .filter((suggestion) => suggestion.dealId === dealId)
     .sort((a, b) => {
@@ -1199,7 +1247,7 @@ function dealSuggestionSection(dealId){
     });
   if (!rows.length) {
     section.append(el("div", "empty", "No recent agent suggestions for this deal."));
-    return section;
+    return;
   }
   const visibleRows = rows.slice(0, DEAL_DETAIL_SUGGESTION_LIMIT);
   const table = el("table");
@@ -1221,6 +1269,12 @@ function dealSuggestionSection(dealId){
   if (rows.length > DEAL_DETAIL_SUGGESTION_LIMIT) {
     section.append(el("div", "muted", "Showing " + visibleRows.length + " of " + rows.length + " recent suggestions for this deal."));
   }
+}
+function dealSuggestionSection(dealId){
+  const section = el("div", "section");
+  section.dataset.dealSuggestionSection = "true";
+  section.dataset.dealId = String(dealId);
+  populateDealSuggestionSection(section, dealId);
   return section;
 }
 function selectDeal(dealId){
@@ -1231,11 +1285,23 @@ function selectDeal(dealId){
   renderPolicyRuns();
   renderAgentSuggestions();
   renderDeploymentHandoff();
-  void renderDetail();
+  scheduleRenderDetail();
 }
-async function renderDetail(){
+function scheduleRenderDetail(){
   const seq = ++detailRequestSeq;
+  void renderDetail(seq).catch((err) => {
+    if (seq !== detailRequestSeq) return;
+    console.error(err);
+    qs("#detail")?.replaceChildren(el("div", "empty", "Could not render deal detail: " + String(err)));
+  });
+}
+async function renderDetail(seq){
   const root = qs("#detail");
+  if (!root) return;
+  if (!state) {
+    root.replaceChildren(el("div", "empty", "State is not loaded."));
+    return;
+  }
   const selected = selectedId ? state.queue.find((d) => d.id === selectedId) : null;
   const readiness = selectedId
     ? (state.deploymentReadiness || []).find((row) => row.dealId === selectedId)
@@ -1324,7 +1390,7 @@ async function loadState(){
   const seq = ++stateRequestSeq;
   try {
     const next = await fetchJson("/state");
-    if (seq !== stateRequestSeq) return;
+    if (seq !== stateRequestSeq) return "stale";
     state = next;
     if (!selectedId && state.queue[0]) selectedId = state.queue[0].id;
     if (!selectedId && (state.deploymentReadiness || [])[0]) selectedId = state.deploymentReadiness[0].dealId;
@@ -1334,12 +1400,13 @@ async function loadState(){
     renderRoleQueues();
     renderPolicyEvaluation();
     renderPolicyRuns();
-    renderAgentSuggestions();
+    renderSuggestionSurfaces({ detail: false });
     renderExceptions();
     renderDeploymentHandoff();
-    void renderDetail();
+    scheduleRenderDetail();
+    return "ok";
   } catch (err) {
-    if (seq !== stateRequestSeq) return;
+    if (seq !== stateRequestSeq) return "stale";
     qs("#last-refresh").textContent = "state error " + new Date().toLocaleTimeString();
     if (!state) {
       const msg = "State load failed: " + String(err);
@@ -1353,6 +1420,7 @@ async function loadState(){
       qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
       qs("#detail").replaceChildren(el("div", "empty", msg));
     }
+    return "error";
   }
 }
 async function loadHealth(){
