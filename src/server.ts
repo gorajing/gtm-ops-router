@@ -9,6 +9,7 @@
  *   POST /preview             validate/enrich/score/route without persistence
  *   POST /deals               ingest one deal or an array
  *   POST /webhooks/hubspot    receive HubSpot dealstage changes
+ *   POST /enrichment-observations local-only manual company evidence
  *   POST /agent-suggestions   local-only agent draft ledger
  *   POST /agent-suggestions/:id/decision
  *   POST /agent-suggestion-runs/policy-evaluation
@@ -24,7 +25,10 @@ import {
 } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { MAX_FUTURE_SKEW_MS } from "./constants.js";
+import {
+  ENRICHMENT_FACT_MAX_AGE_DAYS,
+  MAX_FUTURE_SKEW_MS,
+} from "./constants.js";
 import { enrichmentSubjectKey, type Enricher } from "./enrich.js";
 import {
   type FallbackNotificationHandler,
@@ -70,6 +74,7 @@ const STATE_EVENTS_PER_DEAL = 50;
 const STATE_ROLE_QUEUE_LIMIT = 50;
 const STATE_AGENT_SUGGESTION_LIMIT = 50;
 const STATE_POLICY_RECOMMENDATION_RUN_LIMIT = 25;
+const MAX_MANUAL_ENRICHMENT_EMPLOYEES = 10_000_000;
 // Local-console cache only. Mutating handlers invalidate after successful
 // processing; failed writes do not thrash the dashboard read cache.
 const STATE_CACHE_TTL_MS = 1_000;
@@ -145,6 +150,7 @@ interface ConsoleDeal {
   scoreNotes?: string[];
   sourceChannel?: string;
   statedNeed?: string;
+  enrichmentSubjectKey?: string;
   enrichmentFacts?: EnrichedSubjectFacts | null;
   quarantine?: Quarantine;
 }
@@ -187,6 +193,12 @@ function resolveCanonicalTimestamp(
   return date ? { value: resolved, date } : null;
 }
 
+function defaultEnrichmentExpiresAt(observedAt: string): string {
+  return new Date(
+    Date.parse(observedAt) + ENRICHMENT_FACT_MAX_AGE_DAYS * 86_400_000,
+  ).toISOString();
+}
+
 const CanonicalUtcIsoString = z.string().refine(
   (value) => parseCanonicalOccurredAt(value) !== null,
   "must be a canonical UTC ISO timestamp",
@@ -219,6 +231,24 @@ const LocalOutcomeBody = z.object({
   operator: z.string().trim().min(1).max(120),
   arrDeltaUsd: z.number().int("arrDeltaUsd must be an integer").optional(),
   reasonCategory: OutcomeReasonCategory.optional(),
+});
+
+const LocalEnrichmentObservationBody = z.object({
+  subjectKey: z.string().trim().toLowerCase().min(1).max(253),
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  observedAt: CanonicalUtcIsoString.optional(),
+  expiresAt: CanonicalUtcIsoString.optional(),
+  employees: z
+    .number()
+    .int("employees must be an integer")
+    .min(1)
+    .max(MAX_MANUAL_ENRICHMENT_EMPLOYEES),
+  industry: z.string().trim().min(1).max(120),
+  techSignals: z.array(z.string().trim().min(1).max(80)).max(20).optional(),
+  regulated: z.boolean(),
+  confidence: z.number().min(0).max(1),
+  operator: z.string().trim().min(1).max(120),
+  note: z.string().trim().max(500).optional(),
 });
 
 const LocalAgentSuggestionBody = z.object({
@@ -301,6 +331,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
       scoreNotes: deal.score.notes,
       sourceChannel: deal.sourceChannel,
       statedNeed: deal.statedNeed,
+      enrichmentSubjectKey: subjectKey,
       enrichmentFacts: enrichmentFacts.get(subjectKey) ?? null,
     };
   });
@@ -522,11 +553,15 @@ function consoleHtml(sinkLabel: string): string {
 </div>
 <script>
 const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+// Local-only convenience: sessionStorage avoids persisting the write secret
+// across browser restarts, but this console still must stay localhost-only.
 const LOCAL_SECRET_STORAGE_KEY = "gtm_ops_router_local_secret";
 const AGENT_SUGGESTION_DRAFT_LIMIT = 10;
 const DEAL_DETAIL_SUGGESTION_LIMIT = 5;
 const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
+const MANUAL_ENRICHMENT_MAX_EMPLOYEES = ${MAX_MANUAL_ENRICHMENT_EMPLOYEES};
+const MANUAL_ENRICHMENT_RETRY_WINDOW_MS = 5 * 60 * 1000;
 let state = null;
 let selectedId = null;
 let agentSuggestionFilter = "open";
@@ -574,6 +609,217 @@ function displayBoolean(value){
   if (value === true) return "yes";
   if (value === false) return "no";
   return "-";
+}
+function compareCodepoint(left, right){
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function labeledInput(labelText, input){
+  const label = document.createElement("label");
+  label.append(labelText, input);
+  return label;
+}
+function manualEnrichmentForm(deal, facts){
+  const subjectKey = String(deal?.enrichmentSubjectKey || facts?.subjectKey || "").trim().toLowerCase();
+  const wrap = document.createElement("form");
+  wrap.className = "mini-form";
+  wrap.append(el("div", "muted", "Manual company evidence"));
+  if (!subjectKey) {
+    wrap.append(el("div", "empty", "No company subject key available for this deal."));
+    return wrap;
+  }
+  const employees = document.createElement("input");
+  employees.id = "manual-enrichment-employees";
+  employees.type = "number";
+  employees.min = "1";
+  employees.max = String(MANUAL_ENRICHMENT_MAX_EMPLOYEES);
+  employees.step = "1";
+  employees.required = true;
+  employees.value = facts?.employees ?? "";
+
+  const industry = document.createElement("input");
+  industry.id = "manual-enrichment-industry";
+  industry.required = true;
+  industry.maxLength = 120;
+  industry.value = facts?.industry || "";
+
+  const techSignals = document.createElement("input");
+  techSignals.id = "manual-enrichment-tech";
+  techSignals.placeholder = "manual_ops, voice_ai_eval";
+  techSignals.maxLength = 1800;
+  techSignals.value = Array.isArray(facts?.techSignals) ? facts.techSignals.join(", ") : "";
+
+  const regulated = document.createElement("select");
+  regulated.id = "manual-enrichment-regulated";
+  regulated.required = true;
+  const unknownRegulated = document.createElement("option");
+  unknownRegulated.value = "";
+  unknownRegulated.textContent = "Select...";
+  unknownRegulated.disabled = true;
+  unknownRegulated.hidden = true;
+  regulated.append(unknownRegulated);
+  for (const [value, label] of [["false", "No"], ["true", "Yes"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    regulated.append(option);
+  }
+  regulated.value = facts?.regulated === true ? "true" : facts?.regulated === false ? "false" : "";
+
+  const confidence = document.createElement("input");
+  confidence.id = "manual-enrichment-confidence";
+  confidence.type = "number";
+  confidence.min = "0";
+  confidence.max = "1";
+  confidence.step = "0.01";
+  confidence.required = true;
+  confidence.value = facts?.confidence ?? "0.85";
+
+  const note = document.createElement("textarea");
+  note.id = "manual-enrichment-note";
+  note.rows = 2;
+  note.maxLength = 500;
+  note.placeholder = "What changed or where did this come from?";
+
+  const operator = document.createElement("input");
+  operator.id = "manual-enrichment-operator";
+  operator.required = true;
+  operator.maxLength = 120;
+  operator.value = OPERATOR_PRINCIPAL;
+
+  const status = el("div", "action-status");
+  status.id = "enrichment-action-status";
+  const button = el("button", "secondary", "Record Manual Evidence");
+  button.type = "submit";
+  let pendingSubmission = null;
+  wrap.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (button.disabled) return;
+    if (typeof wrap.reportValidity === "function" && !wrap.reportValidity()) return;
+    const parsedEmployees = Number(employees.value);
+    const parsedConfidence = Number(confidence.value);
+    const normalizedIndustry = industry.value.trim();
+    const normalizedOperator = operator.value.trim();
+    const normalizedNote = note.value.trim();
+    const signals = [
+      ...new Set(
+        techSignals.value
+          .split(",")
+          .map((signal) => signal.trim())
+          .filter((signal) => signal.length > 0),
+      ),
+    ].sort(compareCodepoint);
+    if (
+      !employees.value.trim() ||
+      !Number.isInteger(parsedEmployees) ||
+      parsedEmployees < 1 ||
+      parsedEmployees > MANUAL_ENRICHMENT_MAX_EMPLOYEES
+    ) {
+      status.className = "action-status fail";
+      status.textContent = "Employees must be a positive integer up to " + MANUAL_ENRICHMENT_MAX_EMPLOYEES.toLocaleString("en-US") + ".";
+      return;
+    }
+    if (!Number.isFinite(parsedConfidence) || parsedConfidence < 0 || parsedConfidence > 1) {
+      status.className = "action-status fail";
+      status.textContent = "Confidence must be between 0 and 1.";
+      return;
+    }
+    if (!normalizedIndustry) {
+      status.className = "action-status fail";
+      status.textContent = "Industry is required.";
+      return;
+    }
+    if (!normalizedOperator) {
+      status.className = "action-status fail";
+      status.textContent = "Operator is required.";
+      return;
+    }
+    if (signals.length > 20 || signals.some((signal) => signal.length > 80)) {
+      status.className = "action-status fail";
+      status.textContent = "Use at most 20 tech signals, 80 characters each.";
+      return;
+    }
+    if (regulated.value !== "true" && regulated.value !== "false") {
+      status.className = "action-status fail";
+      status.textContent = "Regulated must be selected.";
+      return;
+    }
+    const submissionKey = JSON.stringify({
+      subjectKey,
+      employees: parsedEmployees,
+      industry: normalizedIndustry,
+      techSignals: signals,
+      regulated: regulated.value === "true",
+      confidence: parsedConfidence,
+      operator: normalizedOperator,
+      note: normalizedNote || null
+    });
+    const nowMs = Date.now();
+    const shouldReusePendingSubmission =
+      pendingSubmission?.key === submissionKey &&
+      nowMs - pendingSubmission.createdAtMs <= MANUAL_ENRICHMENT_RETRY_WINDOW_MS;
+    if (!shouldReusePendingSubmission) {
+      const observedAt = new Date().toISOString();
+      pendingSubmission = {
+        key: submissionKey,
+        observedAt,
+        createdAtMs: nowMs,
+        sourceEventId: deterministicUuidV4("manual-enrichment:" + observedAt + ":" + submissionKey)
+      };
+    }
+    const payload = {
+      subjectKey,
+      sourceEventId: pendingSubmission.sourceEventId,
+      observedAt: pendingSubmission.observedAt,
+      employees: parsedEmployees,
+      industry: normalizedIndustry,
+      techSignals: signals,
+      regulated: regulated.value === "true",
+      confidence: parsedConfidence,
+      operator: normalizedOperator,
+      note: normalizedNote || undefined
+    };
+    button.disabled = true;
+    status.className = "action-status";
+    status.textContent = "Recording manual evidence...";
+    try {
+      const result = await fetchJson("/enrichment-observations", {
+        method: "POST",
+        headers: localWriteHeaders(),
+        body: JSON.stringify(payload)
+      });
+      status.className = "action-status pass";
+      status.textContent = "Evidence " + result.status + ". Refreshing state...";
+      pendingSubmission = null;
+      await loadState();
+    } catch (err) {
+      status.className = "action-status fail";
+      status.textContent = String(err);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  const firstRow = el("div", "two");
+  firstRow.append(
+    labeledInput("Employees", employees),
+    labeledInput("Industry", industry)
+  );
+  const secondRow = el("div", "two");
+  secondRow.append(
+    labeledInput("Regulated", regulated),
+    labeledInput("Confidence", confidence)
+  );
+  wrap.append(
+    el("div", "muted", "Subject " + subjectKey),
+    firstRow,
+    secondRow,
+    labeledInput("Operator", operator),
+    labeledInput("Tech Signals", techSignals),
+    labeledInput("Evidence Note", note),
+    button,
+    status
+  );
+  return wrap;
 }
 function payloadFromForm(){
   const fd = new FormData(qs("#deal-form"));
@@ -1519,6 +1765,7 @@ async function renderDetail(seq){
   } else {
     enrichmentBox.append(el("div", "empty", "No projected enrichment facts available."));
   }
+  enrichmentBox.append(manualEnrichmentForm(deal, facts));
   const suggestions = dealSuggestionSection(detailId);
   const journey = el("div", "section");
   journey.append(el("h2", null, "Deal Journey"));
@@ -2527,6 +2774,39 @@ function localOutcomeStatusCode(
   return 200;
 }
 
+function localEnrichmentObservationMutated(
+  status: ReturnType<Store["recordProviderObservation"]>["status"],
+): boolean {
+  switch (status) {
+    case "recorded":
+    case "refreshed":
+      return true;
+    case "duplicate":
+    case "idempotency_conflict":
+      return false;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localEnrichmentObservationStatusCode(
+  status: ReturnType<Store["recordProviderObservation"]>["status"],
+): number {
+  switch (status) {
+    case "recorded":
+      return 201;
+    case "idempotency_conflict":
+      return 409;
+    case "duplicate":
+    case "refreshed":
+      // Refreshed is a state-changing replay for store callers that opt into
+      // refreshOnDuplicate; this local endpoint does not currently set it.
+      return 200;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
 function localAgentSuggestionMutated(
   status: ReturnType<Store["recordLocalAgentSuggestion"]>["status"],
 ): boolean {
@@ -2739,6 +3019,114 @@ async function handleLocalOutcome(
   });
   if (localOutcomeMutated(result.status)) invalidateStateCache();
   json(res, localOutcomeStatusCode(result.status), result);
+}
+
+async function handleLocalEnrichmentObservation(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/enrichment-observations")) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalEnrichmentObservationBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid enrichment-observation request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const observedAt = resolveCanonicalTimestamp(body.data.observedAt);
+  if (!observedAt) {
+    json(res, 400, {
+      error: "observedAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (observedAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `observedAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  const expiresAt =
+    body.data.expiresAt === undefined
+      ? defaultEnrichmentExpiresAt(observedAt.value)
+      : body.data.expiresAt;
+  const expiresAtTimestamp = resolveCanonicalTimestamp(expiresAt);
+  if (!expiresAtTimestamp) {
+    json(res, 400, {
+      error: "expiresAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  const expiryDeltaMs = expiresAtTimestamp.date.getTime() - observedAt.date.getTime();
+  if (expiryDeltaMs <= 0) {
+    json(res, 422, {
+      error: "expiresAt must be after observedAt",
+    });
+    return;
+  }
+  if (expiresAtTimestamp.date.getTime() <= Date.now()) {
+    json(res, 422, {
+      error: "expiresAt must be in the future",
+    });
+    return;
+  }
+  if (expiryDeltaMs > ENRICHMENT_FACT_MAX_AGE_DAYS * 86_400_000) {
+    json(res, 422, {
+      error: `expiresAt cannot be more than ${ENRICHMENT_FACT_MAX_AGE_DAYS} days after observedAt`,
+    });
+    return;
+  }
+  const techSignals = [...new Set(body.data.techSignals ?? [])].sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  const normalizedPayload = {
+    employees: body.data.employees,
+    industry: body.data.industry,
+    techSignals,
+    regulated: body.data.regulated,
+    confidence: body.data.confidence,
+  };
+  const result = store.recordProviderObservation({
+    subjectType: "company",
+    subjectKey: body.data.subjectKey,
+    provider: "manual",
+    sourceEventId: body.data.sourceEventId,
+    observedAt: observedAt.value,
+    expiresAt,
+    confidence: body.data.confidence,
+    rawPayload: {
+      source: "operator_console",
+      // Local-console attribution only; write authorization is the local
+      // endpoint secret plus loopback guard, not this operator string.
+      operator: body.data.operator,
+      note: body.data.note ?? null,
+      normalizedPayload,
+    },
+    normalizedPayload,
+  });
+  if (localEnrichmentObservationMutated(result.status)) invalidateStateCache();
+  json(res, localEnrichmentObservationStatusCode(result.status), result);
 }
 
 async function handleLocalAgentSuggestion(
@@ -3241,6 +3629,16 @@ async function handleRequest(
   }
   if (method === "POST" && url === "/outcomes") {
     await handleLocalOutcome(req, res, store, localWrites, invalidateStateCache);
+    return;
+  }
+  if (method === "POST" && url === "/enrichment-observations") {
+    await handleLocalEnrichmentObservation(
+      req,
+      res,
+      store,
+      localWrites,
+      invalidateStateCache,
+    );
     return;
   }
   if (method === "POST" && url === "/agent-suggestions") {

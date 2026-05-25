@@ -378,6 +378,11 @@ describe("local commercial-state endpoint", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
+      const enrichment = await fetch(`${baseUrl}/enrichment-observations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
       const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -394,6 +399,7 @@ describe("local commercial-state endpoint", () => {
       const commercialBody = (await commercial.json()) as { error: string };
       const deploymentBody = (await deployment.json()) as { error: string };
       const outcomeBody = (await outcome.json()) as { error: string };
+      const enrichmentBody = (await enrichment.json()) as { error: string };
       const suggestionBody = (await suggestion.json()) as { error: string };
       const suggestionDecisionBody = (await suggestionDecision.json()) as {
         error: string;
@@ -402,11 +408,13 @@ describe("local commercial-state endpoint", () => {
       expect(commercial.status).toBe(404);
       expect(deployment.status).toBe(404);
       expect(outcome.status).toBe(404);
+      expect(enrichment.status).toBe(404);
       expect(suggestion.status).toBe(404);
       expect(suggestionDecision.status).toBe(404);
       expect(commercialBody.error).toBe("not found");
       expect(deploymentBody.error).toBe("not found");
       expect(outcomeBody.error).toBe("not found");
+      expect(enrichmentBody.error).toBe("not found");
       expect(suggestionBody.error).toBe("not found");
       expect(suggestionDecisionBody.error).toBe("not found");
     });
@@ -523,6 +531,11 @@ describe("local commercial-state endpoint", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
+        const enrichment = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
         const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -538,6 +551,7 @@ describe("local commercial-state endpoint", () => {
         );
         expect(deployment.status).toBe(401);
         expect(outcome.status).toBe(401);
+        expect(enrichment.status).toBe(401);
         expect(suggestion.status).toBe(401);
         expect(recommendationRun.status).toBe(401);
       },
@@ -594,6 +608,21 @@ describe("local commercial-state endpoint", () => {
             operator: "DS",
           }),
         });
+        const enrichment = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "local-state.example",
+            sourceEventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            observedAt: "2026-05-21T12:00:00Z",
+            employees: 1200,
+            industry: "logistics",
+            techSignals: ["manual_ops"],
+            regulated: true,
+            confidence: 0.9,
+            operator: "DS",
+          }),
+        });
         const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
           method: "POST",
           headers,
@@ -623,10 +652,12 @@ describe("local commercial-state endpoint", () => {
         expect(commercial.status).toBe(400);
         expect(deployment.status).toBe(400);
         expect(outcome.status).toBe(400);
+        expect(enrichment.status).toBe(400);
         expect(suggestion.status).toBe(400);
         expect(recommendationRun.status).toBe(400);
         expect(store.deploymentFacts(dealId)).toBeNull();
         expect(store.outcomeEvents(dealId)).toHaveLength(0);
+        expect(store.providerObservations("company", "local-state.example")).toHaveLength(0);
         expect(store.agentSuggestions()).toHaveLength(0);
       },
     );
@@ -726,6 +757,189 @@ describe("local commercial-state endpoint", () => {
         expect(store.commercialState(dealId)?.sourceEventId).toBe(
           body.sourceEventId,
         );
+      },
+    );
+  });
+
+  it("records manual enrichment evidence and refreshes the console projection", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const dealId = await postRoutedDeal(baseUrl);
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const body = {
+          subjectKey: "Example.COM",
+          sourceEventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          employees: 1500,
+          industry: "freight brokerage",
+          techSignals: ["voice_ai_eval", "manual_ops"],
+          regulated: false,
+          confidence: 0.99,
+          operator: "operator-console",
+          note: "Confirmed from account research.",
+        };
+
+        const first = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const firstBody = (await first.json()) as {
+          status: string;
+          facts: {
+            employees: number;
+            sourceProvider: string;
+            techSignals: string[];
+          };
+        };
+        const second = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const secondBody = (await second.json()) as { status: string };
+        const conflict = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...body, employees: 1501 }),
+        });
+        const conflictBody = (await conflict.json()) as { status: string };
+
+        expect(first.status).toBe(201);
+        expect(firstBody.status).toBe("recorded");
+        expect(firstBody.facts).toEqual(
+          expect.objectContaining({
+            subjectKey: "example.com",
+            employees: 1500,
+            techSignals: ["manual_ops", "voice_ai_eval"],
+            sourceProvider: "manual",
+          }),
+        );
+        expect(second.status).toBe(200);
+        expect(secondBody.status).toBe("duplicate");
+        expect(conflict.status).toBe(409);
+        expect(conflictBody.status).toBe("idempotency_conflict");
+        expect(store.enrichedSubjectFacts("company", "example.com")).toEqual(
+          expect.objectContaining({
+            employees: 1500,
+            sourceProvider: "manual",
+          }),
+        );
+
+        const state = (await fetch(`${baseUrl}/state`).then((res) =>
+          res.json(),
+        )) as {
+          queue: Array<{
+            id: string;
+            enrichmentSubjectKey?: string;
+            enrichmentFacts?: { employees: number; sourceProvider: string };
+          }>;
+        };
+        const row = state.queue.find((item) => item.id === dealId);
+        expect(row?.enrichmentSubjectKey).toBe("example.com");
+        expect(row?.enrichmentFacts).toEqual(
+          expect.objectContaining({
+            employees: 1500,
+            sourceProvider: "manual",
+          }),
+        );
+      },
+    );
+  });
+
+  it("rejects unsafe manual enrichment evidence before writing", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const baseBody = {
+          subjectKey: "unsafe.example",
+          sourceEventId: "12121212-1212-4212-8212-121212121212",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          employees: 1,
+          industry: "logistics",
+          techSignals: ["manual_ops"],
+          regulated: true,
+          confidence: 0.9,
+          operator: "operator-console",
+        };
+
+        const zeroEmployees = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...baseBody, employees: 0 }),
+        });
+        const impossibleEmployees = await fetch(
+          `${baseUrl}/enrichment-observations`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              ...baseBody,
+              sourceEventId: "23232323-2323-4232-8232-232323232323",
+              employees: 10_000_001,
+            }),
+          },
+        );
+        const unboundedExpiry = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...baseBody,
+            sourceEventId: "34343434-3434-4434-8434-343434343434",
+            expiresAt: null,
+          }),
+        });
+        const expiredFact = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...baseBody,
+            sourceEventId: "56565656-5656-4656-8656-565656565656",
+            expiresAt: "2026-05-21T11:59:59.999Z",
+          }),
+        });
+        const bornExpiredFact = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...baseBody,
+            sourceEventId: "67676767-6767-4767-8767-676767676767",
+            observedAt: "2020-05-21T12:00:00.000Z",
+          }),
+        });
+        const tooLongExpiry = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...baseBody,
+            sourceEventId: "78787878-7878-4878-8878-787878787878",
+            expiresAt: "2026-07-01T12:00:00.000Z",
+          }),
+        });
+
+        expect(zeroEmployees.status).toBe(400);
+        expect(impossibleEmployees.status).toBe(400);
+        expect(unboundedExpiry.status).toBe(400);
+        expect(expiredFact.status).toBe(422);
+        expect(bornExpiredFact.status).toBe(422);
+        expect(tooLongExpiry.status).toBe(422);
+        expect(store.providerObservations("company", "unsafe.example")).toHaveLength(0);
       },
     );
   });
@@ -3720,6 +3934,8 @@ describe("server dashboard", () => {
     expect(dashboard).toContain("Recent Policy Runs");
     expect(dashboard).toContain("policy-runs");
     expect(dashboard).toContain("Draft Policy Recommendations");
+    expect(dashboard).toContain("Manual company evidence");
+    expect(dashboard).toContain("/enrichment-observations");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
     expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
     expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");
