@@ -385,6 +385,9 @@ function consoleHtml(sinkLabel: string): string {
  .empty{border:1px dashed var(--line);border-radius:5px;padding:14px;color:var(--muted);background:#fff}
  .mini-form{display:grid;gap:8px;margin-bottom:10px}.inline-actions{display:flex;gap:6px;flex-wrap:wrap}.inline-actions button{padding:5px 8px;font-size:12px}
  .action-status{font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);min-height:18px}
+ .suggestion-title{font-weight:700;color:var(--ink);margin-bottom:5px;overflow-wrap:anywhere}
+ .suggestion-body{border:1px solid var(--line);background:var(--soft);border-radius:5px;padding:7px 8px;margin:5px 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);max-height:120px;overflow:auto;user-select:text}
+ .suggestion-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere;margin-top:4px}
  dialog{border:1px solid var(--line);border-radius:8px;padding:0;max-width:460px;width:calc(100% - 32px);color:var(--ink);box-shadow:0 14px 44px rgba(20,24,32,.24)}
  dialog::backdrop{background:rgba(20,24,32,.42)}
  .dialog-body{display:grid;gap:10px;padding:16px}
@@ -940,6 +943,25 @@ function suggestionStatusClass(status){
   if (status === "rejected") return "muted";
   return "warn";
 }
+function suggestionAuditText(suggestion){
+  return "By " + (suggestion.createdBy || "-") + " at " + (suggestion.createdAt || "-") + " | Source " + (suggestion.source || "-") + " / " + (suggestion.sourceEventId || "-");
+}
+function suggestionDecisionText(suggestion){
+  if (suggestion.status === "proposed") return "awaiting human";
+  if (!suggestion.decidedBy && !suggestion.decidedAt && !suggestion.decisionReason) return "-";
+  return (suggestion.decidedBy || "-") + " at " + (suggestion.decidedAt || "-") + ": " + (suggestion.decisionReason || "-");
+}
+function suggestionDetailCell(suggestion){
+  const detail = document.createElement("td");
+  const body = el("div", "suggestion-body", suggestion.body || "(no draft body)");
+  detail.append(
+    el("div", "suggestion-title", suggestion.title || "(untitled suggestion)"),
+    body,
+    el("div", "suggestion-meta", "Rationale: " + (suggestion.rationale || "-")),
+    el("div", "suggestion-meta", suggestionAuditText(suggestion))
+  );
+  return detail;
+}
 function renderAgentSuggestions(){
   const root = qs("#agent-suggestions");
   const rows = state.agentSuggestions || [];
@@ -949,14 +971,11 @@ function renderAgentSuggestions(){
   }
   const table = el("table");
   const head = document.createElement("tr");
-  ["Status", "Kind", "Deal", "Title", "Rationale", "Decision", "Action"].forEach((h) => head.append(el("th", null, h)));
+  ["Status", "Kind", "Deal", "Suggestion", "Decision", "Action"].forEach((h) => head.append(el("th", null, h)));
   table.append(head);
   for (const suggestion of rows) {
     const row = el("tr", "selectable" + (selectedId && suggestion.dealId === selectedId ? " selected" : ""));
     row.addEventListener("click", () => selectDeal(suggestion.dealId));
-    const decision = suggestion.status === "proposed"
-      ? "awaiting human"
-      : (suggestion.decidedBy || "-") + ": " + (suggestion.decisionReason || "-");
     const actionCell = document.createElement("td");
     const pendingDecision = pendingSuggestionDecisions.has(suggestion.id);
     if (suggestion.status === "proposed" && pendingDecision) {
@@ -984,9 +1003,8 @@ function renderAgentSuggestions(){
       cell(suggestion.status, suggestionStatusClass(suggestion.status)),
       cell(suggestionKindLabels[suggestion.kind] || suggestion.kind),
       cell(suggestion.dealId),
-      cell(suggestion.title),
-      cell(suggestion.rationale),
-      cell(decision),
+      suggestionDetailCell(suggestion),
+      cell(suggestionDecisionText(suggestion)),
       actionCell
     );
     table.append(row);

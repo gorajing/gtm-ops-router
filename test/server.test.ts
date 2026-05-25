@@ -2225,6 +2225,12 @@ describe("server dashboard", () => {
     expect(document.text("agent-suggestions")).toContain(
       "Unblock stalled deployment",
     );
+    expect(document.text("agent-suggestions")).toContain(
+      "Ask deployment to confirm owner and next milestone.",
+    );
+    expect(document.text("agent-suggestions")).toMatch(
+      /Source local_agent \/ [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/,
+    );
     expect(document.text("deployment-handoff")).toContain("Use case unclear");
     expect(document.text("detail")).toContain("Deal Journey");
     expect(document.text("detail")).toContain("agent_suggestion_proposed");
