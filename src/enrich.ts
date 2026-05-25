@@ -11,10 +11,14 @@
  * gap — it silently corrupts every downstream score. Unresolved -> quarantine.
  */
 
-import type { Deal, Enrichment } from "./types.js";
+import type {
+  Deal,
+  Enrichment,
+  ProviderObservationProvider,
+} from "./types.js";
 
 export interface Enricher {
-  readonly name: string;
+  readonly name: ProviderObservationProvider;
   enrich(deal: Deal): Promise<Enrichment | null>;
 }
 
@@ -23,7 +27,7 @@ export interface FixtureEntry extends Enrichment {
   simulate?: "timeout";
 }
 
-function key(deal: Deal): string {
+export function enrichmentSubjectKey(deal: Deal): string {
   return (deal.domain ?? deal.company).trim().toLowerCase();
 }
 
@@ -32,10 +36,12 @@ export class FixtureEnricher implements Enricher {
   constructor(private readonly fixture: Record<string, FixtureEntry>) {}
 
   async enrich(deal: Deal): Promise<Enrichment | null> {
-    const entry = this.fixture[key(deal)];
+    const entry = this.fixture[enrichmentSubjectKey(deal)];
     if (!entry) return null; // unknown company — caller quarantines, no guess
     if (entry.simulate === "timeout") {
-      throw new Error(`enrichment provider timeout for ${key(deal)}`);
+      throw new Error(
+        `enrichment provider timeout for ${enrichmentSubjectKey(deal)}`,
+      );
     }
     return {
       employees: entry.employees,

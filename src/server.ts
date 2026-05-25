@@ -25,7 +25,7 @@ import {
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { MAX_FUTURE_SKEW_MS } from "./constants.js";
-import type { Enricher } from "./enrich.js";
+import { enrichmentSubjectKey, type Enricher } from "./enrich.js";
 import {
   type FallbackNotificationHandler,
   type HubSpotStageChangeHandler,
@@ -43,6 +43,7 @@ import type { Store } from "./store.js";
 import type {
   AgentSuggestionRecord,
   DeploymentReadinessState,
+  EnrichedSubjectFacts,
   CommercialTerminalDriftAlertClaim,
   CommercialTerminalDriftAlertRetryCandidate,
   Metrics,
@@ -144,6 +145,7 @@ interface ConsoleDeal {
   scoreNotes?: string[];
   sourceChannel?: string;
   statedNeed?: string;
+  enrichmentFacts?: EnrichedSubjectFacts | null;
   quarantine?: Quarantine;
 }
 
@@ -266,11 +268,25 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
   const metrics = store.metrics();
   const routed = store.routedRecords(STATE_DEAL_LIMIT);
   const quarantined = store.quarantinedRecords(STATE_EXCEPTION_LIMIT);
+  const now = new Date().toISOString();
+  const routedWithSubjectKeys = routed.map((record) => ({
+    record,
+    subjectKey: enrichmentSubjectKey(record.deal),
+  }));
+  // Enrichment projections are company-only in this slice, and the console
+  // attaches projected facts only to routed deals. Quarantined deal triage will
+  // need a ledger-observation view rather than this routed read model.
+  const enrichmentFacts = store.enrichedSubjectFactsForKeys(
+    "company",
+    [...new Set(routedWithSubjectKeys.map(({ subjectKey }) => subjectKey))],
+    now,
+  );
   const quarantineLabels = store.intakeLabels(
     quarantined.map((record) => record.quarantine.dealId),
   );
 
-  const routedQueue: ConsoleDeal[] = routed.map(({ deal, updatedAt, sinkStatus, externalStage }) => {
+  const routedQueue: ConsoleDeal[] = routedWithSubjectKeys.map(({ record, subjectKey }) => {
+    const { deal, updatedAt, sinkStatus, externalStage } = record;
     return {
       id: deal.id,
       company: deal.company,
@@ -285,6 +301,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
       scoreNotes: deal.score.notes,
       sourceChannel: deal.sourceChannel,
       statedNeed: deal.statedNeed,
+      enrichmentFacts: enrichmentFacts.get(subjectKey) ?? null,
     };
   });
   const quarantinedQueue: ConsoleDeal[] = quarantined.map(
@@ -307,7 +324,6 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     b.updatedAt.localeCompare(a.updatedAt),
   );
   const integrity = store.integrity();
-  const now = new Date().toISOString();
   const deploymentReadiness = store.deploymentReadinessRecords(now);
 
   return {
@@ -539,6 +555,25 @@ function fmtHours(value){
   if (value == null) return "n/a";
   if (value > 0 && value < 0.01) return "<0.01h";
   return Number(Number(value).toFixed(2)).toString() + "h";
+}
+function displayValue(value){
+  if (value === null || value === undefined || value === "") return "-";
+  return String(value);
+}
+function displayNumber(value, digits){
+  if (value === null || value === undefined || value === "") return "-";
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(digits) : "-";
+}
+function displayInteger(value){
+  if (value === null || value === undefined || value === "") return "-";
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.round(parsed).toLocaleString("en-US") : "-";
+}
+function displayBoolean(value){
+  if (value === true) return "yes";
+  if (value === false) return "no";
+  return "-";
 }
 function payloadFromForm(){
   const fd = new FormData(qs("#deal-form"));
@@ -1462,6 +1497,28 @@ async function renderDetail(seq){
   } else {
     scoreBox.append(el("div", "empty", "No score notes available."));
   }
+  const enrichmentBox = el("div", "section");
+  enrichmentBox.append(el("h2", null, "Enrichment Evidence"));
+  const facts = deal?.enrichmentFacts || null;
+  if (facts) {
+    const factRows = el("div", "kv");
+    const factFields = [
+      ["Provider", displayValue(facts.sourceProvider)],
+      ["Confidence", displayNumber(facts.confidence, 2)],
+      ["Freshness", displayValue(facts.freshnessStatus)],
+      ["Industry", displayValue(facts.industry)],
+      ["Employees", displayInteger(facts.employees)],
+      ["Regulated", displayBoolean(facts.regulated)],
+      ["Tech Signals", Array.isArray(facts.techSignals) ? facts.techSignals.join(", ") || "-" : "-"],
+      ["Observed", displayValue(facts.observedAt)],
+      ["Expires", displayValue(facts.expiresAt)],
+      ["Observation", displayValue(facts.sourceObservationId)]
+    ];
+    for (const [k, v] of factFields) factRows.append(el("div", null, k), el("div", null, v));
+    enrichmentBox.append(factRows);
+  } else {
+    enrichmentBox.append(el("div", "empty", "No projected enrichment facts available."));
+  }
   const suggestions = dealSuggestionSection(detailId);
   const journey = el("div", "section");
   journey.append(el("h2", null, "Deal Journey"));
@@ -1473,7 +1530,7 @@ async function renderDetail(seq){
     list.append(el("div", "event", event.from + " -> " + event.to + " | " + event.detail + "\\n" + event.ts));
   }
   journey.append(list);
-  root.replaceChildren(title, scoreBox, suggestions, journey);
+  root.replaceChildren(title, scoreBox, enrichmentBox, suggestions, journey);
 }
 async function loadState(){
   const seq = ++stateRequestSeq;

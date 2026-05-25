@@ -16,6 +16,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync as DatabaseSyncT } from "node:sqlite";
 import {
   DEPLOYMENT_FACT_MAX_AGE_DAYS,
+  ENRICHMENT_FACT_MAX_AGE_DAYS,
+  ENRICHMENT_FACT_MIN_CONFIDENCE,
   FALLBACK_NOTIFICATION_MAX_ATTEMPTS,
   FALLBACK_NOTIFICATION_LEASE_MS,
   READINESS_NOTIFICATION_MAX_ATTEMPTS,
@@ -26,6 +28,7 @@ import {
   TERMINAL_DRIFT_NOTIFICATION_MAX_ATTEMPTS,
   TERMINAL_TIE_WINDOW_MS,
 } from "./constants.js";
+import { enrichmentSubjectKey } from "./enrich.js";
 import type { IntegrationConfigBundle } from "./integrations.js";
 import {
   AGENT_SUGGESTION_KINDS,
@@ -33,7 +36,14 @@ import {
   AgentSuggestionKind,
   AgentSuggestionStatus,
   DEPLOYMENT_BLOCKERS,
+  PROVIDER_OBSERVATION_PROVIDERS,
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+  ProviderObservationProvider,
+  ProviderObservationSubjectType,
   SOURCE_CHANNELS,
+  type Deal,
+  type Enrichment,
+  type EnrichedSubjectFacts,
   type AgentSuggestionDecision,
   type AgentSuggestionRecord,
   type CommercialTerminalDriftAlertClaim,
@@ -75,6 +85,9 @@ import {
   PolicyRecommendationRunStatus as PolicyRecommendationRunStatusSchema,
   PolicyRecommendationRunStatusCounts,
   type PolicyRecommendationRunStatus,
+  type ProviderObservationInput,
+  type ProviderObservationRecord,
+  type ProviderObservationWriteResult,
   type SourceChannelPolicySummary,
   type FlagPolicySummary,
   type PreviousDeploymentReadiness,
@@ -123,6 +136,7 @@ const LOCAL_DEPLOYMENT_FACTS_SOURCE = "local";
 const LOCAL_OUTCOME_SOURCE = "local";
 const LOCAL_AGENT_SUGGESTION_SOURCE = "local_agent";
 const SELF_REPORTED_OPERATOR_SOURCE = "self_reported";
+const PROVIDER_OBSERVATION_ID_PREFIX = "PO";
 const DAY_MS = 86_400_000;
 const CANONICAL_ISO_UTC =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -139,6 +153,17 @@ const MAX_POLICY_RECOMMENDATION_LIMIT = 25;
 const DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 25;
 const MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 100;
 const POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER = 4;
+function sqlStringList(values: readonly string[]): string {
+  return values
+    .map((value) => `'${value.replaceAll("'", "''")}'`)
+    .join(", ");
+}
+const PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL = sqlStringList(
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+);
+const PROVIDER_OBSERVATION_PROVIDER_SQL = sqlStringList(
+  PROVIDER_OBSERVATION_PROVIDERS,
+);
 type NotifiableReadiness = Exclude<DeploymentReadiness, "not_required">;
 type OutcomeMetricRow = {
   id: string;
@@ -204,6 +229,27 @@ function newestTimestamp(
 
 function humanOwner(deal: RoutedDeal): string | null {
   return deal.route.kind === "human_assisted" ? deal.route.salesOwner : null;
+}
+
+function enrichmentObservationSourceEventId(
+  provider: ProviderObservationProvider,
+  subjectKey: string,
+  enrichment: Enrichment,
+): string {
+  return stableUuidV4(
+    canonicalJson({
+      kind: "provider_observation",
+      provider,
+      subjectKey,
+      enrichment,
+    }),
+  );
+}
+
+function enrichmentFactExpiresAt(observedAt: string): string {
+  return new Date(
+    Date.parse(observedAt) + ENRICHMENT_FACT_MAX_AGE_DAYS * DAY_MS,
+  ).toISOString();
 }
 
 function actionRolePriority(deal: RoutedDeal): RoleQueuePriority {
@@ -691,6 +737,47 @@ const SCHEMA: string[] = [
        )
      )
    )`,
+  `CREATE TABLE IF NOT EXISTS provider_observations (
+     id TEXT PRIMARY KEY,
+     subject_type TEXT NOT NULL,
+     subject_key TEXT NOT NULL,
+     provider TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     source_payload_hash TEXT NOT NULL,
+     observed_at TEXT NOT NULL,
+     expires_at TEXT,
+     confidence REAL NOT NULL,
+     raw_payload_json TEXT NOT NULL,
+     normalized_payload_json TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     UNIQUE (provider, source_event_id),
+     CHECK (subject_type IN (${PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL})),
+     CHECK (provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+     CHECK (confidence >= 0 AND confidence <= 1)
+   )`,
+  // Projection is company-only for now. Contact/deal observations remain in
+  // provider_observations until their fact schemas are explicit.
+  `CREATE TABLE IF NOT EXISTS enriched_subject_facts (
+     subject_type TEXT NOT NULL,
+     subject_key TEXT NOT NULL,
+     employees INTEGER NOT NULL,
+     industry TEXT NOT NULL,
+     tech_signals_json TEXT NOT NULL,
+     regulated INTEGER NOT NULL,
+     confidence REAL NOT NULL,
+     source_provider TEXT NOT NULL,
+     source_observation_id TEXT NOT NULL,
+     observed_at TEXT NOT NULL,
+     expires_at TEXT,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (subject_type, subject_key),
+     CHECK (subject_type IN ('company')),
+     CHECK (source_provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+     CHECK (employees >= 0),
+     CHECK (regulated IN (0, 1)),
+     CHECK (confidence >= 0 AND confidence <= 1),
+     CHECK (json_valid(tech_signals_json))
+   )`,
   `CREATE TABLE IF NOT EXISTS agent_suggestions (
      id TEXT PRIMARY KEY,
      deal_id TEXT NOT NULL,
@@ -881,6 +968,7 @@ const SCHEMA: string[] = [
          'commercial_state',
          'deployment_facts',
          'outcome',
+         'provider_observation',
          'agent_suggestion',
          'agent_suggestion_decision'
        ) OR
@@ -915,6 +1003,8 @@ const SCHEMA: string[] = [
   "CREATE INDEX IF NOT EXISTS idx_outcome_events_outcome ON outcome_events(outcome, occurred_at)",
   "CREATE INDEX IF NOT EXISTS idx_outcome_rejections_kind ON outcome_rejections(rejection_kind, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_outcome_rejections_deal ON outcome_rejections(deal_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_provider_observations_subject ON provider_observations(subject_type, subject_key, observed_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_provider_observations_provider ON provider_observations(provider, observed_at DESC)",
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_status ON agent_suggestions(status, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_deal ON agent_suggestions(deal_id, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
@@ -1054,6 +1144,122 @@ function parseSecondaryBlockerCodes(
     throw new Error("stored secondary blocker codes must be a non-empty array");
   }
   return parsed.map(deploymentBlockerFromValue);
+}
+
+function parseEnrichmentPayload(value: unknown): Enrichment {
+  if (!value || typeof value !== "object") {
+    throw new Error("enrichment payload must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const employees = record.employees;
+  const industry = record.industry;
+  const techSignals = record.techSignals;
+  const regulated = record.regulated;
+  const confidence = record.confidence;
+  if (
+    typeof employees !== "number" ||
+    !Number.isInteger(employees) ||
+    employees < 0
+  ) {
+    throw new Error("enrichment employees must be a non-negative integer");
+  }
+  if (typeof industry !== "string" || industry.trim().length === 0) {
+    throw new Error("enrichment industry must be non-empty");
+  }
+  if (
+    !Array.isArray(techSignals) ||
+    !techSignals.every(
+      (signal) => typeof signal === "string" && signal.trim().length > 0,
+    )
+  ) {
+    throw new Error("enrichment techSignals must be non-empty strings");
+  }
+  if (typeof regulated !== "boolean") {
+    throw new Error("enrichment regulated must be boolean");
+  }
+  if (
+    typeof confidence !== "number" ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    throw new Error("enrichment confidence must be between 0 and 1");
+  }
+  return {
+    employees,
+    industry,
+    techSignals: [...techSignals].sort(),
+    regulated,
+    confidence,
+  };
+}
+
+function providerObservationId(
+  provider: ProviderObservationProvider,
+  sourceEventId: string,
+): string {
+  return `${PROVIDER_OBSERVATION_ID_PREFIX}-${sha256Hex(
+    canonicalJson(["provider_observation", provider, sourceEventId]),
+  ).slice(0, 32)}`;
+}
+
+function assertJsonPayload(value: unknown, field: string): string {
+  const json = canonicalJson(value);
+  if (json === undefined) {
+    throw new Error(`${field} must be JSON-serializable`);
+  }
+  return json;
+}
+
+function providerObservationPayloadHash(input: ProviderObservationInput): string {
+  return sha256Hex(
+    canonicalJson({
+      subjectType: input.subjectType,
+      subjectKey: input.subjectKey,
+      provider: input.provider,
+      sourceEventId: input.sourceEventId,
+      confidence: input.confidence,
+      rawPayload: input.rawPayload,
+      normalizedPayload: input.normalizedPayload,
+    }),
+  );
+}
+
+function companyProviderObservationInput(
+  input: ProviderObservationInput,
+): ProviderObservationInput & { subjectType: "company" } {
+  if (input.subjectType !== "company") {
+    throw new Error("only company provider observations can project enrichment facts");
+  }
+  return {
+    ...input,
+    subjectType: input.subjectType,
+  };
+}
+
+function enrichmentFactFreshnessStatus(
+  expiresAt: string | null,
+  now: string,
+): "fresh" | "stale" {
+  if (expiresAt === null) return "fresh";
+  const expiresAtMs = Date.parse(expiresAt);
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs)) {
+    throw new Error("enrichment fact freshness timestamps must be valid dates");
+  }
+  // Expiration is a closed boundary: at the exact expiry instant, callers should
+  // stop trusting the fact without a fresh observation.
+  return expiresAtMs <= nowMs ? "stale" : "fresh";
+}
+
+function expiryExtends(
+  incoming: string | null,
+  existing: string | null,
+): boolean {
+  if (incoming === existing) return false;
+  if (incoming === null) return true;
+  if (existing === null) return false;
+  return incoming > existing;
 }
 
 function factFreshness(
@@ -1235,6 +1441,7 @@ export class Store {
       !row?.sql ||
       this.idempotencyViolationsAllowScopes(row.sql, [
         "outcome",
+        "provider_observation",
         "agent_suggestion",
         "agent_suggestion_decision",
       ])
@@ -1260,6 +1467,7 @@ export class Store {
                  'commercial_state',
                  'deployment_facts',
                  'outcome',
+                 'provider_observation',
                  'agent_suggestion',
                  'agent_suggestion_decision'
                ) OR
@@ -2258,6 +2466,455 @@ export class Store {
         reason,
         new Date().toISOString(),
       );
+  }
+
+  recordEnrichmentObservation(
+    deal: Deal,
+    provider: ProviderObservationProvider,
+    enrichment: Enrichment,
+  ): ProviderObservationWriteResult {
+    const observedAt = new Date().toISOString();
+    const normalizedPayload = parseEnrichmentPayload(enrichment);
+    const subjectKey = enrichmentSubjectKey(deal);
+    return this.recordProviderObservation({
+      subjectType: "company",
+      subjectKey,
+      provider,
+      sourceEventId: enrichmentObservationSourceEventId(
+        provider,
+        subjectKey,
+        normalizedPayload,
+      ),
+      observedAt,
+      expiresAt: enrichmentFactExpiresAt(observedAt),
+      confidence: normalizedPayload.confidence,
+      rawPayload: {
+        provider,
+        subjectKey,
+        enrichment: normalizedPayload,
+      },
+      normalizedPayload,
+      refreshOnDuplicate: true,
+    });
+  }
+
+  recordProviderObservation(
+    input: ProviderObservationInput,
+  ): ProviderObservationWriteResult {
+    ProviderObservationSubjectType.parse(input.subjectType);
+    ProviderObservationProvider.parse(input.provider);
+    if (input.subjectKey.trim().length === 0) {
+      throw new Error("provider observation subjectKey must be non-empty");
+    }
+    if (input.sourceEventId.trim().length === 0) {
+      throw new Error("provider observation sourceEventId must be non-empty");
+    }
+    assertCanonicalIsoUtc(input.observedAt, "provider observation observedAt");
+    if (input.expiresAt !== null) {
+      assertCanonicalIsoUtc(input.expiresAt, "provider observation expiresAt");
+    }
+    if (
+      !Number.isFinite(input.confidence) ||
+      input.confidence < 0 ||
+      input.confidence > 1
+    ) {
+      throw new Error("provider observation confidence must be between 0 and 1");
+    }
+    const normalizedPayload = parseEnrichmentPayload(input.normalizedPayload);
+    if (input.confidence !== normalizedPayload.confidence) {
+      throw new Error(
+        "provider observation confidence must match normalizedPayload.confidence",
+      );
+    }
+    const normalizedInput = { ...input, normalizedPayload };
+    const rawPayloadJson = assertJsonPayload(
+      input.rawPayload,
+      "provider observation rawPayload",
+    );
+    const normalizedPayloadJson = assertJsonPayload(
+      normalizedPayload,
+      "provider observation normalizedPayload",
+    );
+    const payloadHash = providerObservationPayloadHash(normalizedInput);
+
+    return this.transactionImmediate(() => {
+      const now = new Date().toISOString();
+      const existing = this.providerObservationBySourceEvent(
+        input.provider,
+        input.sourceEventId,
+      );
+      if (existing) {
+        if (existing.sourcePayloadHash === payloadHash) {
+          // Duplicate refreshes are liveness extensions, not TTL corrections:
+          // shorter-lived upstream corrections should arrive as new observations.
+          const refreshExtendsExpiry = expiryExtends(
+            input.expiresAt,
+            existing.expiresAt,
+          );
+          const expiryNotShrunk =
+            input.expiresAt === existing.expiresAt || refreshExtendsExpiry;
+          const duplicateAdvanced =
+            input.observedAt > existing.observedAt || refreshExtendsExpiry;
+          const shouldRefreshDuplicate =
+            input.refreshOnDuplicate === true &&
+            input.observedAt >= existing.observedAt &&
+            expiryNotShrunk &&
+            duplicateAdvanced;
+          if (shouldRefreshDuplicate) {
+            this.db
+              .prepare(
+                `UPDATE provider_observations
+                 SET observed_at = ?,
+                     expires_at = ?
+                 WHERE id = ?`,
+              )
+              .run(input.observedAt, input.expiresAt, existing.id);
+            const refreshed = this.providerObservationById(existing.id);
+            if (!refreshed) {
+              throw new Error("provider observation refresh did not return a stored row");
+            }
+            const currentFacts = this.enrichedFactsForObservationSubject(
+              input.subjectType,
+              input.subjectKey,
+            );
+            const companyInput = companyProviderObservationInput(normalizedInput);
+            const facts =
+              currentFacts === null || currentFacts.sourceObservationId === refreshed.id
+                ? this.projectEnrichedSubjectFacts(
+                    companyInput,
+                    refreshed,
+                    now,
+                    normalizedPayload,
+                  )
+                : currentFacts;
+            return {
+              status: "refreshed",
+              observation: refreshed,
+              facts,
+            };
+          }
+          return {
+            status: "duplicate",
+            observation: existing,
+            facts: this.enrichedFactsForObservationSubject(
+              input.subjectType,
+              input.subjectKey,
+            ),
+          };
+        }
+        this.recordIdempotencyViolation(
+          input.sourceEventId,
+          "provider_observation",
+          existing.sourcePayloadHash,
+          payloadHash,
+          "provider observation source event id replayed with a different payload",
+          input.provider,
+        );
+        return {
+          status: "idempotency_conflict",
+          observation: null,
+          facts: this.enrichedFactsForObservationSubject(
+            input.subjectType,
+            input.subjectKey,
+          ),
+        };
+      }
+
+      const id = providerObservationId(input.provider, input.sourceEventId);
+      this.db
+        .prepare(
+          `INSERT INTO provider_observations (
+             id, subject_type, subject_key, provider, source_event_id,
+             source_payload_hash, observed_at, expires_at, confidence,
+             raw_payload_json, normalized_payload_json, created_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.subjectType,
+          input.subjectKey,
+          input.provider,
+          input.sourceEventId,
+          payloadHash,
+          input.observedAt,
+          input.expiresAt,
+          input.confidence,
+          rawPayloadJson,
+          normalizedPayloadJson,
+          now,
+        );
+
+      const observation = this.providerObservationById(id);
+      if (!observation) {
+        throw new Error("provider observation insert did not return a stored row");
+      }
+      const companyInput = companyProviderObservationInput(input);
+      const facts =
+        input.subjectType === "company"
+          ? this.projectEnrichedSubjectFacts(
+              companyInput,
+              observation,
+              now,
+              normalizedPayload,
+            )
+          : null;
+      return { status: "recorded", observation, facts };
+    });
+  }
+
+  providerObservations(
+    subjectType?: ProviderObservationSubjectType,
+    subjectKey?: string,
+    limit = 50,
+  ): ProviderObservationRecord[] {
+    const cappedLimit = Math.max(1, Math.min(Math.trunc(limit), 250));
+    if (subjectType !== undefined) ProviderObservationSubjectType.parse(subjectType);
+    if (subjectKey !== undefined && subjectKey.trim().length === 0) {
+      throw new Error("provider observation subjectKey must be non-empty");
+    }
+
+    const where: string[] = [];
+    const params: string[] = [];
+    if (subjectType !== undefined) {
+      where.push("subject_type = ?");
+      params.push(subjectType);
+    }
+    if (subjectKey !== undefined) {
+      where.push("subject_key = ?");
+      params.push(subjectKey);
+    }
+    const sql = [
+      "SELECT * FROM provider_observations",
+      where.length ? `WHERE ${where.join(" AND ")}` : "",
+      "ORDER BY observed_at DESC, id DESC",
+      "LIMIT ?",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const rows = this.db
+      .prepare(sql)
+      .all(...params, cappedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.providerObservationFromRow(row));
+  }
+
+  enrichedSubjectFacts(
+    subjectType: "company",
+    subjectKey: string,
+    now = new Date().toISOString(),
+  ): EnrichedSubjectFacts | null {
+    if (subjectType !== "company") {
+      throw new Error("only company enrichment facts are supported");
+    }
+    if (subjectKey.trim().length === 0) {
+      throw new Error("enrichment facts subjectKey must be non-empty");
+    }
+    assertCanonicalIsoUtc(now, "enrichment facts reference time");
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM enriched_subject_facts
+         WHERE subject_type = ?
+           AND subject_key = ?`,
+      )
+      .get(subjectType, subjectKey) as Record<string, unknown> | undefined;
+    return row ? this.enrichedSubjectFactsFromRow(row, now) : null;
+  }
+
+  /**
+   * Returns only currently projected company facts. Missing keys may mean no
+   * observation ever existed, or that observations exist only below the
+   * projection confidence threshold; callers that need that distinction should
+   * read providerObservations().
+   */
+  enrichedSubjectFactsForKeys(
+    subjectType: "company",
+    subjectKeys: readonly string[],
+    now = new Date().toISOString(),
+  ): Map<string, EnrichedSubjectFacts> {
+    if (subjectType !== "company") {
+      throw new Error("only company enrichment facts are supported");
+    }
+    assertCanonicalIsoUtc(now, "enrichment facts reference time");
+    const uniqueKeys = [...new Set(subjectKeys.filter((key) => key.trim().length > 0))];
+    const facts = new Map<string, EnrichedSubjectFacts>();
+    for (let i = 0; i < uniqueKeys.length; i += SQL_PARAMETER_BUDGET - 1) {
+      const chunk = uniqueKeys.slice(i, i + SQL_PARAMETER_BUDGET - 1);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT *
+           FROM enriched_subject_facts
+           WHERE subject_type = ?
+             AND subject_key IN (${placeholders})`,
+        )
+        .all(subjectType, ...chunk) as Record<string, unknown>[];
+      for (const row of rows) {
+        const parsed = this.enrichedSubjectFactsFromRow(row, now);
+        facts.set(parsed.subjectKey, parsed);
+      }
+    }
+    return facts;
+  }
+
+  private providerObservationById(id: string): ProviderObservationRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM provider_observations WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.providerObservationFromRow(row) : null;
+  }
+
+  private providerObservationBySourceEvent(
+    provider: ProviderObservationProvider,
+    sourceEventId: string,
+  ): ProviderObservationRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM provider_observations
+         WHERE provider = ?
+           AND source_event_id = ?`,
+      )
+      .get(provider, sourceEventId) as Record<string, unknown> | undefined;
+    return row ? this.providerObservationFromRow(row) : null;
+  }
+
+  private providerObservationFromRow(
+    row: Record<string, unknown>,
+  ): ProviderObservationRecord {
+    const normalizedPayload = parseEnrichmentPayload(
+      JSON.parse(String(row.normalized_payload_json)),
+    );
+    return {
+      id: String(row.id),
+      subjectType: ProviderObservationSubjectType.parse(row.subject_type),
+      subjectKey: String(row.subject_key),
+      provider: ProviderObservationProvider.parse(row.provider),
+      sourceEventId: String(row.source_event_id),
+      sourcePayloadHash: String(row.source_payload_hash),
+      observedAt: String(row.observed_at),
+      expiresAt: typeof row.expires_at === "string" ? row.expires_at : null,
+      confidence: Number(row.confidence),
+      rawPayload: JSON.parse(String(row.raw_payload_json)) as unknown,
+      normalizedPayload,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  private projectEnrichedSubjectFacts(
+    input: ProviderObservationInput & { subjectType: "company" },
+    observation: ProviderObservationRecord,
+    now: string,
+    enrichment: Enrichment,
+  ): EnrichedSubjectFacts | null {
+    if (enrichment.confidence < ENRICHMENT_FACT_MIN_CONFIDENCE) {
+      return this.enrichedSubjectFacts(input.subjectType, input.subjectKey, now);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO enriched_subject_facts (
+           subject_type, subject_key, employees, industry, tech_signals_json,
+           regulated, confidence, source_provider, source_observation_id,
+           observed_at, expires_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(subject_type, subject_key) DO UPDATE SET
+           employees=excluded.employees,
+           industry=excluded.industry,
+           tech_signals_json=excluded.tech_signals_json,
+           regulated=excluded.regulated,
+           confidence=excluded.confidence,
+           source_provider=excluded.source_provider,
+           source_observation_id=excluded.source_observation_id,
+           observed_at=excluded.observed_at,
+           expires_at=excluded.expires_at,
+           updated_at=excluded.updated_at
+         WHERE
+           excluded.confidence > enriched_subject_facts.confidence OR
+           (
+             enriched_subject_facts.expires_at IS NOT NULL AND
+             enriched_subject_facts.expires_at <= ? AND
+             (
+               excluded.expires_at IS NULL OR
+               excluded.expires_at > ?
+             )
+           ) OR
+           (
+             excluded.source_observation_id =
+               enriched_subject_facts.source_observation_id AND
+             excluded.observed_at >= enriched_subject_facts.observed_at AND
+             (
+               excluded.expires_at IS enriched_subject_facts.expires_at OR
+               excluded.expires_at IS NULL OR
+               (
+                 enriched_subject_facts.expires_at IS NOT NULL AND
+                 excluded.expires_at > enriched_subject_facts.expires_at
+               )
+             )
+           ) OR
+           (
+             excluded.confidence = enriched_subject_facts.confidence AND
+             excluded.observed_at > enriched_subject_facts.observed_at
+           )`,
+      )
+      .run(
+        input.subjectType,
+        input.subjectKey,
+        enrichment.employees,
+        enrichment.industry,
+        canonicalJson(enrichment.techSignals),
+        enrichment.regulated ? 1 : 0,
+        enrichment.confidence,
+        observation.provider,
+        observation.id,
+        observation.observedAt,
+        observation.expiresAt,
+        now,
+        now,
+        now,
+      );
+    return this.enrichedSubjectFacts(input.subjectType, input.subjectKey, now);
+  }
+
+  private enrichedFactsForObservationSubject(
+    subjectType: ProviderObservationSubjectType,
+    subjectKey: string,
+  ): EnrichedSubjectFacts | null {
+    return subjectType === "company"
+      ? this.enrichedSubjectFacts("company", subjectKey)
+      : null;
+  }
+
+  private enrichedSubjectFactsFromRow(
+    row: Record<string, unknown>,
+    now: string,
+  ): EnrichedSubjectFacts {
+    const techSignals = JSON.parse(String(row.tech_signals_json)) as unknown;
+    if (
+      !Array.isArray(techSignals) ||
+      !techSignals.every((signal) => typeof signal === "string")
+    ) {
+      throw new Error("stored enrichment techSignals must be a string array");
+    }
+    return {
+      subjectType: "company",
+      subjectKey: String(row.subject_key),
+      employees: Number(row.employees),
+      industry: String(row.industry),
+      techSignals,
+      regulated: Number(row.regulated) === 1,
+      confidence: Number(row.confidence),
+      sourceProvider: ProviderObservationProvider.parse(row.source_provider),
+      sourceObservationId: String(row.source_observation_id),
+      observedAt: String(row.observed_at),
+      expiresAt: typeof row.expires_at === "string" ? row.expires_at : null,
+      freshnessStatus: enrichmentFactFreshnessStatus(
+        typeof row.expires_at === "string" ? row.expires_at : null,
+        now,
+      ),
+      updatedAt: String(row.updated_at),
+    };
   }
 
   private recordEqualTimestampCommercialState(

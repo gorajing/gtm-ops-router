@@ -597,6 +597,93 @@ export interface Enrichment {
 }
 export type EnrichedDeal = Deal & { enrichment: Enrichment };
 
+// -- Provider evidence ------------------------------------------------------
+export const PROVIDER_OBSERVATION_SUBJECT_TYPES = [
+  "company",
+] as const;
+export const ProviderObservationSubjectType = z.enum(
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+);
+export type ProviderObservationSubjectType = z.infer<
+  typeof ProviderObservationSubjectType
+>;
+
+export const PROVIDER_OBSERVATION_PROVIDERS = [
+  "fixture",
+  "manual",
+  "website",
+  "hubspot",
+  "apollo",
+  "clearbit",
+  "clay",
+  "warehouse",
+  "csv",
+  "agent",
+] as const;
+export const ProviderObservationProvider = z.enum(
+  PROVIDER_OBSERVATION_PROVIDERS,
+);
+export type ProviderObservationProvider = z.infer<
+  typeof ProviderObservationProvider
+>;
+
+export const ENRICHED_FACT_FRESHNESS_STATUSES = ["fresh", "stale"] as const;
+export const EnrichedFactFreshnessStatus = z.enum(
+  ENRICHED_FACT_FRESHNESS_STATUSES,
+);
+export type EnrichedFactFreshnessStatus = z.infer<
+  typeof EnrichedFactFreshnessStatus
+>;
+
+export interface ProviderObservationInput {
+  subjectType: ProviderObservationSubjectType;
+  subjectKey: string;
+  provider: ProviderObservationProvider;
+  sourceEventId: string;
+  observedAt: string;
+  expiresAt: string | null;
+  confidence: number;
+  /** Provider-native payload when available; generated fixture observations use the normalized fixture payload. */
+  rawPayload: unknown;
+  normalizedPayload: Enrichment;
+  /**
+   * Content-addressed generated observations can use duplicates as fresh
+   * provider reconfirmations. Provider-supplied upstream event ids should leave
+   * this false so replay does not mutate the original observed_at.
+   */
+  refreshOnDuplicate?: boolean;
+}
+
+export interface ProviderObservationRecord extends ProviderObservationInput {
+  id: string;
+  sourcePayloadHash: string;
+  createdAt: string;
+}
+
+export type ProviderObservationWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "refreshed"
+  | "idempotency_conflict";
+
+export interface ProviderObservationWriteResult {
+  status: ProviderObservationWriteStatus;
+  observation: ProviderObservationRecord | null;
+  facts: EnrichedSubjectFacts | null;
+}
+
+/** Current projection is intentionally company-only; contact/deal observations stay ledger-only for now. */
+export interface EnrichedSubjectFacts extends Enrichment {
+  subjectType: "company";
+  subjectKey: string;
+  sourceProvider: ProviderObservationProvider;
+  sourceObservationId: string;
+  observedAt: string;
+  expiresAt: string | null;
+  freshnessStatus: EnrichedFactFreshnessStatus;
+  updatedAt: string;
+}
+
 // ── Scoring: deterministic and auditable (a reviewer can recompute it) ───────
 export interface ScoreBreakdown {
   icpFit: number; // 0..1

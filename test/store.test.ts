@@ -15,6 +15,7 @@ import type {
   LocalAgentSuggestionInput,
   LocalOutcomeInput,
   PipelineEventMeta,
+  ProviderObservationInput,
   RoutedDeal,
 } from "../src/types.js";
 
@@ -161,6 +162,29 @@ function agentSuggestionDecisionEventKey(sourceEventId: string): string {
   ]);
 }
 
+function providerObservationInput(
+  overrides: Partial<ProviderObservationInput> = {},
+): ProviderObservationInput {
+  return {
+    subjectType: "company",
+    subjectKey: "acme.example",
+    provider: "fixture",
+    sourceEventId: "55555555-5555-4555-8555-555555555555",
+    observedAt: "2026-05-21T12:00:00.000Z",
+    expiresAt: "2026-06-20T12:00:00.000Z",
+    confidence: 0.9,
+    rawPayload: { source: "fixture" },
+    normalizedPayload: {
+      employees: 500,
+      industry: "logistics",
+      techSignals: ["manual_ops"],
+      regulated: true,
+      confidence: 0.9,
+    },
+    ...overrides,
+  };
+}
+
 function withTempStoreDb(test: (db: InstanceType<typeof DatabaseSync>) => void): void {
   const dir = join(tmpdir(), `gtm-router-schema-${process.pid}-${Date.now()}`);
   mkdirSync(dir);
@@ -222,6 +246,15 @@ interface ExternalEventKeyRow {
   notify_error: string | null;
 }
 
+interface IdempotencyViolationRow {
+  source: string;
+  source_event_id: string;
+  scope: string;
+  existing_payload_hash: string;
+  incoming_payload_hash: string;
+  reason: string;
+}
+
 function readReadiness(
   dbPath: string,
   dealId: string,
@@ -274,6 +307,27 @@ function readExternalEventKey(
          WHERE key = ?`,
       )
       .get(key) as ExternalEventKeyRow | undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function readIdempotencyViolation(
+  dbPath: string,
+  scope: string,
+  sourceEventId: string,
+): IdempotencyViolationRow | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT source, source_event_id, scope, existing_payload_hash,
+                incoming_payload_hash, reason
+         FROM idempotency_violations
+         WHERE scope = ?
+           AND source_event_id = ?`,
+      )
+      .get(scope, sourceEventId) as IdempotencyViolationRow | undefined;
   } finally {
     db.close();
   }
@@ -366,6 +420,8 @@ describe("Store Phase 1 storage schema", () => {
           "idempotency_violations",
           "outcome_events",
           "outcome_rejections",
+          "provider_observations",
+          "enriched_subject_facts",
         ]),
       );
     });
@@ -885,6 +941,292 @@ describe("Store Phase 1 storage schema", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("records provider observations and projects highest-confidence enrichment facts", () => {
+    withTempStore((store, dbPath) => {
+      const first = store.recordProviderObservation(providerObservationInput());
+      expect(first.status).toBe("recorded");
+      expect(first.observation?.id).toMatch(/^PO-[0-9a-f]{32}$/);
+      expect(first.facts).toEqual(
+        expect.objectContaining({
+          subjectType: "company",
+          subjectKey: "acme.example",
+          employees: 500,
+          industry: "logistics",
+          techSignals: ["manual_ops"],
+          regulated: true,
+          confidence: 0.9,
+          sourceProvider: "fixture",
+          freshnessStatus: "fresh",
+        }),
+      );
+
+      const duplicate = store.recordProviderObservation(providerObservationInput());
+      expect(duplicate.status).toBe("duplicate");
+      expect(duplicate.observation?.id).toBe(first.observation?.id);
+      expect(duplicate.observation?.observedAt).toBe(first.observation?.observedAt);
+
+      const refreshedDuplicate = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(refreshedDuplicate.status).toBe("refreshed");
+      expect(refreshedDuplicate.observation?.id).toBe(first.observation?.id);
+      expect(refreshedDuplicate.observation?.observedAt).toBe(
+        "2026-05-22T12:00:00.000Z",
+      );
+      expect(refreshedDuplicate.facts).toEqual(
+        expect.objectContaining({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+        }),
+      );
+
+      const expiryOnlyRefresh = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-22T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(expiryOnlyRefresh.status).toBe("refreshed");
+      expect(expiryOnlyRefresh.observation?.expiresAt).toBe(
+        "2026-06-22T12:00:00.000Z",
+      );
+      expect(expiryOnlyRefresh.facts?.expiresAt).toBe(
+        "2026-06-22T12:00:00.000Z",
+      );
+
+      const conflict = store.recordProviderObservation(
+        providerObservationInput({
+          normalizedPayload: {
+            employees: 501,
+            industry: "logistics",
+            techSignals: ["manual_ops"],
+            regulated: true,
+            confidence: 0.9,
+          },
+        }),
+      );
+      expect(conflict.status).toBe("idempotency_conflict");
+      expect(conflict.observation).toBeNull();
+      expect(
+        readIdempotencyViolation(
+          dbPath,
+          "provider_observation",
+          "55555555-5555-4555-8555-555555555555",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          source: "fixture",
+          scope: "provider_observation",
+          reason:
+            "provider observation source event id replayed with a different payload",
+        }),
+      );
+
+      const lowerConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          sourceEventId: "66666666-6666-4666-8666-666666666666",
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+          confidence: 0.2,
+          normalizedPayload: {
+            employees: 50,
+            industry: "freight",
+            techSignals: ["legacy-tms"],
+            regulated: false,
+            confidence: 0.2,
+          },
+        }),
+      );
+      expect(lowerConfidence.status).toBe("recorded");
+      expect(lowerConfidence.facts?.employees).toBe(500);
+
+      const higherConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          sourceEventId: "77777777-7777-4777-8777-777777777777",
+          observedAt: "2026-05-23T12:00:00.000Z",
+          expiresAt: "2026-06-22T12:00:00.000Z",
+          confidence: 0.95,
+          normalizedPayload: {
+            employees: 650,
+            industry: "3pl",
+            techSignals: ["manual_ops", "voice_ai_eval"],
+            regulated: false,
+            confidence: 0.95,
+          },
+        }),
+      );
+      expect(higherConfidence.status).toBe("recorded");
+      expect(higherConfidence.facts).toEqual(
+        expect.objectContaining({
+          employees: 650,
+          industry: "3pl",
+          techSignals: ["manual_ops", "voice_ai_eval"],
+          sourceObservationId: higherConfidence.observation?.id,
+        }),
+      );
+
+      const refreshedLowerConfidenceSource = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-24T12:00:00.000Z",
+          expiresAt: "2026-06-24T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(refreshedLowerConfidenceSource.status).toBe("refreshed");
+      expect(refreshedLowerConfidenceSource.observation?.observedAt).toBe(
+        "2026-05-24T12:00:00.000Z",
+      );
+      expect(refreshedLowerConfidenceSource.facts).toEqual(
+        expect.objectContaining({
+          employees: 650,
+          sourceObservationId: higherConfidence.observation?.id,
+        }),
+      );
+
+      const expiryShorteningReplay = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-24T12:00:00.000Z",
+          expiresAt: "2026-06-01T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(expiryShorteningReplay.status).toBe("duplicate");
+      expect(expiryShorteningReplay.observation?.expiresAt).toBe(
+        "2026-06-24T12:00:00.000Z",
+      );
+
+      const laterExpiryShorteningReplay = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-25T12:00:00.000Z",
+          expiresAt: "2026-06-01T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(laterExpiryShorteningReplay.status).toBe("duplicate");
+      expect(laterExpiryShorteningReplay.observation?.observedAt).toBe(
+        "2026-05-24T12:00:00.000Z",
+      );
+      expect(laterExpiryShorteningReplay.observation?.expiresAt).toBe(
+        "2026-06-24T12:00:00.000Z",
+      );
+
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "acme.example",
+          "2026-06-23T12:00:00.000Z",
+        )?.freshnessStatus,
+      ).toBe("stale");
+      expect(store.providerObservations("company", "acme.example")).toHaveLength(3);
+    });
+  });
+
+  it("lets fresh usable facts replace stale higher-confidence facts", () => {
+    withTempStore((store) => {
+      const staleHighConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "stale.example",
+          sourceEventId: "88888888-8888-4888-8888-888888888888",
+          observedAt: "2026-04-20T12:00:00.000Z",
+          expiresAt: "2026-05-20T12:00:00.000Z",
+          confidence: 0.95,
+          normalizedPayload: {
+            employees: 900,
+            industry: "logistics",
+            techSignals: ["legacy-tms"],
+            regulated: true,
+            confidence: 0.95,
+          },
+        }),
+      );
+      expect(staleHighConfidence.status).toBe("recorded");
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "stale.example",
+          "2026-05-25T12:00:00.000Z",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          employees: 900,
+          confidence: 0.95,
+          freshnessStatus: "stale",
+        }),
+      );
+
+      const freshLowerConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "stale.example",
+          sourceEventId: "99999999-9999-4999-8999-999999999999",
+          observedAt: "2026-05-25T12:00:00.000Z",
+          expiresAt: "2026-06-24T12:00:00.000Z",
+          confidence: 0.7,
+          normalizedPayload: {
+            employees: 725,
+            industry: "3pl",
+            techSignals: ["voice_ai_eval"],
+            regulated: false,
+            confidence: 0.7,
+          },
+        }),
+      );
+      expect(freshLowerConfidence.status).toBe("recorded");
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "stale.example",
+          "2026-05-25T12:00:00.000Z",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          employees: 725,
+          industry: "3pl",
+          confidence: 0.7,
+          freshnessStatus: "fresh",
+          sourceObservationId: freshLowerConfidence.observation?.id,
+        }),
+      );
+    });
+  });
+
+  it("allows duplicate refresh to extend bounded facts to unbounded expiry", () => {
+    withTempStore((store) => {
+      const first = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "unbounded.example",
+          sourceEventId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          expiresAt: "2026-06-20T12:00:00.000Z",
+        }),
+      );
+      expect(first.status).toBe("recorded");
+
+      const unbounded = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "unbounded.example",
+          sourceEventId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          expiresAt: null,
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(unbounded.status).toBe("refreshed");
+      expect(unbounded.observation?.expiresAt).toBeNull();
+      expect(unbounded.facts).toEqual(
+        expect.objectContaining({
+          expiresAt: null,
+          freshnessStatus: "fresh",
+          sourceObservationId: first.observation?.id,
+        }),
+      );
+    });
   });
 
   it("stores raw local commercial UUIDs in projections and observations", () => {

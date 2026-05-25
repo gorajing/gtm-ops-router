@@ -56,6 +56,52 @@ describe("pipeline — happy path", () => {
     store.close();
   });
 
+  it("records enrichment evidence without changing route behavior", async () => {
+    const store = new Store(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
+    expect(out.ok).toBe(true);
+
+    const facts = store.enrichedSubjectFacts("company", "ryder-digital.com");
+    expect(facts).toEqual(
+      expect.objectContaining({
+        sourceProvider: "fixture",
+        subjectKey: "ryder-digital.com",
+        industry: "logistics",
+        employees: 1200,
+        techSignals: ["salesforce", "twilio"],
+        confidence: 0.95,
+        freshnessStatus: "fresh",
+      }),
+    );
+    expect(store.providerObservations("company", "ryder-digital.com")).toHaveLength(
+      1,
+    );
+    expect(store.routed()[0]?.route.kind).toBe("human_assisted");
+    store.close();
+  });
+
+  it("deduplicates identical provider evidence across deals for the same subject", async () => {
+    const store = new Store(":memory:");
+    const e = new FixtureEnricher(fixture());
+    await processOne(validDeal, store, e);
+    await processOne(
+      {
+        ...validDeal,
+        contactName: "Riley Ops",
+        contactEmail: "riley@ryder-digital.com",
+        dealUSD: 130000,
+      },
+      store,
+      e,
+    );
+
+    expect(store.routed()).toHaveLength(2);
+    expect(store.providerObservations("company", "ryder-digital.com")).toHaveLength(
+      1,
+    );
+    store.close();
+  });
+
   it("keeps limited deal journeys bounded while preserving the intake event", async () => {
     const store = new Store(":memory:");
     const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
@@ -142,6 +188,10 @@ describe("pipeline — every failure mode is typed, never dropped", () => {
     );
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.quarantine.code).toBe("insufficient_data");
+    expect(store.providerObservations("company", "foggyfreight.com")).toHaveLength(
+      1,
+    );
+    expect(store.enrichedSubjectFacts("company", "foggyfreight.com")).toBeNull();
     store.close();
   });
 
@@ -158,6 +208,28 @@ describe("pipeline — every failure mode is typed, never dropped", () => {
       expect(out.quarantine.code).toBe("store_error");
       expect(out.quarantine.reason).toContain("disk full");
     }
+    store.close();
+  });
+
+  it("enrichment evidence failures do not become a new routing gate", async () => {
+    class ExplodingEvidenceStore extends Store {
+      override recordEnrichmentObservation(): never {
+        throw new Error("evidence table locked");
+      }
+    }
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new ExplodingEvidenceStore(":memory:");
+    const out = await processOne(validDeal, store, new FixtureEnricher(fixture()));
+
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.deal.route.kind).toBe("human_assisted");
+    expect(store.events(store.routed()[0]?.id).map((event) => event.detail)).toContain(
+      "enrichment_evidence_persist_failed: evidence table locked",
+    );
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("enrichment_evidence_persist_failed"),
+    );
+    errorSpy.mockRestore();
     store.close();
   });
 
@@ -195,6 +267,9 @@ describe("pipeline — idempotency (data accuracy by construction)", () => {
     await processOne(validDeal, store, e);
     await processOne(validDeal, store, e);
     expect(store.routed().length).toBe(1);
+    expect(store.providerObservations("company", "ryder-digital.com")).toHaveLength(
+      1,
+    );
     store.close();
   });
 });

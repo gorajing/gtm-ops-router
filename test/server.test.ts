@@ -29,7 +29,7 @@ const ISOLATED_ENV_KEYS = [
 ] as const;
 
 const enricher: Enricher = {
-  name: "test",
+  name: "fixture",
   async enrich(_deal: Deal): Promise<Enrichment> {
     return {
       employees: 1200,
@@ -1975,6 +1975,21 @@ describe("server dashboard", () => {
           sourceChannel: "inbound_form",
           statedNeed: "manual exception follow-up",
           scoreNotes: ["ICP fit +1"],
+          enrichmentFacts: {
+            subjectType: "company",
+            subjectKey: "console.example",
+            employees: 1200,
+            industry: "logistics",
+            techSignals: ["manual_ops", "voice_ai_eval"],
+            regulated: true,
+            confidence: 0.95,
+            sourceProvider: "fixture",
+            sourceObservationId: "PO-console",
+            observedAt: "2026-05-24T15:00:00.000Z",
+            expiresAt: "2026-06-23T15:00:00.000Z",
+            freshnessStatus: "fresh",
+            updatedAt: "2026-05-24T15:00:00.000Z",
+          },
         },
       ],
       roleQueues: {
@@ -2420,6 +2435,9 @@ describe("server dashboard", () => {
     expect(document.text("deployment-handoff")).toContain("Use case unclear");
     expect(document.text("detail")).toContain("Deal Journey");
     expect(document.text("detail")).toContain("agent_suggestion_proposed");
+    expect(document.text("detail")).toContain("Enrichment Evidence");
+    expect(document.text("detail")).toContain("fixture");
+    expect(document.text("detail")).toContain("manual_ops, voice_ai_eval");
     expect(document.text("detail")).toContain("Agent Suggestions");
     expect(document.text("detail")).toContain(
       "Ask deployment to confirm owner and next milestone.",
