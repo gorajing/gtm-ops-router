@@ -65,6 +65,7 @@ class FakeConsoleElement {
   open = false;
   focused = false;
   selected = false;
+  readonly attributes = new Map<string, string>();
   dataset: Record<string, string> = new Proxy<Record<string, string>>(
     {},
     {
@@ -115,6 +116,10 @@ class FakeConsoleElement {
 
   removeEventListener(event: string, handler: FakeConsoleEventHandler): void {
     this.listeners.get(event)?.delete(handler);
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, String(value));
   }
 
   querySelector(selector: string): FakeConsoleElement | null {
@@ -2094,6 +2099,46 @@ describe("server dashboard", () => {
           decisionPayloadHash: null,
           decisionReason: null,
         },
+        {
+          id: "S-console-decided",
+          dealId: "D-console",
+          kind: "handoff_summary",
+          status: "accepted",
+          title: "Accepted reference handoff",
+          body: "Already accepted operator note.",
+          rationale: "Accepted row should stay out of the default open queue.",
+          source: "local_agent",
+          sourceEventId: "22222222-2222-4222-8222-222222222222",
+          sourcePayloadHash: "hash2",
+          createdBy: "policy-agent",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          createdAt: "2026-05-24T15:01:00.000Z",
+          decidedAt: "2026-05-24T15:03:00.000Z",
+          decidedBy: "operator-console",
+          decisionSourceEventId: "33333333-3333-4333-8333-333333333333",
+          decisionPayloadHash: "decision-hash",
+          decisionReason: "Accepted from operator console.",
+        },
+        {
+          id: "S-console-other",
+          dealId: "D-console",
+          kind: "policy_change_recommendation",
+          status: "deferred",
+          title: "Deferred policy check",
+          body: "Unknown statuses should be visible only from Other or All.",
+          rationale: "The console should surface unclassified statuses loudly.",
+          source: "local_agent",
+          sourceEventId: "44444444-4444-4444-8444-444444444444",
+          sourcePayloadHash: "hash3",
+          createdBy: "policy-agent",
+          occurredAt: "2026-05-24T15:04:00.000Z",
+          createdAt: "2026-05-24T15:05:00.000Z",
+          decidedAt: null,
+          decidedBy: null,
+          decisionSourceEventId: null,
+          decisionPayloadHash: null,
+          decisionReason: null,
+        },
       ],
       exceptions: [
         {
@@ -2216,11 +2261,16 @@ describe("server dashboard", () => {
     };
     let formDataConstructed = 0;
     let promptCalls = 0;
+    const dashboardWarnings: unknown[][] = [];
+    const dashboardConsole = Object.create(console) as Console;
+    dashboardConsole.warn = (...args: unknown[]): void => {
+      dashboardWarnings.push(args);
+    };
 
     process.on("unhandledRejection", onUnhandledRejection);
     try {
       runInNewContext(script, {
-        console,
+        console: dashboardConsole,
         document,
         encodeURIComponent,
         fetch: fetchImpl,
@@ -2277,8 +2327,95 @@ describe("server dashboard", () => {
     expect(document.text("agent-suggestions")).toContain(
       "Ask deployment to confirm owner and next milestone.",
     );
+    expect(document.text("agent-suggestions")).not.toContain(
+      "Accepted reference handoff",
+    );
+    expect(document.text("agent-suggestions")).not.toContain(
+      "Deferred policy check",
+    );
+    expect(document.text("agent-suggestions")).toContain(
+      "Queue: 1 open proposal, 1 decided suggestion, 1 unclassified status",
+    );
     expect(document.text("agent-suggestions")).toMatch(
       /Source local_agent \/ [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/,
+    );
+    expect(dashboardWarnings).toEqual([
+      ["unknown agent suggestion status", "deferred"],
+    ]);
+    const suggestionRoot = document.querySelector("#agent-suggestions");
+    if (!suggestionRoot) throw new Error("agent suggestions root missing");
+    for (const [filter, label] of [
+      ["open", "Open 1"],
+      ["decided", "Decided 1"],
+      ["other", "Other 1"],
+      ["all", "All 3"],
+    ]) {
+      const filterButton = findConsoleElement(
+        suggestionRoot,
+        (node) =>
+          node.tagName === "BUTTON" &&
+          node.attributes.get("data-filter") === filter &&
+          node.textContent === label,
+      );
+      if (!filterButton) throw new Error(`${label} filter button missing`);
+      expect(filterButton.attributes.get("aria-pressed")).toBe(
+        label === "Open 1" ? "true" : "false",
+      );
+    }
+    const decidedFilter = findConsoleElement(
+      suggestionRoot,
+      (node) =>
+        node.tagName === "BUTTON" &&
+        node.attributes.get("data-filter") === "decided",
+    );
+    if (!decidedFilter) throw new Error("decided filter button missing");
+    decidedFilter.dispatch("click");
+    expect(document.text("agent-suggestions")).toContain(
+      "Accepted reference handoff",
+    );
+    expect(document.text("agent-suggestions")).not.toContain(
+      "Unblock stalled deployment",
+    );
+    const activeDecidedFilter = findConsoleElement(
+      suggestionRoot,
+      (node) =>
+        node.tagName === "BUTTON" &&
+        node.attributes.get("data-filter") === "decided",
+    );
+    expect(activeDecidedFilter?.attributes.get("aria-pressed")).toBe("true");
+    const otherFilter = findConsoleElement(
+      suggestionRoot,
+      (node) =>
+        node.tagName === "BUTTON" &&
+        node.attributes.get("data-filter") === "other",
+    );
+    if (!otherFilter) throw new Error("other filter button missing");
+    otherFilter.dispatch("click");
+    expect(document.text("agent-suggestions")).toContain(
+      "Deferred policy check",
+    );
+    expect(document.text("agent-suggestions")).not.toContain(
+      "Accepted reference handoff",
+    );
+    expect(document.text("agent-suggestions")).not.toContain(
+      "Unblock stalled deployment",
+    );
+    const allFilter = findConsoleElement(
+      suggestionRoot,
+      (node) =>
+        node.tagName === "BUTTON" &&
+        node.attributes.get("data-filter") === "all",
+    );
+    if (!allFilter) throw new Error("all filter button missing");
+    allFilter.dispatch("click");
+    expect(document.text("agent-suggestions")).toContain(
+      "Accepted reference handoff",
+    );
+    expect(document.text("agent-suggestions")).toContain(
+      "Unblock stalled deployment",
+    );
+    expect(document.text("agent-suggestions")).toContain(
+      "Deferred policy check",
     );
     expect(document.text("deployment-handoff")).toContain("Use case unclear");
     expect(document.text("detail")).toContain("Deal Journey");

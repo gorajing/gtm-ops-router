@@ -384,6 +384,10 @@ function consoleHtml(sinkLabel: string): string {
  .receipts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.receipt{border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;font-size:11px}
  .empty{border:1px dashed var(--line);border-radius:5px;padding:14px;color:var(--muted);background:#fff}
  .mini-form{display:grid;gap:8px;margin-bottom:10px}.inline-actions{display:flex;gap:6px;flex-wrap:wrap}.inline-actions button{padding:5px 8px;font-size:12px}
+ .toolbar{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+ .segmented{display:flex;gap:4px;flex-wrap:wrap}
+ .segmented button{padding:5px 8px;font-size:12px}
+ .segmented button.active{background:var(--ink);color:#fff;border-color:var(--ink)}
  .action-status{font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);min-height:18px}
  .suggestion-title{font-weight:700;color:var(--ink);margin-bottom:5px;overflow-wrap:anywhere}
  .suggestion-body{border:1px solid var(--line);background:var(--soft);border-radius:5px;padding:7px 8px;margin:5px 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);max-height:120px;overflow:auto;user-select:text}
@@ -509,6 +513,8 @@ const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
 let state = null;
 let selectedId = null;
+let agentSuggestionFilter = "open";
+const warnedAgentSuggestionStatuses = new Set();
 let stateRequestSeq = 0;
 let healthRequestSeq = 0;
 let detailRequestSeq = 0;
@@ -944,6 +950,11 @@ function suggestionStatusClass(status){
   if (status === "rejected") return "muted";
   return "warn";
 }
+function suggestionStatusGroup(suggestion){
+  if (suggestion.status === "proposed") return "open";
+  if (suggestion.status === "accepted" || suggestion.status === "rejected") return "decided";
+  return "other";
+}
 function suggestionAuditText(suggestion){
   return "By " + (suggestion.createdBy || "-") + " at " + (suggestion.createdAt || "-") + " | Source " + (suggestion.source || "-") + " / " + (suggestion.sourceEventId || "-");
 }
@@ -989,6 +1000,77 @@ function suggestionActionCell(suggestion){
   }
   return actionCell;
 }
+function agentSuggestionFilterName(filter){
+  const labels = { open: "Open", decided: "Decided", other: "Other", all: "All" };
+  return labels[filter] || filter;
+}
+function agentSuggestionFilterLabel(filter, count){
+  return agentSuggestionFilterName(filter) + " " + count;
+}
+function agentSuggestionFilterEmptyText(){
+  if (agentSuggestionFilter === "all") return "No agent suggestions in this view.";
+  return "No " + agentSuggestionFilterName(agentSuggestionFilter).toLowerCase() + " agent suggestions in this view.";
+}
+function agentSuggestionFilterMatches(suggestion){
+  if (agentSuggestionFilter === "all") return true;
+  return suggestionStatusGroup(suggestion) === agentSuggestionFilter;
+}
+function countAgentSuggestions(rows){
+  return rows.reduce((acc, suggestion) => {
+    const group = suggestionStatusGroup(suggestion);
+    if (group === "other" && !warnedAgentSuggestionStatuses.has(suggestion.status)) {
+      warnedAgentSuggestionStatuses.add(suggestion.status);
+      console.warn("unknown agent suggestion status", suggestion.status);
+    }
+    acc.all += 1;
+    acc[group] += 1;
+    return acc;
+  }, { open: 0, decided: 0, other: 0, all: 0 });
+}
+function normalizeAgentSuggestionFilter(counts){
+  if (agentSuggestionFilter === "other" && !counts.other) {
+    agentSuggestionFilter = counts.open ? "open" : counts.decided ? "decided" : "all";
+  }
+}
+function agentSuggestionQueueSummary(counts){
+  const parts = [
+    counts.open + " open proposal" + (counts.open === 1 ? "" : "s"),
+    counts.decided + " decided suggestion" + (counts.decided === 1 ? "" : "s"),
+  ];
+  if (counts.other) {
+    parts.push(counts.other + " unclassified status" + (counts.other === 1 ? "" : "es"));
+  }
+  return "Queue: " + parts.join(", ");
+}
+function renderAgentSuggestionFilters(counts){
+  const toolbar = el("div", "toolbar");
+  toolbar.append(el("div", counts.other ? "warn" : "muted", agentSuggestionQueueSummary(counts)));
+  const segmented = el("div", "segmented");
+  segmented.setAttribute("role", "group");
+  segmented.setAttribute("aria-label", "Filter agent suggestions");
+  const filters = counts.other
+    ? ["open", "decided", "other", "all"]
+    : ["open", "decided", "all"];
+  for (const filter of filters) {
+    const active = agentSuggestionFilter === filter;
+    const label = agentSuggestionFilterLabel(filter, counts[filter]);
+    const button = el(
+      "button",
+      "secondary" + (active ? " active" : ""),
+      label
+    );
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(active));
+    button.setAttribute("data-filter", filter);
+    button.addEventListener("click", () => {
+      agentSuggestionFilter = filter;
+      renderAgentSuggestions();
+    });
+    segmented.append(button);
+  }
+  toolbar.append(segmented);
+  return toolbar;
+}
 function renderAgentSuggestions(){
   const root = qs("#agent-suggestions");
   const rows = state.agentSuggestions || [];
@@ -996,11 +1078,14 @@ function renderAgentSuggestions(){
     root.replaceChildren(el("div", "empty", "No agent suggestions."));
     return;
   }
+  const counts = countAgentSuggestions(rows);
+  normalizeAgentSuggestionFilter(counts);
+  const visibleRows = rows.filter(agentSuggestionFilterMatches);
   const table = el("table");
   const head = document.createElement("tr");
   ["Status", "Kind", "Deal", "Suggestion", "Decision", "Action"].forEach((h) => head.append(el("th", null, h)));
   table.append(head);
-  for (const suggestion of rows) {
+  for (const suggestion of visibleRows) {
     const row = el("tr", "selectable" + (selectedId && suggestion.dealId === selectedId ? " selected" : ""));
     row.addEventListener("click", () => selectDeal(suggestion.dealId));
     row.append(
@@ -1013,7 +1098,11 @@ function renderAgentSuggestions(){
     );
     table.append(row);
   }
-  root.replaceChildren(table);
+  const filterEmpty = el("div", "empty", agentSuggestionFilterEmptyText());
+  root.replaceChildren(
+    renderAgentSuggestionFilters(counts),
+    visibleRows.length ? table : filterEmpty
+  );
 }
 function renderSelectedDealSuggestions(){
   const detail = qs("#detail");
