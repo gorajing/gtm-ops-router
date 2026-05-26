@@ -402,6 +402,16 @@ describe("local commercial-state endpoint", () => {
           body: JSON.stringify({}),
         },
       );
+      const workItem = await fetch(`${baseUrl}/work-items`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const workItemAction = await fetch(`${baseUrl}/work-items/WI-1/action`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
       const commercialBody = (await commercial.json()) as { error: string };
       const deploymentBody = (await deployment.json()) as { error: string };
       const outcomeBody = (await outcome.json()) as { error: string };
@@ -411,6 +421,8 @@ describe("local commercial-state endpoint", () => {
       const suggestionDecisionBody = (await suggestionDecision.json()) as {
         error: string;
       };
+      const workItemBody = (await workItem.json()) as { error: string };
+      const workItemActionBody = (await workItemAction.json()) as { error: string };
 
       expect(commercial.status).toBe(404);
       expect(deployment.status).toBe(404);
@@ -419,6 +431,8 @@ describe("local commercial-state endpoint", () => {
       expect(replay.status).toBe(404);
       expect(suggestion.status).toBe(404);
       expect(suggestionDecision.status).toBe(404);
+      expect(workItem.status).toBe(404);
+      expect(workItemAction.status).toBe(404);
       expect(commercialBody.error).toBe("not found");
       expect(deploymentBody.error).toBe("not found");
       expect(outcomeBody.error).toBe("not found");
@@ -426,6 +440,8 @@ describe("local commercial-state endpoint", () => {
       expect(replayBody.error).toBe("not found");
       expect(suggestionBody.error).toBe("not found");
       expect(suggestionDecisionBody.error).toBe("not found");
+      expect(workItemBody.error).toBe("not found");
+      expect(workItemActionBody.error).toBe("not found");
     });
   });
 
@@ -555,6 +571,16 @@ describe("local commercial-state endpoint", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
+        const workItem = await fetch(`${baseUrl}/work-items`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const workItemAction = await fetch(`${baseUrl}/work-items/WI-1/action`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
         const recommendationRun = await fetch(
           `${baseUrl}/agent-suggestion-runs/policy-evaluation`,
           {
@@ -568,6 +594,8 @@ describe("local commercial-state endpoint", () => {
         expect(enrichment.status).toBe(401);
         expect(replay.status).toBe(401);
         expect(suggestion.status).toBe(401);
+        expect(workItem.status).toBe(401);
+        expect(workItemAction.status).toBe(401);
         expect(recommendationRun.status).toBe(401);
       },
     );
@@ -608,6 +636,29 @@ describe("local commercial-state endpoint", () => {
             dataReady: true,
             operator: "DS",
             occurredAt: "2026-05-21T14:00:00+02:00",
+          }),
+        });
+        const workItem = await fetch(`${baseUrl}/work-items`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            queue: "ae_attention",
+            sourceEventId: "51515151-5151-4151-9151-515151515159",
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-21T12:00:00",
+          }),
+        });
+        const workItemAction = await fetch(`${baseUrl}/work-items/WI-test/action`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            sourceEventId: "52525252-5252-4252-9252-525252525259",
+            action: "resolve",
+            humanPrincipal: "operator-console",
+            occurredAt: "2026-05-21T12:00:00",
+            reason: "bad timestamp",
           }),
         });
 
@@ -669,11 +720,14 @@ describe("local commercial-state endpoint", () => {
         expect(outcome.status).toBe(400);
         expect(enrichment.status).toBe(400);
         expect(suggestion.status).toBe(400);
+        expect(workItem.status).toBe(400);
+        expect(workItemAction.status).toBe(400);
         expect(recommendationRun.status).toBe(400);
         expect(store.deploymentFacts(dealId)).toBeNull();
         expect(store.outcomeEvents(dealId)).toHaveLength(0);
         expect(store.providerObservations("company", "local-state.example")).toHaveLength(0);
         expect(store.agentSuggestions()).toHaveLength(0);
+        expect(store.workItems()).toHaveLength(0);
       },
     );
   });
@@ -706,6 +760,161 @@ describe("local commercial-state endpoint", () => {
         expect(res.status).toBe(400);
         expect(body.error).toBe("invalid policy recommendation run request");
         expect(store.policyRecommendationRuns()).toHaveLength(0);
+      },
+    );
+  });
+
+  it("opens and resolves work items from current role-queue signals", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const { baseUrl, store } = await app();
+        const dealId = await postRoutedDeal(baseUrl);
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const notInQueue = await fetch(`${baseUrl}/work-items`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            queue: "deployment_readiness",
+            sourceEventId: "56565656-5656-4656-9656-565656565656",
+            owner: "deployment.ops",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-24T15:00:00.000Z",
+          }),
+        });
+        const notInQueueBody = (await notInQueue.json()) as { status: string };
+        expect(notInQueue.status).toBe(409);
+        expect(notInQueueBody.status).toBe("not_in_queue");
+
+        const open = await fetch(`${baseUrl}/work-items`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            queue: "ae_attention",
+            sourceEventId: "57575757-5757-4757-9757-575757575757",
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-24T15:05:00.000Z",
+            dueAt: "2026-05-25T15:05:00.000Z",
+            reason: "AE should follow up.",
+          }),
+        });
+        const openBody = (await open.json()) as {
+          status: string;
+          workItem: {
+            id: string;
+            status: string;
+            owner: string;
+            dueAt: string | null;
+          } | null;
+        };
+        expect(open.status).toBe(200);
+        expect(openBody.workItem?.id).toBeTruthy();
+        const workItemId = openBody.workItem!.id;
+        expect(openBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            workItem: expect.objectContaining({
+              status: "assigned",
+              owner: "ae.morgan",
+              dueAt: "2026-05-25T15:05:00.000Z",
+            }),
+          }),
+        );
+
+        const duplicate = await fetch(`${baseUrl}/work-items`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            queue: "ae_attention",
+            sourceEventId: "57575757-5757-4757-9757-575757575757",
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-24T15:05:00.000Z",
+            dueAt: "2026-05-25T15:05:00.000Z",
+            reason: "AE should follow up.",
+          }),
+        });
+        const duplicateBody = (await duplicate.json()) as { status: string };
+        expect(duplicate.status).toBe(200);
+        expect(duplicateBody.status).toBe("duplicate");
+        expect(duplicateBody).toEqual(
+          expect.objectContaining({
+            workItem: openBody.workItem,
+          }),
+        );
+
+        const missingAction = await fetch(
+          `${baseUrl}/work-items/WI-missing/action`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              sourceEventId: "59595959-5959-4959-9959-595959595959",
+              action: "resolve",
+              humanPrincipal: "operator-console",
+              occurredAt: "2026-05-24T15:09:00.000Z",
+              reason: "Missing item should stay visible.",
+            }),
+          },
+        );
+        const missingActionBody = (await missingAction.json()) as { status: string };
+        expect(missingAction.status).toBe(404);
+        expect(missingActionBody.status).toBe("not_found");
+
+        const resolve = await fetch(
+          `${baseUrl}/work-items/${encodeURIComponent(
+            workItemId,
+          )}/action`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              sourceEventId: "58585858-5858-4858-9858-585858585858",
+              action: "resolve",
+              humanPrincipal: "operator-console",
+              occurredAt: "2026-05-24T15:10:00.000Z",
+              reason: "AE confirmed first touch.",
+            }),
+          },
+        );
+        const resolveBody = (await resolve.json()) as {
+          status: string;
+          workItem: { status: string; resolutionReason: string } | null;
+        };
+        expect(resolve.status).toBe(200);
+        expect(resolveBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            workItem: expect.objectContaining({
+              status: "resolved",
+              resolutionReason: "AE confirmed first touch.",
+            }),
+          }),
+        );
+
+        const state = (await fetch(`${baseUrl}/state`).then((r) =>
+          r.json(),
+        )) as {
+          workItems: Array<{ dealId: string; status: string }>;
+        };
+        expect(state.workItems).toEqual([
+          expect.objectContaining({
+            dealId,
+            status: "resolved",
+          }),
+        ]);
+        expect(store.workItems()[0]?.status).toBe("resolved");
       },
     );
   });
@@ -2942,6 +3151,8 @@ describe("server dashboard", () => {
       "refresh-btn": "button",
       "role-queues": "div",
       "submit-btn": "button",
+      "work-item-action-status": "div",
+      "work-items": "div",
     });
     type DashboardStateBase = {
       metrics: Record<string, unknown>;
@@ -3044,6 +3255,27 @@ describe("server dashboard", () => {
         growth_attribution: [],
       },
       roleQueueLimit: 50,
+      workItems: [
+        {
+          id: "WI-console",
+          sourceKind: "role_queue",
+          sourceKey: "role_queue:ae_attention:D-console",
+          dealId: "D-console",
+          queue: "ae_attention",
+          status: "assigned",
+          priority: "high",
+          owner: "ae.morgan",
+          title: "AE attention: Console Co",
+          description: "needs follow-up",
+          dueAt: null,
+          createdBy: "operator-console",
+          createdAt: "2026-05-24T15:00:00.000Z",
+          updatedAt: "2026-05-24T15:00:00.000Z",
+          resolvedAt: null,
+          resolvedBy: null,
+          resolutionReason: null,
+        },
+      ],
       policyEvaluation: {
         ...baseState.policyEvaluation,
         candidateRouted: 1,
@@ -3368,6 +3600,9 @@ describe("server dashboard", () => {
     expect(document.text("policy-runs")).toContain(
       "Showing latest 1 policy runs.",
     );
+    expect(document.text("work-items")).toContain("AE attention: Console Co");
+    expect(document.text("work-items")).toContain("Resolve");
+    expect(document.text("work-items")).toContain("assigned");
     expect(document.text("agent-suggestions")).toContain(
       "Unblock stalled deployment",
     );

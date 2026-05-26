@@ -739,6 +739,90 @@ export interface RoleQueueItem {
 
 export type RoleQueues = Record<RoleQueueKind, RoleQueueItem[]>;
 
+export const WORK_ITEM_STATUSES = [
+  "assigned",
+  "resolved",
+  "waived",
+] as const;
+export const WorkItemStatus = z.enum(WORK_ITEM_STATUSES);
+export type WorkItemStatus = z.infer<typeof WorkItemStatus>;
+
+export const WORK_ITEM_ACTIONS = ["assign", "resolve", "waive"] as const;
+export const WorkItemAction = z.enum(WORK_ITEM_ACTIONS);
+export type WorkItemAction = z.infer<typeof WorkItemAction>;
+
+export type WorkItemSourceKind = "role_queue";
+
+export interface WorkItemRecord {
+  id: string;
+  sourceKind: WorkItemSourceKind;
+  sourceKey: string;
+  dealId: string;
+  queue: RoleQueueKind;
+  status: WorkItemStatus;
+  /** Opening-time queue priority; not live queue priority. */
+  priority: RoleQueuePriority;
+  owner: string;
+  title: string;
+  /** Opening-time queue context for operator display; not live queue state. */
+  description: string;
+  dueAt: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  resolutionReason: string | null;
+}
+
+export interface LocalWorkItemInput {
+  dealId: string;
+  queue: RoleQueueKind;
+  sourceEventId: string;
+  owner: string;
+  createdBy: string;
+  occurredAt: string;
+  dueAt?: string;
+  reason?: string;
+}
+
+export interface LocalWorkItemActionInput {
+  workItemId: string;
+  sourceEventId: string;
+  action: WorkItemAction;
+  humanPrincipal: string;
+  occurredAt: string;
+  owner?: string;
+  reason: string;
+}
+
+export type LocalWorkItemWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "already_exists";
+
+export interface LocalWorkItemWriteResult {
+  status: LocalWorkItemWriteStatus;
+  eventKey: string;
+  workItem: WorkItemRecord | null;
+}
+
+export type LocalWorkItemActionStatus =
+  | "recorded"
+  | "superseded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "already_closed"
+  | "invalid_action";
+
+export interface LocalWorkItemActionResult {
+  status: LocalWorkItemActionStatus;
+  eventKey: string;
+  workItem: WorkItemRecord | null;
+}
+
 export const POLICY_EVALUATION_SIGNALS = [
   "self_serve_expanded",
   "human_assisted_churned",

@@ -14,6 +14,8 @@
  *   POST /agent-suggestions   local-only agent draft ledger
  *   POST /agent-suggestions/:id/decision
  *   POST /agent-suggestion-runs/policy-evaluation
+ *   POST /work-items          local-only role-queue work item ledger
+ *   POST /work-items/:id/action
  *
  * This is a local/operator-console surface. Put auth in front of it before
  * exposing it beyond localhost or a trusted internal network.
@@ -68,8 +70,11 @@ import type {
   Quarantine,
   ReadinessFallbackNotificationClaim,
   ReadinessNotificationClaim,
+  RoleQueueItem,
   RoleQueues,
+  RoleQueueKind,
   RoutedDeal,
+  WorkItemRecord,
 } from "./types.js";
 import {
   AgentSuggestionKind,
@@ -77,6 +82,8 @@ import {
   CommercialState,
   OutcomeReasonCategory,
   OutcomeState,
+  ROLE_QUEUE_KINDS,
+  WorkItemAction,
 } from "./types.js";
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -86,6 +93,7 @@ const STATE_EVENTS_PER_DEAL = 50;
 const STATE_ROLE_QUEUE_LIMIT = 50;
 const STATE_AGENT_SUGGESTION_LIMIT = 50;
 const STATE_POLICY_RECOMMENDATION_RUN_LIMIT = 25;
+const STATE_WORK_ITEM_LIMIT = 50;
 const MAX_MANUAL_ENRICHMENT_EMPLOYEES = 10_000_000;
 // Local-console cache only. Mutating handlers invalidate after successful
 // processing; failed writes do not thrash the dashboard read cache.
@@ -179,6 +187,7 @@ interface ConsoleState {
   exceptions: Quarantine[];
   deploymentReadiness: DeploymentReadinessState[];
   agentSuggestions: AgentSuggestionRecord[];
+  workItems: WorkItemRecord[];
   roleQueues: RoleQueues;
   roleQueueLimit: number;
   policyEvaluation: PolicyEvaluationReports;
@@ -293,6 +302,26 @@ const LocalAgentSuggestionDecisionBody = z.object({
   humanPrincipal: z.string().trim().min(1).max(200),
   reason: z.string().trim().min(1).max(1000),
   occurredAt: CanonicalUtcIsoString.optional(),
+});
+
+const LocalWorkItemBody = z.object({
+  dealId: z.string().trim().min(1),
+  queue: z.enum(ROLE_QUEUE_KINDS),
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  owner: z.string().trim().min(1).max(120),
+  createdBy: z.string().trim().min(1).max(120),
+  occurredAt: CanonicalUtcIsoString.optional(),
+  dueAt: CanonicalUtcIsoString.optional(),
+  reason: z.string().trim().max(500).optional(),
+});
+
+const LocalWorkItemActionBody = z.object({
+  sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
+  action: WorkItemAction,
+  humanPrincipal: z.string().trim().min(1).max(120),
+  occurredAt: CanonicalUtcIsoString.optional(),
+  owner: z.string().trim().min(1).max(120).optional(),
+  reason: z.string().trim().min(1).max(500),
 });
 
 const LocalPolicyRecommendationRunBody = z.object({
@@ -415,6 +444,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     exceptions: quarantined.map((record) => record.quarantine),
     deploymentReadiness,
     agentSuggestions: store.agentSuggestions(STATE_AGENT_SUGGESTION_LIMIT),
+    workItems: store.workItems(STATE_WORK_ITEM_LIMIT),
     roleQueues: store.roleQueues(STATE_ROLE_QUEUE_LIMIT, deploymentReadiness),
     roleQueueLimit: STATE_ROLE_QUEUE_LIMIT,
     policyEvaluation: store.policyEvaluation(
@@ -551,6 +581,11 @@ function consoleHtml(sinkLabel: string): string {
    <div class="handoff-wrap" id="role-queues"></div>
   </div>
   <div class="section">
+   <h2>Work Items</h2>
+   <div class="action-status" id="work-item-action-status"></div>
+   <div class="handoff-wrap" id="work-items"></div>
+  </div>
+  <div class="section">
    <h2>Policy Evaluation</h2>
    <div class="handoff-wrap" id="policy-evaluation"></div>
   </div>
@@ -620,6 +655,7 @@ let stateRequestSeq = 0;
 let healthRequestSeq = 0;
 let detailRequestSeq = 0;
 const pendingSuggestionDecisions = new Set();
+const pendingWorkItemActions = new Set();
 
 function qs(sel){ return document.querySelector(sel); }
 function el(tag, className, text){
@@ -981,7 +1017,10 @@ async function fetchJson(url, init){
   if (!res.ok) {
     const detail = body && typeof body === "object" && body.error ? body.error : body || res.statusText;
     const detailText = typeof detail === "string" ? detail : JSON.stringify(detail);
-    throw new Error("HTTP " + res.status + ": " + (detailText || res.statusText));
+    const error = new Error("HTTP " + res.status + ": " + (detailText || res.statusText));
+    error.status = res.status;
+    error.body = body;
+    throw error;
   }
   return body;
 }
@@ -1005,6 +1044,18 @@ function deterministicUuidV4(input){
   const normalized = hex.slice(0, 12) + "4" + hex.slice(13, 16) + variant + hex.slice(17);
   return normalized.slice(0, 8) + "-" + normalized.slice(8, 12) + "-" + normalized.slice(12, 16) + "-" + normalized.slice(16, 20) + "-" + normalized.slice(20);
 }
+function randomUuidV4(fallbackKey){
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return deterministicUuidV4(fallbackKey + ":" + Date.now() + ":" + Math.random());
+}
+function statusFromError(err){
+  if (!err || typeof err !== "object") return null;
+  const body = err.body;
+  if (!body || typeof body !== "object") return null;
+  return body.status || body.error || null;
+}
 function localWriteHeaders(){
   const input = qs("#local-secret");
   const secret = input ? String(input.value || "").trim() : "";
@@ -1014,6 +1065,12 @@ function localWriteHeaders(){
 }
 function setAgentActionStatus(message, className){
   const root = qs("#agent-action-status");
+  root.className = "action-status" + (className ? " " + className : "");
+  root.textContent = message;
+}
+function setWorkItemActionStatus(message, className){
+  const root = qs("#work-item-action-status");
+  if (!root) return;
   root.className = "action-status" + (className ? " " + className : "");
   root.textContent = message;
 }
@@ -1177,6 +1234,92 @@ function rolePriorityClass(priority){
   if (priority === "medium") return "warn";
   return "muted";
 }
+function workItemSourceKey(item){
+  return "role_queue:" + item.queue + ":" + item.dealId;
+}
+function workItemStatusClass(status){
+  if (status === "resolved") return "pass";
+  if (status === "waived") return "muted";
+  return "warn";
+}
+function workItemDefaultOwner(item){
+  if (item.queue === "ae_attention") return item.salesOwner || "ae.unassigned";
+  if (item.queue === "finance_review") return "finance.ops";
+  if (item.queue === "legal_review") return "legal.counsel";
+  if (item.queue === "deployment_readiness") return "deployment.ops";
+  return "growth.ops";
+}
+function workItemForSignal(item){
+  const sourceKey = workItemSourceKey(item);
+  return (state.workItems || []).find((workItem) => workItem.sourceKey === sourceKey) || null;
+}
+function roleQueueOpenEventId(item){
+  return randomUuidV4(["work-item-open", item.queue, item.dealId].join(":"));
+}
+async function openWorkItemFromSignal(item){
+  const existing = workItemForSignal(item);
+  if (existing) {
+    setWorkItemActionStatus("Work item already exists: " + existing.id, "warn");
+    return;
+  }
+  const actionKey = workItemSourceKey(item);
+  if (pendingWorkItemActions.has(actionKey)) return;
+  pendingWorkItemActions.add(actionKey);
+  renderRoleQueues();
+  renderWorkItems();
+  try {
+    setWorkItemActionStatus("Opening work item for " + item.company + "...", "");
+    const result = await fetchJson("/work-items", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        dealId: item.dealId,
+        queue: item.queue,
+        sourceEventId: roleQueueOpenEventId(item),
+        owner: workItemDefaultOwner(item),
+        createdBy: OPERATOR_PRINCIPAL,
+        reason: "Opened from " + (roleQueueLabels[item.queue] || item.queue) + " queue."
+      })
+    });
+    if (result.status === "recorded" || result.status === "duplicate" || result.status === "already_exists") {
+      setWorkItemActionStatus("Work item " + result.status + ": " + (result.workItem?.id || "-"), result.status === "recorded" ? "pass" : "warn");
+      await loadState();
+      return;
+    }
+    setWorkItemActionStatus("Work item open returned " + result.status, "fail");
+  } catch (err) {
+    const status = statusFromError(err);
+    setWorkItemActionStatus(
+      status
+        ? "Work item open returned " + status
+        : "Work item open failed: " + String(err),
+      status === "already_exists" ? "warn" : "fail"
+    );
+  } finally {
+    pendingWorkItemActions.delete(actionKey);
+    renderRoleQueues();
+    renderWorkItems();
+  }
+}
+function roleQueueActionCell(item){
+  const actionCell = document.createElement("td");
+  const existing = workItemForSignal(item);
+  const actionKey = workItemSourceKey(item);
+  if (pendingWorkItemActions.has(actionKey)) {
+    actionCell.textContent = "Opening...";
+  } else if (existing) {
+    actionCell.append(el("span", workItemStatusClass(existing.status), existing.status));
+  } else {
+    const button = el("button", "secondary", "Open");
+    button.type = "button";
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void openWorkItemFromSignal(item);
+    });
+    actionCell.append(button);
+  }
+  return actionCell;
+}
 function renderRoleQueues(){
   const root = qs("#role-queues");
   const queues = state.roleQueues || {};
@@ -1204,7 +1347,7 @@ function renderRoleQueues(){
   if (actionRows.length) {
     nodes.push(renderTable(
       actionRows,
-      ["Queue", "Priority", "Company", "ARR", "Sales Owner", "Status", "Reason"],
+      ["Queue", "Priority", "Company", "ARR", "Sales Owner", "Status", "Reason", "Work Item"],
       (item) => [
         cell(roleQueueLabels[item.queue] || item.queue),
         cell(item.priority, rolePriorityClass(item.priority)),
@@ -1212,7 +1355,8 @@ function renderRoleQueues(){
         cell(fmtMoney.format(item.amount)),
         cell(item.salesOwner || "-"),
         cell(item.status),
-        cell(item.reason)
+        cell(item.reason),
+        roleQueueActionCell(item)
       ]
     ));
   }
@@ -1232,6 +1376,117 @@ function renderRoleQueues(){
   }
   nodes.push(el("div", "muted", "Showing up to " + (state.roleQueueLimit || 50) + " rows per role from a bounded dashboard candidate set."));
   root.replaceChildren(...nodes);
+}
+function workItemActionEventId(item, action){
+  return deterministicUuidV4(
+    ["work-item-action", action, item.id, item.status, item.updatedAt].join(":")
+  );
+}
+async function actOnWorkItem(item, action){
+  const actionKey = item.id + ":" + action;
+  if (pendingWorkItemActions.has(actionKey)) return;
+  pendingWorkItemActions.add(actionKey);
+  renderWorkItems();
+  renderRoleQueues();
+  try {
+    const verb = action === "resolve" ? "Resolving" : "Waiving";
+    setWorkItemActionStatus(verb + " " + item.id + "...", "");
+    const result = await fetchJson("/work-items/" + encodeURIComponent(item.id) + "/action", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        action,
+        sourceEventId: workItemActionEventId(item, action),
+        humanPrincipal: OPERATOR_PRINCIPAL,
+        reason: action === "resolve"
+          ? "Resolved from operator console."
+          : "Waived from operator console."
+      })
+    });
+    if (result.status === "recorded" || result.status === "duplicate" || result.status === "superseded") {
+      setWorkItemActionStatus(
+        "Work item " + result.status + ": " + (result.workItem?.id || item.id),
+        result.status === "superseded" ? "warn" : "pass"
+      );
+      await loadState();
+      return;
+    }
+    setWorkItemActionStatus("Work item action returned " + result.status, result.status === "already_closed" ? "warn" : "fail");
+  } catch (err) {
+    const status = statusFromError(err);
+    setWorkItemActionStatus(
+      status
+        ? "Work item action returned " + status
+        : "Work item action failed: " + String(err),
+      status === "already_closed" || status === "invalid_action" ? "warn" : "fail"
+    );
+  } finally {
+    pendingWorkItemActions.delete(actionKey);
+    renderWorkItems();
+    renderRoleQueues();
+  }
+}
+function workItemActionCell(item){
+  const actionCell = document.createElement("td");
+  if (item.status !== "assigned") {
+    actionCell.textContent = item.resolutionReason || "-";
+    return actionCell;
+  }
+  if (
+    pendingWorkItemActions.has(item.id + ":resolve") ||
+    pendingWorkItemActions.has(item.id + ":waive")
+  ) {
+    actionCell.textContent = "Updating...";
+    return actionCell;
+  }
+  const actions = el("div", "inline-actions");
+  const resolve = el("button", "secondary", "Resolve");
+  const waive = el("button", "secondary", "Waive");
+  resolve.type = "button";
+  waive.type = "button";
+  resolve.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void actOnWorkItem(item, "resolve");
+  });
+  waive.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void actOnWorkItem(item, "waive");
+  });
+  actions.append(resolve, waive);
+  actionCell.append(actions);
+  return actionCell;
+}
+function renderWorkItems(){
+  const root = qs("#work-items");
+  if (!root) return;
+  const rows = state.workItems || [];
+  if (!rows.length) {
+    root.replaceChildren(el("div", "empty", "No work items yet. Open one from a role queue."));
+    return;
+  }
+  const table = el("table");
+  const head = document.createElement("tr");
+  ["Status", "Owner", "Queue", "Deal", "Priority", "Title", "Updated", "Action"].forEach((h) => head.append(el("th", null, h)));
+  table.append(head);
+  for (const item of rows) {
+    const row = el("tr", "selectable" + (item.dealId === selectedId ? " selected" : ""));
+    row.addEventListener("click", () => selectDeal(item.dealId));
+    row.append(
+      cell(item.status, workItemStatusClass(item.status)),
+      cell(item.owner),
+      cell(roleQueueLabels[item.queue] || item.queue),
+      cell(item.dealId),
+      cell(item.priority, rolePriorityClass(item.priority)),
+      cell(item.title),
+      cell(item.updatedAt),
+      workItemActionCell(item)
+    );
+    table.append(row);
+  }
+  root.replaceChildren(
+    table,
+    el("div", "muted", "Showing latest " + rows.length + " role-queue work items.")
+  );
 }
 const policySignalLabels = {
   self_serve_expanded: "Self-serve expanded",
@@ -1780,6 +2035,7 @@ function selectDeal(dealId){
   selectedId = dealId;
   renderQueue();
   renderRoleQueues();
+  renderWorkItems();
   renderPolicyEvaluation();
   renderPolicyRuns();
   renderAgentSuggestions();
@@ -1922,6 +2178,7 @@ async function loadState(){
     renderKpis();
     renderQueue();
     renderRoleQueues();
+    renderWorkItems();
     renderPolicyEvaluation();
     renderPolicyRuns();
     renderSuggestionSurfaces({ detail: false });
@@ -1937,6 +2194,7 @@ async function loadState(){
       qs("#kpis").replaceChildren(el("div", "empty", msg));
       qs("#queue").replaceChildren(el("div", "empty", msg));
       qs("#role-queues").replaceChildren(el("div", "empty", msg));
+      qs("#work-items").replaceChildren(el("div", "empty", msg));
       qs("#policy-evaluation").replaceChildren(el("div", "empty", msg));
       qs("#policy-runs").replaceChildren(el("div", "empty", msg));
       qs("#agent-suggestions").replaceChildren(el("div", "empty", msg));
@@ -3037,6 +3295,87 @@ function localAgentSuggestionDecisionStatusCode(
   }
 }
 
+function localWorkItemMutated(
+  status: ReturnType<Store["recordLocalWorkItem"]>["status"],
+): boolean {
+  switch (status) {
+    case "recorded":
+      return true;
+    case "duplicate":
+    case "idempotency_conflict":
+    case "already_exists":
+      return false;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localWorkItemStatusCode(
+  status: ReturnType<Store["recordLocalWorkItem"]>["status"],
+): number {
+  switch (status) {
+    case "idempotency_conflict":
+      return 409;
+    case "recorded":
+    case "duplicate":
+    case "already_exists":
+      return 200;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localWorkItemActionMutated(
+  status: ReturnType<Store["recordLocalWorkItemAction"]>["status"],
+): boolean {
+  switch (status) {
+    case "recorded":
+    case "superseded":
+      return true;
+    case "duplicate":
+    case "idempotency_conflict":
+    case "not_found":
+    case "already_closed":
+    case "invalid_action":
+      return false;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function localWorkItemActionStatusCode(
+  status: ReturnType<Store["recordLocalWorkItemAction"]>["status"],
+): number {
+  switch (status) {
+    case "not_found":
+      return 404;
+    case "idempotency_conflict":
+    case "already_closed":
+      return 409;
+    case "invalid_action":
+      return 422;
+    case "recorded":
+    case "superseded":
+    case "duplicate":
+      return 200;
+    default:
+      return unreachableStatus(status);
+  }
+}
+
+function findRoleQueueSignal(
+  store: Store,
+  queue: RoleQueueKind,
+  dealId: string,
+): RoleQueueItem | null {
+  const readiness = store.deploymentReadinessRecords(new Date().toISOString());
+  return (
+    store
+      .roleQueues(250, readiness)
+      [queue].find((item) => item.dealId === dealId) ?? null
+  );
+}
+
 async function handleLocalDeploymentFacts(
   req: IncomingMessage,
   res: ServerResponse,
@@ -3721,6 +4060,153 @@ async function handleLocalAgentSuggestionDecision(
   json(res, localAgentSuggestionDecisionStatusCode(result.status), result);
 }
 
+async function handleLocalWorkItem(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/work-items")) return;
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalWorkItemBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid work-item request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = resolveCanonicalTimestamp(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (occurredAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+  let dueAtValue: string | undefined;
+  if (body.data.dueAt) {
+    const dueAt = resolveCanonicalTimestamp(body.data.dueAt);
+    if (!dueAt) {
+      json(res, 400, {
+        error: "dueAt must be a canonical UTC ISO timestamp",
+      });
+      return;
+    }
+    dueAtValue = dueAt.value;
+  }
+
+  const signal = findRoleQueueSignal(store, body.data.queue, body.data.dealId);
+  if (!signal) {
+    json(res, 409, {
+      status: "not_in_queue",
+      error: "deal is not currently in that role queue",
+      dealId: body.data.dealId,
+      queue: body.data.queue,
+    });
+    return;
+  }
+
+  // Local-only: createdBy is an operator label supplied with the loopback
+  // secret. A production surface must bind this to authenticated identity.
+  const result = store.recordLocalWorkItem(
+    {
+      dealId: body.data.dealId,
+      queue: body.data.queue,
+      sourceEventId: body.data.sourceEventId,
+      owner: body.data.owner,
+      createdBy: body.data.createdBy,
+      occurredAt: occurredAt.value,
+      ...(dueAtValue ? { dueAt: dueAtValue } : {}),
+      ...(body.data.reason !== undefined ? { reason: body.data.reason } : {}),
+    },
+    signal,
+  );
+  if (localWorkItemMutated(result.status)) invalidateStateCache();
+  json(res, localWorkItemStatusCode(result.status), result);
+}
+
+async function handleLocalWorkItemAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  workItemId: string,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/work-items/:id/action")) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalWorkItemActionBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid work-item action request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const occurredAt = resolveCanonicalTimestamp(body.data.occurredAt);
+  if (!occurredAt) {
+    json(res, 400, {
+      error: "occurredAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (occurredAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `occurredAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  // Local-only: humanPrincipal is self-reported by the operator holding the
+  // local secret, matching the rest of this console's command endpoints.
+  const result = store.recordLocalWorkItemAction({
+    workItemId,
+    sourceEventId: body.data.sourceEventId,
+    action: body.data.action,
+    humanPrincipal: body.data.humanPrincipal,
+    occurredAt: occurredAt.value,
+    reason: body.data.reason,
+    ...(body.data.owner ? { owner: body.data.owner } : {}),
+  });
+  if (localWorkItemActionMutated(result.status)) invalidateStateCache();
+  json(res, localWorkItemActionStatusCode(result.status), result);
+}
+
 async function handleLocalPolicyRecommendationRun(
   req: IncomingMessage,
   res: ServerResponse,
@@ -4131,6 +4617,33 @@ async function handleRequest(
       res,
       store,
       localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/work-items") {
+    await handleLocalWorkItem(
+      req,
+      res,
+      store,
+      localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  const workItemActionMatch = url.match(/^\/work-items\/([^/]+)\/action$/);
+  if (method === "POST" && workItemActionMatch) {
+    const workItemId = safeDecodeURIComponent(workItemActionMatch[1] ?? "");
+    if (workItemId === null) {
+      json(res, 400, { error: "work item id is not valid URL encoding" });
+      return;
+    }
+    await handleLocalWorkItemAction(
+      req,
+      res,
+      store,
+      localWrites,
+      workItemId,
       invalidateStateCache,
     );
     return;

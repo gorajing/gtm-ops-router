@@ -3273,6 +3273,221 @@ describe("Store readiness derivation", () => {
     });
   });
 
+  it("opens and closes role-queue work items with idempotent local commands", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item";
+      deal.company = "Work Item Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "51515151-5151-4151-9151-515151515151",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(opened.status).toBe("recorded");
+      expect(opened.workItem).toBeDefined();
+      const workItemId = opened.workItem!.id;
+      expect(opened.workItem).toEqual(
+        expect.objectContaining({
+          dealId: deal.id,
+          queue: "ae_attention",
+          status: "assigned",
+          owner: "ae.morgan",
+          sourceKey: "role_queue:ae_attention:D-work-item",
+        }),
+      );
+
+      const duplicate = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "51515151-5151-4151-9151-515151515151",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(duplicate.status).toBe("duplicate");
+
+      const alreadyExists = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "52525252-5252-4252-9252-525252525252",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:05:00.000Z",
+          reason: "Second operator click.",
+        },
+        signal,
+      );
+      expect(alreadyExists.status).toBe("already_exists");
+
+      const reassigned = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "56565656-5656-4656-9656-565656565656",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:08:00.000Z",
+        owner: "ae.taylor",
+        reason: "Taylor owns this lane.",
+      });
+      expect(reassigned.status).toBe("recorded");
+      expect(reassigned.workItem?.owner).toBe("ae.taylor");
+
+      const staleAssign = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "57575757-5757-4757-9757-575757575757",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:06:00.000Z",
+        owner: "ae.older",
+        reason: "Older owner update arrived late.",
+      });
+      expect(staleAssign.status).toBe("superseded");
+      expect(staleAssign.workItem?.owner).toBe("ae.taylor");
+
+      const staleWaive = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "58585858-5858-4858-9858-585858585858",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:06:30.000Z",
+        reason: "Older terminal update arrived late.",
+      });
+      expect(staleWaive.status).toBe("superseded");
+      expect(staleWaive.workItem?.status).toBe("assigned");
+
+      const resolved = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "53535353-5353-4353-9353-535353535353",
+        action: "resolve",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:10:00.000Z",
+        reason: "AE followed up.",
+      });
+      expect(resolved.status).toBe("recorded");
+      expect(resolved.workItem).toEqual(
+        expect.objectContaining({
+          status: "resolved",
+          resolvedBy: "operator-console",
+          resolutionReason: "AE followed up.",
+        }),
+      );
+
+      const afterClose = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "54545454-5454-4454-9454-545454545454",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:15:00.000Z",
+        reason: "No longer needed.",
+      });
+      expect(afterClose.status).toBe("already_closed");
+
+      const assignAfterClose = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "59595959-5959-4959-9959-595959595959",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:16:00.000Z",
+        owner: "ae.closed",
+        reason: "Closed items should not be reassigned.",
+      });
+      expect(assignAfterClose.status).toBe("already_closed");
+
+      const reopened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "55555555-5555-4555-9555-555555555555",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:20:00.000Z",
+          reason: "Deal returned to the queue.",
+        },
+        signal,
+      );
+      expect(reopened.status).toBe("recorded");
+      expect(reopened.workItem).toEqual(
+        expect.objectContaining({
+          sourceKey: "role_queue:ae_attention:D-work-item",
+          status: "assigned",
+          resolvedAt: null,
+          resolvedBy: null,
+          resolutionReason: null,
+        }),
+      );
+      expect(reopened.workItem?.id).not.toBe(workItemId);
+      // The operator queue renders currently assigned work before closed history.
+      expect(store.workItems()).toEqual([
+        expect.objectContaining({
+          id: reopened.workItem?.id,
+          status: "assigned",
+        }),
+        expect.objectContaining({
+          id: workItemId,
+          status: "resolved",
+        }),
+      ]);
+    });
+  });
+
+  it("waives assigned role-queue work items", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-waive-work-item";
+      deal.company = "Waive Work Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "61616161-6161-4161-9161-616161616161",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T16:00:00.000Z",
+        },
+        signal,
+      );
+      expect(opened.workItem).toBeDefined();
+      const workItemId = opened.workItem!.id;
+      const waived = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "62626262-6262-4262-9262-626262626262",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T16:05:00.000Z",
+        reason: "Queue signal reviewed and waived.",
+      });
+
+      expect(waived.status).toBe("recorded");
+      expect(waived.workItem).toEqual(
+        expect.objectContaining({
+          status: "waived",
+          resolvedBy: "operator-console",
+          resolutionReason: "Queue signal reviewed and waived.",
+        }),
+      );
+    });
+  });
+
 	  it("evaluates routing policy against post-sale outcomes without changing policy", () => {
 	    withTempStore((store) => {
       const closeDeal = (

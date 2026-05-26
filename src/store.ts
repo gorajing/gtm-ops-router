@@ -36,6 +36,8 @@ import {
   AgentSuggestionKind,
   AgentSuggestionStatus,
   DEPLOYMENT_BLOCKERS,
+  ROLE_QUEUE_KINDS,
+  WorkItemStatus,
   PROVIDER_OBSERVATION_PROVIDERS,
   PROVIDER_OBSERVATION_SUBJECT_TYPES,
   ProviderObservationProvider,
@@ -99,12 +101,19 @@ import {
   type ReadinessNotificationClaim,
   type ReadinessNotificationDeliveryResult,
   type ReadinessNotificationRecordStatus,
+  type LocalWorkItemActionInput,
+  type LocalWorkItemActionResult,
+  type LocalWorkItemInput,
+  type LocalWorkItemWriteResult,
   type RoleQueueItem,
+  type RoleQueueKind,
   type RoleQueuePriority,
   type RoleQueues,
   type RoleQueueStatus,
   type RoutedDeal,
   type Stage,
+  type WorkItemRecord,
+  type WorkItemStatus as WorkItemStatusType,
 } from "./types.js";
 
 // Load the experimental built-in SQLite via createRequire. `node:sqlite`
@@ -171,6 +180,7 @@ const PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL = sqlStringList(
 const PROVIDER_OBSERVATION_PROVIDER_SQL = sqlStringList(
   PROVIDER_OBSERVATION_PROVIDERS,
 );
+const ROLE_QUEUE_KIND_SQL = sqlStringList(ROLE_QUEUE_KINDS);
 type NotifiableReadiness = Exclude<DeploymentReadiness, "not_required">;
 type OutcomeMetricRow = {
   id: string;
@@ -936,6 +946,62 @@ const SCHEMA: string[] = [
        )
      ),
      CHECK (decided_at IS NULL OR decided_at >= occurred_at)
+   )`,
+  `CREATE TABLE IF NOT EXISTS work_items (
+     id TEXT PRIMARY KEY,
+     source_kind TEXT NOT NULL,
+     source_key TEXT NOT NULL,
+     deal_id TEXT NOT NULL,
+     queue TEXT NOT NULL,
+     status TEXT NOT NULL,
+     priority TEXT NOT NULL,
+     owner TEXT NOT NULL,
+     title TEXT NOT NULL,
+     description TEXT NOT NULL,
+     due_at TEXT,
+     created_by TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     resolved_at TEXT,
+     resolved_by TEXT,
+     resolution_reason TEXT,
+     CHECK (source_kind IN ('role_queue')),
+     CHECK (queue IN (${ROLE_QUEUE_KIND_SQL})),
+     CHECK (status IN ('assigned', 'resolved', 'waived')),
+     CHECK (priority IN ('high', 'medium', 'low')),
+     CHECK (
+       status = 'assigned' OR
+       (
+         resolved_at IS NOT NULL AND
+         resolved_by IS NOT NULL AND
+         resolution_reason IS NOT NULL
+       )
+     ),
+     CHECK (
+       status != 'assigned' OR
+       (
+         resolved_at IS NULL AND
+         resolved_by IS NULL AND
+         resolution_reason IS NULL
+       )
+     )
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_assigned_source
+     ON work_items(source_key)
+     WHERE status = 'assigned'`,
+  `CREATE TABLE IF NOT EXISTS work_item_events (
+     id TEXT PRIMARY KEY,
+     work_item_id TEXT NOT NULL,
+     action TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     event_key TEXT NOT NULL UNIQUE,
+     source_payload_hash TEXT NOT NULL,
+     actor TEXT NOT NULL,
+     owner TEXT,
+     reason TEXT NOT NULL,
+     occurred_at TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     CHECK (action IN ('opened', 'open_attempted', 'assign', 'resolve', 'waive', 'already_closed', 'superseded', 'invalid_action'))
    )`,
   `CREATE TABLE IF NOT EXISTS policy_recommendation_runs (
      id TEXT PRIMARY KEY,
@@ -4646,6 +4712,519 @@ export class Store {
           ? String(row.decision_reason)
           : null,
     };
+  }
+
+  workItems(limit = 50): WorkItemRecord[] {
+    const normalizedLimit = Number.isFinite(limit) ? limit : 50;
+    const cappedLimit = Math.max(1, Math.min(250, normalizedLimit));
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM work_items
+         ORDER BY
+           CASE status
+             WHEN 'assigned' THEN 0
+             WHEN 'resolved' THEN 1
+             WHEN 'waived' THEN 2
+             ELSE 3
+           END,
+           CASE priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           updated_at DESC,
+           id
+         LIMIT ?`,
+      )
+      .all(cappedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.workItemFromRow(row));
+  }
+
+  recordLocalWorkItem(
+    input: LocalWorkItemInput,
+    signal: RoleQueueItem,
+  ): LocalWorkItemWriteResult {
+    // Caller must resolve this from roleQueues immediately before writing; the
+    // store checks identity but does not re-run the full queue projection.
+    assertCanonicalIsoUtc(input.occurredAt, "work item occurredAt");
+    if (input.dueAt) assertCanonicalIsoUtc(input.dueAt, "work item dueAt");
+    if (input.dealId !== signal.dealId || input.queue !== signal.queue) {
+      throw new Error("work item input does not match role queue signal");
+    }
+    const sourceKey = this.workItemSourceKey(input.queue, input.dealId);
+    const eventKey = JSON.stringify([
+      "work_item",
+      "role_queue",
+      sourceKey,
+      input.sourceEventId,
+    ]);
+    const { occurredAt: _occurredAt, reason: _reason, ...stableInput } = input;
+    // Open notes are operator context, not the identity of the open command.
+    // Signal detail is likewise a point-in-time snapshot used to describe the
+    // work item, so retries do not fail when queue priority/reason text evolves.
+    const payloadHash = sha256Hex(
+      canonicalJson({
+        input: stableInput,
+        sourceKey,
+      }),
+    );
+
+    return this.transactionImmediate(() => {
+      const replay = this.workItemReplayResult(
+        eventKey,
+        payloadHash,
+      );
+      if (replay) return replay;
+
+      const existing = this.assignedWorkItemBySourceKey(sourceKey);
+      if (existing) {
+        this.insertWorkItemEvent({
+          workItemId: existing.id,
+          action: "open_attempted",
+          sourceEventId: input.sourceEventId,
+          eventKey,
+          payloadHash,
+          actor: input.createdBy,
+          owner: input.owner,
+          reason:
+            input.reason ??
+            "Open requested while an assigned work item already existed.",
+          occurredAt: input.occurredAt,
+          createdAt: new Date().toISOString(),
+        });
+        return this.localWorkItemResult("already_exists", eventKey, existing);
+      }
+
+      const now = new Date().toISOString();
+      const workItemId = `WI-${sha256Hex(`${sourceKey}:${input.sourceEventId}`).slice(0, 20)}`;
+      const arrDescription = Number.isFinite(signal.amount)
+        ? `$${Math.round(signal.amount).toLocaleString("en-US")}`
+        : "unknown";
+      const title = `${this.roleQueueLabel(signal.queue)}: ${signal.company}`;
+      const description = [
+        signal.reason,
+        `Status: ${signal.status}`,
+        `ARR: ${arrDescription}`,
+        input.reason ? `Operator note: ${input.reason}` : "",
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      this.db
+        .prepare(
+          `INSERT INTO work_items (
+             id, source_kind, source_key, deal_id, queue, status, priority,
+             owner, title, description, due_at, created_by, created_at,
+             updated_at
+           )
+           VALUES (?, 'role_queue', ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          workItemId,
+          sourceKey,
+          input.dealId,
+          input.queue,
+          signal.priority,
+          input.owner,
+          title,
+          description,
+          input.dueAt ?? null,
+          input.createdBy,
+          input.occurredAt,
+          input.occurredAt,
+        );
+      this.insertWorkItemEvent({
+        workItemId,
+        action: "opened",
+        sourceEventId: input.sourceEventId,
+        eventKey,
+        payloadHash,
+        actor: input.createdBy,
+        owner: input.owner,
+        reason: input.reason ?? "Opened from role queue.",
+        occurredAt: input.occurredAt,
+        createdAt: now,
+      });
+      this.appendEvent(
+        input.dealId,
+        "routed",
+        "routed",
+        `work_item_opened: ${workItemId} ${input.queue} owner ${input.owner}`,
+      );
+      return this.localWorkItemResult(
+        "recorded",
+        eventKey,
+        this.workItemById(workItemId),
+      );
+    });
+  }
+
+  recordLocalWorkItemAction(
+    input: LocalWorkItemActionInput,
+  ): LocalWorkItemActionResult {
+    assertCanonicalIsoUtc(input.occurredAt, "work item action occurredAt");
+    const eventKey = JSON.stringify([
+      "work_item_action",
+      input.workItemId,
+      input.action,
+      input.sourceEventId,
+    ]);
+    const { occurredAt: _occurredAt, ...stableInput } = input;
+    // Action reasons are persisted as resolution evidence, so changing them
+    // under the same event key is an idempotency conflict rather than a retry.
+    const payloadHash = sha256Hex(canonicalJson(stableInput));
+
+    return this.transactionImmediate(() => {
+      const replay = this.workItemActionReplayResult(
+        eventKey,
+        payloadHash,
+      );
+      if (replay) return replay;
+
+      const current = this.workItemById(input.workItemId);
+      if (!current) {
+        return this.localWorkItemActionResult("not_found", eventKey, null);
+      }
+      if (current.status !== "assigned") {
+        this.insertWorkItemEvent({
+          workItemId: input.workItemId,
+          action: "already_closed",
+          sourceEventId: input.sourceEventId,
+          eventKey,
+          payloadHash,
+          actor: input.humanPrincipal,
+          owner: input.owner ?? null,
+          reason: input.reason,
+          occurredAt: input.occurredAt,
+          createdAt: new Date().toISOString(),
+        });
+        this.appendEvent(
+          current.dealId,
+          "routed",
+          "routed",
+          `work_item_${input.action}_already_closed_noop: ${input.workItemId} by ${input.humanPrincipal}`,
+        );
+        return this.localWorkItemActionResult("already_closed", eventKey, current);
+      }
+      const now = new Date().toISOString();
+      // Recency is a projection rule, not an audit rule: older actions,
+      // including terminal attempts, are logged as superseded no-ops so an old
+      // backfill cannot close or reassign newer operator work. If these local
+      // commands ever become distributed writes, replace client occurredAt as
+      // the ordering key with a server-assigned monotonic sequence.
+      const actionStatus: LocalWorkItemActionResult["status"] =
+        input.occurredAt < current.updatedAt ? "superseded" : "recorded";
+      const nextUpdatedAt =
+        input.occurredAt > current.updatedAt ? input.occurredAt : current.updatedAt;
+      if (input.action === "assign") {
+        const nextOwner = input.owner;
+        if (!nextOwner) {
+          this.insertWorkItemEvent({
+            workItemId: input.workItemId,
+            action: "invalid_action",
+            sourceEventId: input.sourceEventId,
+            eventKey,
+            payloadHash,
+            actor: input.humanPrincipal,
+            owner: null,
+            reason: input.reason,
+            occurredAt: input.occurredAt,
+            createdAt: new Date().toISOString(),
+          });
+          this.appendEvent(
+            current.dealId,
+            "routed",
+            "routed",
+            `work_item_assign_invalid_action_noop: ${input.workItemId} by ${input.humanPrincipal} missing owner`,
+          );
+          return this.localWorkItemActionResult("invalid_action", eventKey, current);
+        }
+        if (actionStatus === "recorded") {
+          this.db
+            .prepare(
+              `UPDATE work_items
+               SET owner = ?, updated_at = ?
+               WHERE id = ?
+                 AND status = 'assigned'`,
+            )
+            .run(nextOwner, nextUpdatedAt, input.workItemId);
+        }
+      } else {
+        const nextStatus: Exclude<WorkItemStatusType, "assigned"> =
+          input.action === "resolve" ? "resolved" : "waived";
+        if (actionStatus === "recorded") {
+          this.db
+            .prepare(
+              `UPDATE work_items
+               SET status = ?,
+                   updated_at = ?,
+                   resolved_at = ?,
+                   resolved_by = ?,
+                   resolution_reason = ?
+               WHERE id = ?
+                 AND status = 'assigned'`,
+            )
+            .run(
+              nextStatus,
+              nextUpdatedAt,
+              input.occurredAt,
+              input.humanPrincipal,
+              input.reason,
+              input.workItemId,
+            );
+        }
+      }
+      this.insertWorkItemEvent({
+        workItemId: input.workItemId,
+        action: actionStatus === "superseded" ? "superseded" : input.action,
+        sourceEventId: input.sourceEventId,
+        eventKey,
+        payloadHash,
+        actor: input.humanPrincipal,
+        owner: input.owner ?? null,
+        reason: input.reason,
+        occurredAt: input.occurredAt,
+        createdAt: now,
+      });
+      const updated = this.workItemById(input.workItemId);
+      if (!updated) {
+        throw new Error("work item disappeared during action write");
+      }
+      this.appendEvent(
+        updated.dealId,
+        "routed",
+        "routed",
+        actionStatus === "superseded"
+          ? `work_item_${input.action}_superseded_noop: ${input.workItemId} by ${input.humanPrincipal} older than current projection`
+          : `work_item_${input.action}: ${input.workItemId} by ${input.humanPrincipal}`,
+      );
+      return this.localWorkItemActionResult(actionStatus, eventKey, updated);
+    });
+  }
+
+  private workItemReplayResult(
+    eventKey: string,
+    payloadHash: string,
+  ): LocalWorkItemWriteResult | null {
+    const event = this.workItemEventByEventKey(eventKey);
+    if (!event) return null;
+    const item = this.workItemById(event.workItemId);
+    if (!item) {
+      throw new Error("work item event was claimed without a work item row");
+    }
+    if (event.sourcePayloadHash !== payloadHash) {
+      return this.localWorkItemResult("idempotency_conflict", eventKey, item);
+    }
+    if (event.action === "open_attempted") {
+      // "Already exists" should describe the current active blocker, not a
+      // historical blocker that may have closed since the no-op was logged.
+      const activeItem =
+        item.status === "assigned"
+          ? item
+          : this.assignedWorkItemBySourceKey(item.sourceKey);
+      return this.localWorkItemResult(
+        activeItem ? "already_exists" : "duplicate",
+        eventKey,
+        activeItem ?? item,
+      );
+    }
+    return this.localWorkItemResult(
+      "duplicate",
+      eventKey,
+      item,
+    );
+  }
+
+  private workItemActionReplayResult(
+    eventKey: string,
+    payloadHash: string,
+  ): LocalWorkItemActionResult | null {
+    const event = this.workItemEventByEventKey(eventKey);
+    if (!event) return null;
+    const item = this.workItemById(event.workItemId);
+    if (!item) {
+      throw new Error("work item event was claimed without a work item row");
+    }
+    if (event.sourcePayloadHash !== payloadHash) {
+      return this.localWorkItemActionResult(
+        "idempotency_conflict",
+        eventKey,
+        item,
+      );
+    }
+    return this.localWorkItemActionResult(
+      event.action === "already_closed"
+        ? "already_closed"
+        : event.action === "superseded"
+          ? "superseded"
+          : event.action === "invalid_action"
+            ? "invalid_action"
+            : "duplicate",
+      eventKey,
+      item,
+    );
+  }
+
+  private insertWorkItemEvent(event: {
+    workItemId: string;
+    action:
+      | "opened"
+      | "open_attempted"
+      | "already_closed"
+      | "superseded"
+      | "invalid_action"
+      | LocalWorkItemActionInput["action"];
+    sourceEventId: string;
+    eventKey: string;
+    payloadHash: string;
+    actor: string;
+    owner: string | null;
+    reason: string;
+    occurredAt: string;
+    createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO work_item_events (
+           id, work_item_id, action, source_event_id, event_key, source_payload_hash,
+           actor, owner, reason, occurred_at, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        `WIE-${sha256Hex(`${event.eventKey}:${event.payloadHash}`).slice(0, 20)}`,
+        event.workItemId,
+        event.action,
+        event.sourceEventId,
+        event.eventKey,
+        event.payloadHash,
+        event.actor,
+        event.owner,
+        event.reason,
+        event.occurredAt,
+        event.createdAt,
+      );
+  }
+
+  private workItemEventByEventKey(
+    eventKey: string,
+  ): {
+    workItemId: string;
+    action: string;
+    sourcePayloadHash: string;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT work_item_id, action, source_payload_hash
+         FROM work_item_events
+         WHERE event_key = ?`,
+      )
+      .get(eventKey) as
+      | { work_item_id: string; action: string; source_payload_hash: string }
+      | undefined;
+    return row
+      ? {
+          workItemId: row.work_item_id,
+          action: row.action,
+          sourcePayloadHash: row.source_payload_hash,
+        }
+      : null;
+  }
+
+  private workItemById(id: string): WorkItemRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM work_items WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.workItemFromRow(row) : null;
+  }
+
+  private assignedWorkItemBySourceKey(sourceKey: string): WorkItemRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM work_items
+         WHERE source_key = ?
+           AND status = 'assigned'
+         LIMIT 1`,
+      )
+      .get(sourceKey) as Record<string, unknown> | undefined;
+    return row ? this.workItemFromRow(row) : null;
+  }
+
+  private workItemFromRow(row: Record<string, unknown>): WorkItemRecord {
+    return {
+      id: String(row.id),
+      sourceKind: "role_queue",
+      sourceKey: String(row.source_key),
+      dealId: String(row.deal_id),
+      queue: this.parseRoleQueueKind(row.queue),
+      status: WorkItemStatus.parse(row.status),
+      priority: this.parseRoleQueuePriority(row.priority),
+      owner: String(row.owner),
+      title: String(row.title),
+      description: String(row.description),
+      dueAt: typeof row.due_at === "string" ? String(row.due_at) : null,
+      createdBy: String(row.created_by),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      resolvedAt:
+        typeof row.resolved_at === "string" ? String(row.resolved_at) : null,
+      resolvedBy:
+        typeof row.resolved_by === "string" ? String(row.resolved_by) : null,
+      resolutionReason:
+        typeof row.resolution_reason === "string"
+          ? String(row.resolution_reason)
+          : null,
+    };
+  }
+
+  private localWorkItemResult(
+    status: LocalWorkItemWriteResult["status"],
+    eventKey: string,
+    workItem: WorkItemRecord | null,
+  ): LocalWorkItemWriteResult {
+    return { status, eventKey, workItem };
+  }
+
+  private localWorkItemActionResult(
+    status: LocalWorkItemActionResult["status"],
+    eventKey: string,
+    workItem: WorkItemRecord | null,
+  ): LocalWorkItemActionResult {
+    return { status, eventKey, workItem };
+  }
+
+  private workItemSourceKey(queue: RoleQueueKind, dealId: string): string {
+    return `role_queue:${queue}:${dealId}`;
+  }
+
+  private roleQueueLabel(queue: RoleQueueKind): string {
+    const labels: Record<RoleQueueKind, string> = {
+      ae_attention: "AE attention",
+      finance_review: "Finance review",
+      legal_review: "Legal review",
+      deployment_readiness: "Deployment readiness",
+      growth_attribution: "Growth attribution",
+    };
+    return labels[queue];
+  }
+
+  private parseRoleQueueKind(value: unknown): RoleQueueKind {
+    if (
+      typeof value === "string" &&
+      ROLE_QUEUE_KINDS.includes(value as RoleQueueKind)
+    ) {
+      return value as RoleQueueKind;
+    }
+    throw new Error(`invalid role queue kind: ${String(value)}`);
+  }
+
+  private parseRoleQueuePriority(value: unknown): RoleQueuePriority {
+    if (value === "high" || value === "medium" || value === "low") {
+      return value;
+    }
+    throw new Error(`invalid role queue priority: ${String(value)}`);
   }
 
   private deriveDeploymentReadiness(
