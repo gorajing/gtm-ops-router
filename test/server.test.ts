@@ -3278,6 +3278,8 @@ describe("server dashboard", () => {
       "submit-btn": "button",
       "work-item-action-status": "div",
       "work-items": "div",
+      "workflow-guide": "div",
+      "workflow-mode": "button",
     });
     type DashboardStateBase = {
       metrics: Record<string, unknown>;
@@ -3393,6 +3395,7 @@ describe("server dashboard", () => {
           title: "AE attention: Console Co",
           description: "needs follow-up",
           dueAt: null,
+          agentSuggestionSourceEventId: "11111111-1111-4111-8111-111111111111",
           createdBy: "operator-console",
           createdAt: "2026-05-24T15:00:00.000Z",
           updatedAt: "2026-05-24T15:00:00.000Z",
@@ -3690,6 +3693,7 @@ describe("server dashboard", () => {
         Intl,
         localStorage: storage,
         sessionStorage: storage,
+        URLSearchParams,
         setTimeout: (_handler: unknown, delay?: number) => {
           scheduledTimeoutDelays.push(delay);
           return scheduledTimeoutDelays.length;
@@ -3699,6 +3703,9 @@ describe("server dashboard", () => {
           prompt: () => {
             promptCalls += 1;
             return null;
+          },
+          location: {
+            search: "?demo=operator",
           },
         },
       });
@@ -3728,6 +3735,14 @@ describe("server dashboard", () => {
     expect(document.text("work-items")).toContain("AE attention: Console Co");
     expect(document.text("work-items")).toContain("Resolve");
     expect(document.text("work-items")).toContain("assigned");
+    expect(document.text("workflow-mode")).toContain("Pause auto-follow");
+    expect(document.text("workflow-guide")).toContain("Console Co routed");
+    expect(document.text("workflow-guide")).toContain("AE signal");
+    expect(document.text("workflow-guide")).toContain("Assigned to ae.morgan");
+    expect(document.text("workflow-guide")).toContain("Draft proposed");
+    expect(document.text("workflow-guide")).toContain("Human decision needed");
+    expect(document.text("workflow-guide")).toContain("Accept draft");
+    expect(document.text("workflow-guide")).toContain("Reject draft");
     expect(document.text("agent-suggestions")).toContain(
       "Unblock stalled deployment",
     );
@@ -5120,7 +5135,7 @@ describe("server dashboard", () => {
     expect(dashboard).toContain("/quarantine-replay");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
     expect(dashboard).toContain("agent-suggestion-runs/work-items");
-    expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
+    expect(dashboard).toContain('encodeURIComponent(activeSuggestion.id) + "/decision"');
     expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");
     expect(dashboard).toContain("sessionStorage");
     expect(dashboard).not.toContain(payload.company);

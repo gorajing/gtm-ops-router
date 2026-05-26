@@ -522,6 +522,19 @@ function consoleHtml(sinkLabel: string): string {
  .suggestion-title{font-weight:700;color:var(--ink);margin-bottom:5px;overflow-wrap:anywhere}
  .suggestion-body{border:1px solid var(--line);background:var(--soft);border-radius:5px;padding:7px 8px;margin:5px 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);max-height:120px;overflow:auto;user-select:text}
  .suggestion-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere;margin-top:4px}
+ .workflow-panel{margin-bottom:12px}
+ .workflow-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+ .workflow-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px;align-items:start}
+ .workflow-steps{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
+ .workflow-step{border:1px solid var(--line);border-radius:6px;background:#fff;padding:9px;min-height:112px}
+ .workflow-step.active{border-color:var(--blue);box-shadow:inset 0 0 0 1px rgba(36,94,219,.2)}
+ .workflow-step.complete{border-color:rgba(8,122,85,.48);background:#f3fbf7}
+ .workflow-step.waiting{background:var(--soft)}
+ .workflow-step-label{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+ .workflow-step-title{font-weight:700;margin-top:5px;overflow-wrap:anywhere}
+ .workflow-step-detail{font-size:12px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}
+ .workflow-lineage{display:grid;gap:6px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+ .workflow-next{display:grid;gap:8px;border:1px solid var(--line);background:var(--soft);border-radius:6px;padding:10px}
  dialog{border:1px solid var(--line);border-radius:8px;padding:0;max-width:460px;width:calc(100% - 32px);color:var(--ink);box-shadow:0 14px 44px rgba(20,24,32,.24)}
  dialog::backdrop{background:rgba(20,24,32,.42)}
  .dialog-body{display:grid;gap:10px;padding:16px}
@@ -531,8 +544,8 @@ function consoleHtml(sinkLabel: string): string {
  .dialog-draft{border:1px solid var(--line);background:var(--soft);border-radius:5px;padding:9px 10px;max-height:160px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
  .queue-wrap{max-height:560px;overflow:auto}.exceptions,.handoff-wrap{max-height:260px;overflow:auto}
  .footer{color:var(--muted);font-size:12px;margin-top:12px}
- @media(max-width:1180px){.layout,.top{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
- @media(max-width:640px){.shell{padding:14px}.two,.kpis{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.stamp{white-space:normal}.layout{grid-template-columns:1fr}.queue-wrap{max-height:none}}
+ @media(max-width:1180px){.layout,.top,.workflow-grid{grid-template-columns:1fr}.workflow-steps{grid-template-columns:1fr 1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ @media(max-width:640px){.shell{padding:14px}.two,.kpis,.workflow-steps{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.stamp{white-space:normal}.layout{grid-template-columns:1fr}.queue-wrap{max-height:none}}
 </style></head><body>
 <div class="shell">
 <header>
@@ -552,6 +565,13 @@ function consoleHtml(sinkLabel: string): string {
   <div class="health" id="health"><div class="empty">Checking...</div></div>
  </section>
 </div>
+<section class="panel workflow-panel">
+ <div class="workflow-head">
+  <h2>Operator Workflow</h2>
+  <button type="button" class="secondary" id="workflow-mode" hidden>Guided</button>
+ </div>
+ <div id="workflow-guide"><div class="empty">Loading workflow...</div></div>
+</section>
 <div class="layout">
  <section class="panel">
   <h2>New Deal Intake</h2>
@@ -652,8 +672,10 @@ const WORK_ITEM_SUGGESTION_RUNNER = "console-work-item-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
 const MANUAL_ENRICHMENT_MAX_EMPLOYEES = ${MAX_MANUAL_ENRICHMENT_EMPLOYEES};
 const MANUAL_ENRICHMENT_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const OPERATOR_DEMO_MODE = new URLSearchParams(window.location.search).get("demo") === "operator";
 let state = null;
 let selectedId = null;
+let demoAutoPilotPaused = false;
 let agentSuggestionFilter = "open";
 const warnedAgentSuggestionStatuses = new Set();
 let stateRequestSeq = 0;
@@ -661,6 +683,7 @@ let healthRequestSeq = 0;
 let detailRequestSeq = 0;
 const pendingSuggestionDecisions = new Set();
 const pendingWorkItemActions = new Set();
+let workItemDraftRunPending = false;
 
 function qs(sel){ return document.querySelector(sel); }
 function el(tag, className, text){
@@ -1227,12 +1250,21 @@ function renderExceptions(){
   }
   root.replaceChildren(table);
 }
+const roleQueueOrder = ${JSON.stringify(ROLE_QUEUE_KINDS)};
 const roleQueueLabels = {
   ae_attention: "AE",
   finance_review: "Finance",
   legal_review: "Legal",
   deployment_readiness: "Deployment",
   growth_attribution: "Growth"
+};
+// Action queues are every ROLE_QUEUE_KIND except growth_attribution, which is attribution-only.
+const actionWorkQueueKeys = roleQueueOrder.filter((queue) => queue !== "growth_attribution");
+const suggestionKindLabels = {
+  handoff_summary: "Handoff",
+  missing_field_question: "Missing field",
+  stale_deal_nudge: "Stale deal",
+  policy_change_recommendation: "Policy"
 };
 function rolePriorityClass(priority){
   if (priority === "high") return "fail";
@@ -1261,7 +1293,11 @@ function workItemForSignal(item){
 function roleQueueOpenEventId(item){
   return randomUuidV4(["work-item-open", item.queue, item.dealId].join(":"));
 }
+function pauseDemoAutoPilot(){
+  if (OPERATOR_DEMO_MODE) demoAutoPilotPaused = true;
+}
 async function openWorkItemFromSignal(item){
+  pauseDemoAutoPilot();
   const existing = workItemForSignal(item);
   if (existing) {
     setWorkItemActionStatus("Work item already exists: " + existing.id, "warn");
@@ -1272,6 +1308,7 @@ async function openWorkItemFromSignal(item){
   pendingWorkItemActions.add(actionKey);
   renderRoleQueues();
   renderWorkItems();
+  renderWorkflowGuide();
   try {
     setWorkItemActionStatus("Opening work item for " + item.company + "...", "");
     const result = await fetchJson("/work-items", {
@@ -1304,6 +1341,7 @@ async function openWorkItemFromSignal(item){
     pendingWorkItemActions.delete(actionKey);
     renderRoleQueues();
     renderWorkItems();
+    renderWorkflowGuide();
   }
 }
 function roleQueueActionCell(item){
@@ -1328,8 +1366,7 @@ function roleQueueActionCell(item){
 function renderRoleQueues(){
   const root = qs("#role-queues");
   const queues = state.roleQueues || {};
-  const actionQueueKeys = ["ae_attention", "finance_review", "legal_review", "deployment_readiness"];
-  const actionRows = actionQueueKeys.flatMap((queue) => queues[queue] || []);
+  const actionRows = actionWorkQueueKeys.flatMap((queue) => queues[queue] || []);
   const growthRows = queues.growth_attribution || [];
   if (!actionRows.length && !growthRows.length) {
     root.replaceChildren(el("div", "empty", "No role-specific queue items."));
@@ -1388,11 +1425,13 @@ function workItemActionEventId(item, action){
   );
 }
 async function actOnWorkItem(item, action){
+  pauseDemoAutoPilot();
   const actionKey = item.id + ":" + action;
   if (pendingWorkItemActions.has(actionKey)) return;
   pendingWorkItemActions.add(actionKey);
   renderWorkItems();
   renderRoleQueues();
+  renderWorkflowGuide();
   try {
     const verb = action === "resolve" ? "Resolving" : "Waiving";
     setWorkItemActionStatus(verb + " " + item.id + "...", "");
@@ -1429,6 +1468,7 @@ async function actOnWorkItem(item, action){
     pendingWorkItemActions.delete(actionKey);
     renderWorkItems();
     renderRoleQueues();
+    renderWorkflowGuide();
   }
 }
 function workItemActionCell(item){
@@ -1460,6 +1500,348 @@ function workItemActionCell(item){
   actions.append(resolve, waive);
   actionCell.append(actions);
   return actionCell;
+}
+function roleQueueKeys(){
+  return roleQueueOrder;
+}
+function rolePriorityRank(priority){
+  if (priority === "high") return 0;
+  if (priority === "medium") return 1;
+  return 2;
+}
+function workflowRoleQueueRows(){
+  const queues = state?.roleQueues || {};
+  return roleQueueKeys()
+    .flatMap((key) => queues[key] || [])
+    .sort((a, b) => {
+      const actionDelta = Number(isActionWorkQueue(b.queue)) - Number(isActionWorkQueue(a.queue));
+      if (actionDelta !== 0) return actionDelta;
+      const priorityDelta = rolePriorityRank(a.priority) - rolePriorityRank(b.priority);
+      if (priorityDelta !== 0) return priorityDelta;
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+    });
+}
+function isActionWorkQueue(queue){
+  return actionWorkQueueKeys.includes(queue);
+}
+function roleQueueSignalForDeal(dealId, workItem){
+  const rows = workflowRoleQueueRows().filter((item) => item.dealId === dealId);
+  if (workItem) {
+    return rows.find((item) => item.queue === workItem.queue) || null;
+  }
+  return rows[0] || null;
+}
+function workItemsForDeal(dealId){
+  return (state.workItems || [])
+    .filter((item) => item.dealId === dealId)
+    .sort((a, b) => {
+      const statusRank = (item) => item.status === "assigned" ? 0 : (item.status === "resolved" ? 1 : 2);
+      const rankDelta = statusRank(a) - statusRank(b);
+      if (rankDelta !== 0) return rankDelta;
+      const aUpdatedAt = String(a.updatedAt || "");
+      const bUpdatedAt = String(b.updatedAt || "");
+      if (aUpdatedAt !== bUpdatedAt) return bUpdatedAt.localeCompare(aUpdatedAt);
+      return String(b.id || "").localeCompare(String(a.id || ""));
+    });
+}
+function primaryWorkItemForDeal(dealId){
+  return workItemsForDeal(dealId)[0] || null;
+}
+function suggestionsForDeal(dealId){
+  return (state.agentSuggestions || [])
+    .filter((suggestion) => suggestion.dealId === dealId)
+    .sort((a, b) => {
+      const statusRank = (suggestion) => suggestion.status === "proposed" ? 0 : (suggestion.status === "accepted" ? 1 : 2);
+      const rankDelta = statusRank(a) - statusRank(b);
+      if (rankDelta !== 0) return rankDelta;
+      const aTime = String(a.status === "proposed" ? (a.createdAt || "") : (a.decidedAt || a.createdAt || ""));
+      const bTime = String(b.status === "proposed" ? (b.createdAt || "") : (b.decidedAt || b.createdAt || ""));
+      if (aTime !== bTime) return bTime.localeCompare(aTime);
+      return String(b.id || "").localeCompare(String(a.id || ""));
+    });
+}
+function primarySuggestionForDeal(dealId, workItem){
+  const rows = suggestionsForDeal(dealId);
+  if (workItem) {
+    if (!workItem.agentSuggestionSourceEventId) return null;
+    const direct = rows.find((suggestion) => suggestion.sourceEventId === workItem.agentSuggestionSourceEventId);
+    if (direct) return direct;
+    return null;
+  }
+  return rows.find((suggestion) => suggestion.status === "proposed") || null;
+}
+function workflowDealIds(){
+  const ids = new Set();
+  for (const deal of state.queue || []) ids.add(deal.id);
+  for (const item of workflowRoleQueueRows()) ids.add(item.dealId);
+  for (const item of state.workItems || []) ids.add(item.dealId);
+  for (const suggestion of state.agentSuggestions || []) ids.add(suggestion.dealId);
+  for (const readiness of state.deploymentReadiness || []) ids.add(readiness.dealId);
+  return ids;
+}
+function preferredWorkflowDealId(){
+  const assignedWorkItem = (state.workItems || [])
+    .filter((item) => item.status === "assigned")
+    .sort((a, b) => {
+      const priorityDelta = rolePriorityRank(a.priority) - rolePriorityRank(b.priority);
+      if (priorityDelta !== 0) return priorityDelta;
+      const aUpdatedAt = String(a.updatedAt || "");
+      const bUpdatedAt = String(b.updatedAt || "");
+      if (aUpdatedAt !== bUpdatedAt) return bUpdatedAt.localeCompare(aUpdatedAt);
+      return String(b.id || "").localeCompare(String(a.id || ""));
+    })[0];
+  if (assignedWorkItem) return assignedWorkItem.dealId;
+  const openSuggestion = (state.agentSuggestions || [])
+    .filter((suggestion) => suggestion.status === "proposed")
+    .sort((a, b) => {
+      const aTime = String(a.createdAt || "");
+      const bTime = String(b.createdAt || "");
+      if (aTime !== bTime) return bTime.localeCompare(aTime);
+      return String(b.id || "").localeCompare(String(a.id || ""));
+    })[0];
+  if (openSuggestion) return openSuggestion.dealId;
+  const roleSignal = workflowRoleQueueRows()[0];
+  if (roleSignal) return roleSignal.dealId;
+  const queue = state.queue || [];
+  if (queue[0]) return queue[0].id;
+  const readiness = (state.deploymentReadiness || [])[0];
+  return readiness ? readiness.dealId : null;
+}
+function workflowStep(label, className, title, detail){
+  const node = el("div", "workflow-step " + (className || "waiting"));
+  node.setAttribute("role", "listitem");
+  if (className === "active") node.setAttribute("aria-current", "step");
+  node.append(
+    el("div", "workflow-step-label", label),
+    el("div", "workflow-step-title", title),
+    el("div", "workflow-step-detail", detail)
+  );
+  return node;
+}
+function workflowLine(label, value, className){
+  const row = el("div", className || null);
+  row.append(el("span", "muted", label + ": "), value === null || value === undefined || value === "" ? "-" : String(value));
+  return row;
+}
+function workflowNextAction(dealId, deal, roleSignal, workItem, suggestion, hasUnpairedProposedDraft, linkedDraftMissing){
+  const box = el("div", "workflow-next");
+  const boxLabel = el("div", "workflow-step-label", "Next action");
+  box.append(boxLabel);
+  if (!deal && !workItem && !suggestion) {
+    box.append(el("div", "workflow-step-title", dealId ? "No action signal" : "Select a routed deal"));
+    box.append(el("div", "workflow-step-detail", dealId ? "This deal has no active queue signal, work item, or agent draft in the current state payload." : "The rail follows the selected deal, work item, and agent draft."));
+    return box;
+  }
+  if (!workItem && roleSignal && isActionWorkQueue(roleSignal.queue)) {
+    box.append(el("div", "workflow-step-title", "Open the work item"));
+    box.append(el("div", "workflow-step-detail", "Creates owner-visible work from the " + (roleQueueLabels[roleSignal.queue] || roleSignal.queue) + " queue signal."));
+    const actionKey = workItemSourceKey(roleSignal);
+    if (pendingWorkItemActions.has(actionKey)) {
+      box.append(el("div", "muted", "Opening..."));
+    } else {
+      const button = el("button", "secondary", "Open work item");
+      button.type = "button";
+      button.addEventListener("click", () => void openWorkItemFromSignal(roleSignal));
+      box.append(button);
+    }
+    return box;
+  }
+  if (!workItem && roleSignal) {
+    box.append(el("div", "workflow-step-title", "Growth signal captured"));
+    box.append(el("div", "workflow-step-detail", "This queue is an attribution view; no owner work item is opened from the workflow rail."));
+    return box;
+  }
+  if (workItem && workItem.status === "assigned" && linkedDraftMissing) {
+    box.append(el("div", "workflow-step-title", "Find linked draft"));
+    box.append(el("div", "workflow-step-detail", "This work item already points to a draft outside the current suggestion window; refresh or inspect Agent Suggestions before closing it."));
+    const button = el("button", "secondary", "Refresh");
+    button.type = "button";
+    button.addEventListener("click", () => { void loadState(); });
+    box.append(button);
+    return box;
+  }
+  if (workItem && workItem.status === "assigned" && !suggestion) {
+    boxLabel.textContent = "Available actions";
+    box.append(el("div", "workflow-step-title", "Choose manual close or global draft"));
+    box.append(el("div", "workflow-step-detail", "Use the global Draft Work Item Actions control when you want the agent to process pending work; use Resolve/Waive if this item is intentionally manual."));
+    if (hasUnpairedProposedDraft) {
+      box.append(el("div", "warn", "Unpaired proposed drafts exist for this deal; review them in Agent Suggestions before closing the work item."));
+    }
+    if (workItemDraftRunPending) box.append(el("div", "muted", "Global draft batch is running..."));
+    if (
+      !pendingWorkItemActions.has(workItem.id + ":resolve") &&
+      !pendingWorkItemActions.has(workItem.id + ":waive")
+    ) {
+      const manualActions = el("div", "inline-actions");
+      const resolve = el("button", "secondary", "Resolve item");
+      const waive = el("button", "secondary", "Waive item");
+      resolve.type = "button";
+      waive.type = "button";
+      resolve.addEventListener("click", () => void actOnWorkItem(workItem, "resolve"));
+      waive.addEventListener("click", () => void actOnWorkItem(workItem, "waive"));
+      manualActions.append(resolve, waive);
+      box.append(manualActions);
+    } else {
+      box.append(el("div", "muted", "Updating..."));
+    }
+    return box;
+  }
+  if (suggestion && suggestion.status === "proposed") {
+    box.append(el("div", "workflow-step-title", "Human decision needed"));
+    box.append(el("div", "workflow-step-detail", "Accept or reject the draft before any operator marks the work item done."));
+    renderSuggestionDecisionActions(box, suggestion);
+    return box;
+  }
+  if (workItem && workItem.status === "assigned") {
+    box.append(el("div", "workflow-step-title", "Resolve or waive"));
+    box.append(el("div", "workflow-step-detail", "Close the work item once the accepted action is complete, or waive it with an audit reason."));
+    if (
+      pendingWorkItemActions.has(workItem.id + ":resolve") ||
+      pendingWorkItemActions.has(workItem.id + ":waive")
+    ) {
+      box.append(el("div", "muted", "Updating..."));
+    } else {
+      const actions = el("div", "inline-actions");
+      const resolve = el("button", "secondary", "Resolve item");
+      const waive = el("button", "secondary", "Waive item");
+      resolve.type = "button";
+      waive.type = "button";
+      resolve.addEventListener("click", () => void actOnWorkItem(workItem, "resolve"));
+      waive.addEventListener("click", () => void actOnWorkItem(workItem, "waive"));
+      actions.append(resolve, waive);
+      box.append(actions);
+    }
+    return box;
+  }
+  if (!workItem) {
+    box.append(
+      el("div", "workflow-step-title", "No work to do"),
+      el("div", "workflow-step-detail", "No action signal, work item, or agent draft is active for this deal.")
+    );
+    return box;
+  }
+  box.append(
+    el("div", "workflow-step-title", "Loop closed"),
+    el("div", "workflow-step-detail", workItem.status + " by " + (workItem.resolvedBy || "-"))
+  );
+  return box;
+}
+function renderSuggestionDecisionActions(box, suggestion){
+  if (pendingSuggestionDecisions.has(suggestion.id)) {
+    box.append(el("div", "muted", "Deciding..."));
+    return;
+  }
+  const actions = el("div", "inline-actions");
+  const accept = el("button", "secondary", "Accept draft");
+  const reject = el("button", "secondary", "Reject draft");
+  accept.type = "button";
+  reject.type = "button";
+  accept.addEventListener("click", () => void decideSuggestion(suggestion, "accepted"));
+  reject.addEventListener("click", () => void decideSuggestion(suggestion, "rejected"));
+  actions.append(accept, reject);
+  box.append(actions);
+}
+function renderWorkflowMode(){
+  const mode = qs("#workflow-mode");
+  if (!mode) return;
+  mode.textContent = OPERATOR_DEMO_MODE ? (demoAutoPilotPaused ? "Resume auto-follow" : "Pause auto-follow") : "Guided";
+  mode.hidden = !OPERATOR_DEMO_MODE;
+  mode.title = OPERATOR_DEMO_MODE
+    ? (demoAutoPilotPaused ? "Resume following the highest-priority workflow" : "Auto-following the highest-priority workflow")
+    : "Guided workflow rail";
+}
+function toggleDemoAutoPilot(){
+  if (!OPERATOR_DEMO_MODE || !state) return;
+  if (!demoAutoPilotPaused) {
+    demoAutoPilotPaused = true;
+    renderWorkflowGuide();
+    return;
+  }
+  demoAutoPilotPaused = false;
+  selectedId = preferredWorkflowDealId() || selectedId;
+  renderWorkflowGuide();
+  renderQueue();
+  renderRoleQueues();
+  renderWorkItems();
+  renderPolicyEvaluation();
+  renderPolicyRuns();
+  renderAgentSuggestions();
+  renderDeploymentHandoff();
+  scheduleRenderDetail();
+}
+function renderWorkflowGuide(){
+  const root = qs("#workflow-guide");
+  if (!root || !state) return;
+  renderWorkflowMode();
+  const dealId = selectedId || preferredWorkflowDealId();
+  if (!dealId) {
+    root.replaceChildren(el("div", "empty", "No routed deals, role queues, work items, or agent suggestions yet."));
+    return;
+  }
+  const queue = state.queue || [];
+  const deal = queue.find((row) => row.id === dealId) || null;
+  const workItem = primaryWorkItemForDeal(dealId);
+  const roleSignal = roleQueueSignalForDeal(dealId, workItem);
+  const suggestion = primarySuggestionForDeal(dealId, workItem);
+  const hasUnpairedProposedDraft =
+    Boolean(workItem) &&
+    suggestionsForDeal(dealId).some((row) => row.status === "proposed" && (!suggestion || row.id !== suggestion.id));
+  const linkedDraftMissing =
+    Boolean(workItem?.agentSuggestionSourceEventId) && !suggestion;
+  const routeTitle = deal ? (deal.company + " routed") : "Routed deal";
+  const signalTitle = roleSignal
+    ? ((roleQueueLabels[roleSignal.queue] || roleSignal.queue) + " signal")
+    : (workItem ? "Opened from prior signal" : "Awaiting signal");
+  const workTitle = workItem
+    ? (workItem.status === "assigned" ? "Assigned to " + workItem.owner : workItem.status)
+    : "No work item";
+  const draftTitle = suggestion
+    ? (suggestion.status === "proposed" ? "Draft proposed" : suggestion.status)
+    : (linkedDraftMissing ? "Linked draft not found" : (hasUnpairedProposedDraft ? "Unpaired draft exists" : "No draft"));
+  const decisionTitle = suggestion
+    ? (suggestion.status === "proposed" ? "Awaiting human" : suggestion.status + " by " + (suggestion.decidedBy || "-"))
+    : "No decision";
+  const decisionDetail = suggestion
+    ? (suggestion.status === "proposed"
+      ? "Awaiting accept/reject."
+      : (suggestion.decisionReason || "Decided without reason."))
+    : (linkedDraftMissing ? "Linked draft is outside the current suggestion window." : "No draft decision yet.");
+  const closeTitle = workItem
+    ? (workItem.status === "assigned" ? "Still open" : workItem.status + " by " + (workItem.resolvedBy || "-"))
+    : "Not opened";
+  const otherWorkItemCount = workItemsForDeal(dealId).filter((item) => !workItem || item.id !== workItem.id).length;
+  const steps = el("div", "workflow-steps");
+  steps.setAttribute("role", "list");
+  steps.append(
+    workflowStep("1. Routed", deal ? "complete" : "waiting", routeTitle, deal ? (deal.route + " | " + (deal.externalStage?.stageLabel || deal.status)) : "Select or ingest a deal."),
+    workflowStep("2. Signal", (roleSignal || workItem) ? "complete" : "waiting", signalTitle, roleSignal ? roleSignal.reason : (workItem ? "Opened from " + (roleQueueLabels[workItem.queue] || workItem.queue) + " queue." : "No queue signal selected.")),
+    workflowStep("3. Work item", workItem ? "complete" : "waiting", workTitle, workItem ? workItem.title : (roleSignal && !isActionWorkQueue(roleSignal.queue) ? "Attribution-only signal." : "Open one from the role queue.")),
+    workflowStep("4. Agent draft", suggestion ? "complete" : (workItem && workItem.status === "assigned" ? "active" : "waiting"), draftTitle, suggestion ? suggestion.title : (linkedDraftMissing ? "This work item links to a draft outside the current suggestion window." : (hasUnpairedProposedDraft ? "Other proposed drafts exist for this deal; this work item has no paired draft." : (workItem && workItem.status !== "assigned" ? "Closed without an agent draft." : "Use Draft Work Item Actions to generate a draft.")))),
+    workflowStep("5. Decision", suggestion && suggestion.status !== "proposed" ? "complete" : (suggestion || linkedDraftMissing ? "active" : "waiting"), decisionTitle, decisionDetail),
+    workflowStep("6. Close work", workItem && workItem.status !== "assigned" ? "complete" : (workItem && suggestion && suggestion.status !== "proposed" ? "active" : "waiting"), closeTitle, workItem ? (workItem.resolutionReason || "Resolve or waive after the human decision.") : "No work item to close yet.")
+  );
+  const lineage = el("div", "workflow-lineage");
+  const hubSpotStage = deal?.externalStage
+    ? ((deal.externalStage.stageLabel || deal.externalStage.stageId || "-") + " / " + (deal.externalStage.externalId || "-"))
+    : "-";
+  const roleSignalLine = roleSignal
+    ? ((roleQueueLabels[roleSignal.queue] || roleSignal.queue || "-") + " / " + (roleSignal.priority || "-"))
+    : "-";
+  lineage.append(
+    workflowLine("Deal", deal ? (deal.company + " / " + deal.id) : dealId),
+    workflowLine("Route", deal ? deal.route : "-"),
+    workflowLine("HubSpot", hubSpotStage),
+    workflowLine("Role signal", roleSignalLine),
+    workflowLine("Work item", workItem ? (workItem.id + " / " + workItem.status + " / " + workItem.owner) : "-"),
+    workflowLine("Other work items", otherWorkItemCount ? String(otherWorkItemCount) : "-"),
+    workflowLine("Suggestion", suggestion ? (suggestion.id + " / " + (suggestionKindLabels[suggestion.kind] || suggestion.kind) + " / " + suggestion.status) : "-"),
+    workflowLine("Source event", workItem?.agentSuggestionSourceEventId || suggestion?.sourceEventId || "-")
+  );
+  const summary = el("div");
+  summary.append(lineage, workflowNextAction(dealId, deal, roleSignal, workItem, suggestion, hasUnpairedProposedDraft, linkedDraftMissing));
+  const grid = el("div", "workflow-grid");
+  grid.append(steps, summary);
+  root.replaceChildren(grid);
 }
 function renderWorkItems(){
   const root = qs("#work-items");
@@ -1609,12 +1991,6 @@ function renderPolicyRuns(){
     el("div", "muted", "Showing latest " + runs.length + " policy runs.")
   );
 }
-const suggestionKindLabels = {
-  handoff_summary: "Handoff",
-  missing_field_question: "Missing field",
-  stale_deal_nudge: "Stale deal",
-  policy_change_recommendation: "Policy"
-};
 function suggestionStatusClass(status){
   if (status === "accepted") return "pass";
   if (status === "rejected") return "muted";
@@ -1802,6 +2178,7 @@ function renderSuggestionSurfaces(options){
   if (!state) return;
   renderAgentSuggestions();
   if (!options || options.detail !== false) renderSelectedDealSuggestions();
+  renderWorkflowGuide();
 }
 async function draftPolicyRecommendations(){
   const button = qs("#draft-policy-btn");
@@ -1837,7 +2214,11 @@ async function draftWorkItemSuggestions(){
     setAgentActionStatus("Work item draft button is not available.", "fail");
     return;
   }
+  if (workItemDraftRunPending) return;
+  pauseDemoAutoPilot();
+  workItemDraftRunPending = true;
   button.disabled = true;
+  renderWorkflowGuide();
   setAgentActionStatus("Drafting work item actions...", "muted");
   try {
     const result = await fetchJson("/agent-suggestion-runs/work-items", {
@@ -1856,7 +2237,9 @@ async function draftWorkItemSuggestions(){
   } catch (err) {
     setAgentActionStatus(String(err), "fail");
   } finally {
+    workItemDraftRunPending = false;
     button.disabled = false;
+    renderWorkflowGuide();
   }
 }
 function defaultDecisionReason(decision){
@@ -1915,6 +2298,7 @@ async function decideSuggestion(suggestion, decision){
   // reload; otherwise the finally block releases and repaints.
   let lockReleased = false;
   let refreshStatus = null;
+  pauseDemoAutoPilot();
   pendingSuggestionDecisions.add(suggestion.id);
   try {
     renderSuggestionSurfaces();
@@ -1923,22 +2307,28 @@ async function decideSuggestion(suggestion, decision){
       setAgentActionStatus("Decision cancelled.", "muted");
       return; // operator cancelled; finally releases the lock
     }
-    setAgentActionStatus(decision + " " + suggestion.id + "...", "muted");
-    const result = await fetchJson("/agent-suggestions/" + encodeURIComponent(suggestion.id) + "/decision", {
+    const activeSuggestion = (state.agentSuggestions || []).find((row) => row.id === suggestion.id);
+    if (!activeSuggestion || activeSuggestion.status !== "proposed") {
+      setAgentActionStatus("Suggestion changed while the dialog was open; refreshing before deciding.", "warn");
+      refreshStatus = await loadState();
+      return;
+    }
+    setAgentActionStatus(decision + " " + activeSuggestion.id + "...", "muted");
+    const result = await fetchJson("/agent-suggestions/" + encodeURIComponent(activeSuggestion.id) + "/decision", {
       method: "POST",
       headers: localWriteHeaders(),
       body: JSON.stringify({
-        sourceEventId: deterministicUuidV4("agent-suggestion-decision:" + suggestion.id + ":" + decision),
+        sourceEventId: deterministicUuidV4("agent-suggestion-decision:" + activeSuggestion.id + ":" + decision),
         decision,
         humanPrincipal: OPERATOR_PRINCIPAL,
         reason
       })
     });
     setAgentActionStatus(
-      "Suggestion " + result.status + ": " + suggestion.title,
+      "Suggestion " + result.status + ": " + activeSuggestion.title,
       result.status === "recorded" ? "pass" : "warn"
     );
-    const patchedBeforeReload = applySuggestionDecisionResult(result, suggestion.id);
+    const patchedBeforeReload = applySuggestionDecisionResult(result, activeSuggestion.id);
     if (patchedBeforeReload) {
       pendingSuggestionDecisions.delete(suggestion.id);
       lockReleased = true;
@@ -1949,7 +2339,7 @@ async function decideSuggestion(suggestion, decision){
       const localState = patchedBeforeReload
         ? "local suggestion row was patched"
         : (state ? "local suggestion row was not found" : "local state is unavailable");
-      setAgentActionStatus("Decision " + result.status + " for " + suggestion.title + ". Refresh failed after the decision response; " + localState + ". Refresh to sync the rest of the dashboard.", "warn");
+      setAgentActionStatus("Decision " + result.status + " for " + activeSuggestion.title + ". Refresh failed after the decision response; " + localState + ". Refresh to sync the rest of the dashboard.", "warn");
     }
   } catch (err) {
     setAgentActionStatus(String(err), "fail");
@@ -2066,6 +2456,8 @@ function dealSuggestionSection(dealId){
 }
 function selectDeal(dealId){
   selectedId = dealId;
+  pauseDemoAutoPilot();
+  renderWorkflowGuide();
   renderQueue();
   renderRoleQueues();
   renderWorkItems();
@@ -2205,7 +2597,16 @@ async function loadState(){
     const next = await fetchJson("/state");
     if (seq !== stateRequestSeq) return "stale";
     state = next;
-    if (!selectedId && state.queue[0]) selectedId = state.queue[0].id;
+    const demoCanRetarget =
+      OPERATOR_DEMO_MODE &&
+      !demoAutoPilotPaused &&
+      pendingSuggestionDecisions.size === 0 &&
+      pendingWorkItemActions.size === 0;
+    if (demoCanRetarget) {
+      if (selectedId && !workflowDealIds().has(selectedId)) selectedId = null;
+      selectedId = preferredWorkflowDealId() || selectedId;
+    }
+    if (!selectedId && (state.queue || [])[0]) selectedId = (state.queue || [])[0].id;
     if (!selectedId && (state.deploymentReadiness || [])[0]) selectedId = state.deploymentReadiness[0].dealId;
     qs("#last-refresh").textContent = new Date().toLocaleTimeString();
     renderKpis();
@@ -2230,6 +2631,7 @@ async function loadState(){
       qs("#work-items").replaceChildren(el("div", "empty", msg));
       qs("#policy-evaluation").replaceChildren(el("div", "empty", msg));
       qs("#policy-runs").replaceChildren(el("div", "empty", msg));
+      qs("#workflow-guide").replaceChildren(el("div", "empty", msg));
       qs("#agent-suggestions").replaceChildren(el("div", "empty", msg));
       qs("#exceptions").replaceChildren(el("div", "empty", msg));
       qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
@@ -2278,6 +2680,7 @@ const savedLocalSecret = sessionStorage.getItem(LOCAL_SECRET_STORAGE_KEY);
 if (savedLocalSecret) qs("#local-secret").value = savedLocalSecret;
 qs("#preview-btn").addEventListener("click", preview);
 qs("#refresh-btn").addEventListener("click", () => { loadState(); loadHealth(); });
+qs("#workflow-mode").addEventListener("click", () => { toggleDemoAutoPilot(); });
 qs("#draft-policy-btn").addEventListener("click", () => { void draftPolicyRecommendations(); });
 qs("#draft-work-item-btn").addEventListener("click", () => { void draftWorkItemSuggestions(); });
 qs("#deal-form").addEventListener("submit", async (event) => {
