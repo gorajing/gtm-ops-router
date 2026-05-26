@@ -135,6 +135,7 @@ function quarantine(
   code: QuarantineCode,
   reason: string,
   t0: number,
+  deal?: Deal,
 ): PipelineOutcome {
   const q: Quarantine = {
     dealId,
@@ -149,6 +150,7 @@ function quarantine(
       Math.round(performance.now() - t0),
       from,
       `${code}: ${reason}`,
+      deal,
     );
     return { ok: false, quarantine: q };
   } catch (err) {
@@ -285,6 +287,7 @@ export async function processOne(
       enrichmentResult.code,
       enrichmentResult.reason,
       t0,
+      deal,
     );
   }
   const enrichment = enrichmentResult.enrichment;
@@ -357,6 +360,7 @@ export async function processOne(
           "sink_terminal",
           err.message,
           t0,
+          deal,
         );
       }
       if (err instanceof SinkExhaustedError) {
@@ -368,6 +372,7 @@ export async function processOne(
           "sink_exhausted",
           err.message,
           t0,
+          deal,
         );
       }
       throw err; // unknown — do not absorb
@@ -388,6 +393,7 @@ export async function processOne(
       "store_error",
       `persist failed: ${msg}`,
       t0,
+      deal,
     );
   }
   return { ok: true, deal: routed };

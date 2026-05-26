@@ -280,9 +280,10 @@ function routedRecord(id: string): RoutedDeal {
 
 async function app(
   options?: Parameters<typeof startServer>[3],
+  testEnricher: Enricher = enricher,
 ): Promise<{ baseUrl: string; close(): Promise<void>; store: Store }> {
   const store = new Store(":memory:");
-  const server = startServer(store, enricher, 0, options);
+  const server = startServer(store, testEnricher, 0, options);
   await new Promise<void>((resolve) => {
     if (server.listening) resolve();
     else server.once("listening", resolve);
@@ -383,6 +384,11 @@ describe("local commercial-state endpoint", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
+      const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
       const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -400,6 +406,7 @@ describe("local commercial-state endpoint", () => {
       const deploymentBody = (await deployment.json()) as { error: string };
       const outcomeBody = (await outcome.json()) as { error: string };
       const enrichmentBody = (await enrichment.json()) as { error: string };
+      const replayBody = (await replay.json()) as { error: string };
       const suggestionBody = (await suggestion.json()) as { error: string };
       const suggestionDecisionBody = (await suggestionDecision.json()) as {
         error: string;
@@ -409,12 +416,14 @@ describe("local commercial-state endpoint", () => {
       expect(deployment.status).toBe(404);
       expect(outcome.status).toBe(404);
       expect(enrichment.status).toBe(404);
+      expect(replay.status).toBe(404);
       expect(suggestion.status).toBe(404);
       expect(suggestionDecision.status).toBe(404);
       expect(commercialBody.error).toBe("not found");
       expect(deploymentBody.error).toBe("not found");
       expect(outcomeBody.error).toBe("not found");
       expect(enrichmentBody.error).toBe("not found");
+      expect(replayBody.error).toBe("not found");
       expect(suggestionBody.error).toBe("not found");
       expect(suggestionDecisionBody.error).toBe("not found");
     });
@@ -536,6 +545,11 @@ describe("local commercial-state endpoint", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
         const suggestion = await fetch(`${baseUrl}/agent-suggestions`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -552,6 +566,7 @@ describe("local commercial-state endpoint", () => {
         expect(deployment.status).toBe(401);
         expect(outcome.status).toBe(401);
         expect(enrichment.status).toBe(401);
+        expect(replay.status).toBe(401);
         expect(suggestion.status).toBe(401);
         expect(recommendationRun.status).toBe(401);
       },
@@ -849,6 +864,432 @@ describe("local commercial-state endpoint", () => {
           expect.objectContaining({
             employees: 1500,
             sourceProvider: "manual",
+          }),
+        );
+      },
+    );
+  });
+
+  it("replays an enrichment quarantine after manual evidence is recorded", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const unresolvedEnricher: Enricher = {
+          name: "fixture",
+          async enrich(): Promise<Enrichment | null> {
+            return null;
+          },
+        };
+        const { baseUrl, store } = await app(undefined, unresolvedEnricher);
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const post = await fetch(`${baseUrl}/deals`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            company: "Repair Logistics",
+            domain: "repairlogistics.com",
+            contactName: "Rina Ops",
+            contactEmail: "rina@repairlogistics.com",
+            dealUSD: 55000,
+            region: "NA",
+            sourceChannel: "cold_reply",
+            statedNeed: "manual appointment scheduling creates missed pickups",
+          }),
+        });
+        const postBody = (await post.json()) as {
+          quarantined: number;
+          outcomes: Array<{
+            ok: false;
+            quarantine: { dealId: string; code: string };
+          }>;
+        };
+        const dealId = postBody.outcomes[0]?.quarantine.dealId;
+        if (!dealId) throw new Error("expected quarantined deal id");
+
+        const blocked = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Rina Ops",
+            contactEmail: "rina@repairlogistics.com",
+            operator: "operator-console",
+          }),
+        });
+        const blockedBody = (await blocked.json()) as { status: string };
+
+        expect(postBody.quarantined).toBe(1);
+        expect(postBody.outcomes[0]?.quarantine.code).toBe(
+          "enrichment_unresolved",
+        );
+        expect(store.quarantinedDeal(dealId)?.deal).toEqual(
+          expect.objectContaining({
+            company: "Repair Logistics",
+            domain: "repairlogistics.com",
+            contactName: "Redacted Contact",
+            contactEmail: "redacted@example.invalid",
+            dealUSD: 55000,
+          }),
+        );
+        expect(blocked.status).toBe(409);
+        expect(blockedBody.status).toBe("no_fresh_facts");
+
+        await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "RepairLogistics.COM",
+            sourceEventId: "90909090-9090-4090-8090-909090909090",
+            employees: 750,
+            industry: "freight brokerage",
+            techSignals: ["voice_ai_eval", "manual_ops"],
+            regulated: false,
+            confidence: 0.19,
+            operator: "operator-console",
+            note: "Low-confidence manual note should still hit the gate.",
+          }),
+        });
+        const lowConfidenceReplay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Rina Ops",
+            contactEmail: "rina@repairlogistics.com",
+            operator: "operator-console",
+          }),
+        });
+        const lowConfidenceReplayBody = (await lowConfidenceReplay.json()) as {
+          status: string;
+        };
+        expect(lowConfidenceReplay.status).toBe(409);
+        expect(lowConfidenceReplayBody.status).toBe("low_confidence");
+
+        const evidence = await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "RepairLogistics.COM",
+            sourceEventId: "90909090-9090-4090-9090-909090909090",
+            employees: 750,
+            industry: "freight brokerage",
+            techSignals: ["voice_ai_eval", "manual_ops"],
+            regulated: false,
+            confidence: 0.96,
+            operator: "operator-console",
+            note: "Backfilled from manual account research.",
+          }),
+        });
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Rina Ops",
+            contactEmail: "rina@repairlogistics.com",
+            operator: "operator-console",
+            reason: "manual enrichment evidence is now fresh",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          deal: {
+            contactName: string;
+            contactEmail: string;
+            route: { kind: string; financeFlag: string | null };
+          };
+          facts: { subjectKey: string; sourceProvider: string };
+        };
+        const state = (await fetch(`${baseUrl}/state`).then((res) =>
+          res.json(),
+        )) as {
+          queue: Array<{
+            id: string;
+            stage: string;
+            amount: number;
+            status: string;
+            enrichmentSubjectKey?: string;
+            enrichmentFacts?: { sourceProvider: string };
+          }>;
+          exceptions: Array<{ dealId: string }>;
+        };
+        const row = state.queue.find((item) => item.id === dealId);
+        const events = (await fetch(
+          `${baseUrl}/deals/${encodeURIComponent(dealId)}/events`,
+        ).then((res) => res.json())) as {
+          events: Array<{ detail: string; from: string; to: string }>;
+        };
+
+        expect(evidence.status).toBe(201);
+        expect(replay.status).toBe(200);
+        expect(replayBody.status).toBe("routed");
+        expect(replayBody.deal.contactName).toBe("Rina Ops");
+        expect(replayBody.deal.contactEmail).toBe("rina@repairlogistics.com");
+        expect(replayBody.deal.route.kind).toBe("human_assisted");
+        expect(replayBody.deal.route.financeFlag).toBe("pricing_approval");
+        expect(replayBody.facts).toEqual(
+          expect.objectContaining({
+            subjectKey: "repairlogistics.com",
+            sourceProvider: "manual",
+          }),
+        );
+        expect(store.quarantinedDeal(dealId)).toBeNull();
+        expect(row).toEqual(
+          expect.objectContaining({
+            id: dealId,
+            stage: "routed",
+            amount: 55000,
+            status: "dry_run",
+            enrichmentSubjectKey: "repairlogistics.com",
+            enrichmentFacts: expect.objectContaining({
+              sourceProvider: "manual",
+            }),
+          }),
+        );
+        expect(state.exceptions.some((item) => item.dealId === dealId)).toBe(
+          false,
+        );
+        expect(events.events).toContainEqual(
+          expect.objectContaining({
+            from: "quarantined",
+            to: "enriched",
+            detail: expect.stringContaining("quarantine replay by operator-console"),
+          }),
+        );
+      },
+    );
+  });
+
+  it("records an audit event when replay sink failure races with state movement", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const unresolvedEnricher: Enricher = {
+          name: "fixture",
+          async enrich(): Promise<Enrichment | null> {
+            return null;
+          },
+        };
+        let raceStore: Store | undefined;
+        const racingSink: OpportunitySink = {
+          name: "racing-sink",
+          async upsert(deal: RoutedDeal) {
+            raceStore?.recordRouted(deal, 0, {
+              mode: "dry_run",
+              status: "dry_run",
+            });
+            throw new Error("crm unavailable after state moved");
+          },
+        };
+        const { baseUrl, store } = await app(
+          { pipelineOptions: { sink: racingSink } },
+          unresolvedEnricher,
+        );
+        raceStore = store;
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const post = await fetch(`${baseUrl}/deals`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            company: "Race Failure Logistics",
+            domain: "racefailure.com",
+            contactName: "Rafi Ops",
+            contactEmail: "rafi@racefailure.com",
+            dealUSD: 62000,
+            region: "NA",
+            sourceChannel: "inbound_form",
+            statedNeed: "manual dispatch follow-up is missing booked loads",
+          }),
+        });
+        const postBody = (await post.json()) as {
+          outcomes: Array<{
+            ok: false;
+            quarantine: { dealId: string };
+          }>;
+        };
+        const dealId = postBody.outcomes[0]?.quarantine.dealId;
+        if (!dealId) throw new Error("expected quarantined deal id");
+
+        await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "racefailure.com",
+            sourceEventId: "91919191-9191-4191-9191-919191919191",
+            employees: 820,
+            industry: "freight brokerage",
+            techSignals: ["voice_ai_eval", "manual_ops"],
+            regulated: false,
+            confidence: 0.97,
+            operator: "operator-console",
+          }),
+        });
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Rafi Ops",
+            contactEmail: "rafi@racefailure.com",
+            operator: "operator-console",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          auditRecorded: boolean;
+          stateChanged: boolean;
+        };
+        const events = (await fetch(
+          `${baseUrl}/deals/${encodeURIComponent(dealId)}/events`,
+        ).then((res) => res.json())) as {
+          events: Array<{ detail: string; from: string; to: string }>;
+        };
+
+        expect(replay.status).toBe(502);
+        expect(replayBody).toEqual(
+          expect.objectContaining({
+            status: "sink_error",
+            auditRecorded: true,
+            stateChanged: true,
+          }),
+        );
+        expect(events.events).toContainEqual(
+          expect.objectContaining({
+            from: "routed",
+            to: "routed",
+            detail: expect.stringContaining(
+              "quarantine replay sink_error after state moved",
+            ),
+          }),
+        );
+      },
+    );
+  });
+
+  it("records an audit event when replay loses the quarantine race after sink success", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        const unresolvedEnricher: Enricher = {
+          name: "fixture",
+          async enrich(): Promise<Enrichment | null> {
+            return null;
+          },
+        };
+        let raceStore: Store | undefined;
+        const racingSink: OpportunitySink = {
+          name: "racing-sink",
+          async upsert(deal: RoutedDeal) {
+            raceStore?.recordRouted(deal, 0, {
+              mode: "dry_run",
+              status: "dry_run",
+            });
+            return [
+              {
+                system: "dry_run",
+                externalId: deal.id,
+                detail: "race sink accepted replay",
+              },
+            ];
+          },
+        };
+        const { baseUrl, store } = await app(
+          { pipelineOptions: { sink: racingSink } },
+          unresolvedEnricher,
+        );
+        raceStore = store;
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const post = await fetch(`${baseUrl}/deals`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            company: "Race Success Logistics",
+            domain: "racesuccess.com",
+            contactName: "Sana Ops",
+            contactEmail: "sana@racesuccess.com",
+            dealUSD: 71000,
+            region: "NA",
+            sourceChannel: "event",
+            statedNeed: "manual appointment work creates detention risk",
+          }),
+        });
+        const postBody = (await post.json()) as {
+          outcomes: Array<{
+            ok: false;
+            quarantine: { dealId: string };
+          }>;
+        };
+        const dealId = postBody.outcomes[0]?.quarantine.dealId;
+        if (!dealId) throw new Error("expected quarantined deal id");
+
+        await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "racesuccess.com",
+            sourceEventId: "92929292-9292-4292-9292-929292929292",
+            employees: 930,
+            industry: "freight brokerage",
+            techSignals: ["voice_ai_eval", "manual_ops"],
+            regulated: false,
+            confidence: 0.98,
+            operator: "operator-console",
+          }),
+        });
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Sana Ops",
+            contactEmail: "sana@racesuccess.com",
+            operator: "operator-console",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          auditRecorded: boolean;
+          sink: { receipts: Array<{ detail: string }> };
+        };
+        const events = (await fetch(
+          `${baseUrl}/deals/${encodeURIComponent(dealId)}/events`,
+        ).then((res) => res.json())) as {
+          events: Array<{ detail: string; from: string; to: string }>;
+        };
+
+        expect(replay.status).toBe(409);
+        expect(replayBody.status).toBe("not_quarantined");
+        expect(replayBody.auditRecorded).toBe(true);
+        expect(replayBody.sink.receipts[0]?.detail).toBe(
+          "race sink accepted replay",
+        );
+        expect(events.events).toContainEqual(
+          expect.objectContaining({
+            from: "routed",
+            to: "routed",
+            detail: expect.stringContaining(
+              "quarantine replay dropped after sink success because state moved",
+            ),
           }),
         );
       },
@@ -3936,6 +4377,8 @@ describe("server dashboard", () => {
     expect(dashboard).toContain("Draft Policy Recommendations");
     expect(dashboard).toContain("Manual company evidence");
     expect(dashboard).toContain("/enrichment-observations");
+    expect(dashboard).toContain("Replay Quarantine");
+    expect(dashboard).toContain("/quarantine-replay");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
     expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
     expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");

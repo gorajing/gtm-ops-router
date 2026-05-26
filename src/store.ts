@@ -124,6 +124,13 @@ const QUARANTINE_CODES: QuarantineCode[] = [
   "sink_terminal",
   "sink_exhausted",
 ];
+const PIPELINE_STAGES = [
+  "intake",
+  "enriched",
+  "scored",
+  "routed",
+  "quarantined",
+] as const satisfies readonly Stage[];
 
 // Stage-change Slack posts are single-attempt and bounded by the shared webhook
 // fetch cap in constants.ts. notify_leases counts lease acquisitions, not only
@@ -179,6 +186,12 @@ type RoutedRecord = {
   sinkStatus: "synced" | "partial" | "dry_run" | "needs_review";
   externalStage: ExternalStageState | null;
 };
+type QuarantinedRecord = {
+  quarantine: Quarantine;
+  deal: Deal | null;
+  updatedAt: string;
+  externalStage: ExternalStageState | null;
+};
 type RoutedRecordRow = {
   payload: string;
   updated_at: string;
@@ -189,6 +202,30 @@ type RoutedRecordRow = {
   external_stage_label: string | null;
   external_stage_updated_at: string | null;
 };
+
+type QuarantineReplayPayload = Omit<Deal, "contactName" | "contactEmail">;
+
+function quarantineReplayPayload(deal: Deal): QuarantineReplayPayload {
+  return {
+    id: deal.id,
+    company: deal.company,
+    domain: deal.domain,
+    dealUSD: deal.dealUSD,
+    region: deal.region,
+    sourceChannel: deal.sourceChannel,
+    statedNeed: deal.statedNeed,
+  };
+}
+
+function dealFromPayload(payload: string | null): Deal | null {
+  if (!payload) return null;
+  const parsed = JSON.parse(payload) as QuarantineReplayPayload;
+  return {
+    ...parsed,
+    contactName: "Redacted Contact",
+    contactEmail: "redacted@example.invalid",
+  };
+}
 
 const COMMERCIAL_STATE_RANK: Record<CommercialState, number> = {
   open: 0,
@@ -1077,6 +1114,12 @@ function stableUuidV4(seed: string): string {
   )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+function pipelineStage(value: string): Stage | null {
+  return (PIPELINE_STAGES as readonly string[]).includes(value)
+    ? (value as Stage)
+    : null;
+}
+
 function policyRecommendationRunStatus(counts: {
   recorded: number;
   duplicate: number;
@@ -1784,25 +1827,33 @@ export class Store {
     return existing ? "updated" : "inserted";
   }
 
-  upsertQuarantine(q: Quarantine, latencyMs: number): void {
+  upsertQuarantine(q: Quarantine, latencyMs: number, deal?: Deal): void {
     const now = new Date().toISOString();
     const sink = this.sinkStateFromEvents(q.dealId);
     this.db
       .prepare(
-        `INSERT INTO deals (
+         `INSERT INTO deals (
            id, stage, payload, quarantine, route_kind, finance_flag, legal_flag,
            deal_usd, quarantine_code, sink_mode, sink_status, latency_ms, created_at, updated_at
          )
-         VALUES (?, 'quarantined', NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+         VALUES (?, 'quarantined', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           stage='quarantined', payload=NULL, quarantine=excluded.quarantine,
-           route_kind=NULL, finance_flag=NULL, legal_flag=NULL, deal_usd=NULL,
+           stage='quarantined',
+           payload=CASE
+             WHEN excluded.payload IS NOT NULL THEN excluded.payload
+             WHEN deals.stage = 'quarantined' THEN deals.payload
+             ELSE NULL
+           END,
+           quarantine=excluded.quarantine,
+           route_kind=NULL, finance_flag=NULL, legal_flag=NULL,
+           deal_usd=NULL,
            quarantine_code=excluded.quarantine_code,
            sink_mode=excluded.sink_mode, sink_status=excluded.sink_status,
            latency_ms=excluded.latency_ms, updated_at=excluded.updated_at`,
       )
       .run(
         q.dealId,
+        deal ? JSON.stringify(quarantineReplayPayload(deal)) : null,
         JSON.stringify(q),
         q.code,
         sink.mode,
@@ -1825,15 +1876,122 @@ export class Store {
     });
   }
 
+  recordQuarantineReplay(
+    deal: RoutedDeal,
+    latencyMs: number,
+    sink: { mode: "dry_run" | "live"; status: "synced" | "partial" | "dry_run" },
+    replayDetail: string,
+    scoreDetail: string,
+    sinkDetail: string,
+    sinkMeta: PipelineEventMeta,
+    noteDetail?: string,
+  ): "inserted" | "updated" {
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(deal.id) as { stage: string } | undefined;
+      if (current?.stage !== "quarantined") {
+        throw new Error("quarantine replay requires a currently quarantined deal");
+      }
+      this.appendEvent(deal.id, "quarantined", "enriched", replayDetail);
+      if (noteDetail) {
+        this.appendEvent(deal.id, "enriched", "enriched", noteDetail);
+      }
+      this.appendEvent(deal.id, "enriched", "scored", scoreDetail);
+      this.appendEvent(deal.id, "scored", "scored", sinkDetail, sinkMeta);
+      // upsertRouted only mutates the deals row; recordRouted is the normal
+      // ingestion helper that appends its own routed event. Replay owns the
+      // virtual quarantine -> enriched -> scored -> routed audit chain here.
+      const result = this.upsertRouted(deal, latencyMs, sink);
+      this.appendEvent(deal.id, "scored", "routed", `route ${deal.route.kind}`);
+      return result;
+    });
+  }
+
+  recordQuarantineReplayFailureOrStateRace(
+    dealId: string,
+    quarantineDetail: string,
+    stateRaceDetail: string,
+  ): { auditRecorded: boolean; stateChanged: boolean; auditUnavailable: boolean } {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(dealId) as { stage: string } | undefined;
+      if (!current) {
+        return {
+          auditRecorded: false,
+          stateChanged: false,
+          auditUnavailable: true,
+        };
+      }
+      const stage = pipelineStage(current.stage);
+      if (!stage) {
+        return {
+          auditRecorded: false,
+          stateChanged: false,
+          auditUnavailable: true,
+        };
+      }
+      if (stage === "quarantined") {
+        this.appendEvent(dealId, "quarantined", "quarantined", quarantineDetail);
+        this.db
+          .prepare(
+            `UPDATE deals
+             SET updated_at = ?
+             WHERE id = ?
+               AND stage = 'quarantined'`,
+          )
+          .run(now, dealId);
+        return {
+          auditRecorded: true,
+          stateChanged: false,
+          auditUnavailable: false,
+        };
+      }
+      this.appendEvent(dealId, stage, stage, stateRaceDetail);
+      this.db
+        .prepare("UPDATE deals SET updated_at = ? WHERE id = ?")
+        .run(now, dealId);
+      return {
+        auditRecorded: true,
+        stateChanged: true,
+        auditUnavailable: false,
+      };
+    });
+  }
+
+  recordQuarantineReplayStateRace(
+    dealId: string,
+    detail: string,
+    meta?: PipelineEventMeta,
+  ): boolean {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(dealId) as { stage: string } | undefined;
+      if (!current) return false;
+      const stage = pipelineStage(current.stage);
+      if (!stage) return false;
+      this.appendEvent(dealId, stage, stage, detail, meta);
+      this.db
+        .prepare("UPDATE deals SET updated_at = ? WHERE id = ?")
+        .run(now, dealId);
+      return true;
+    });
+  }
+
   recordQuarantine(
     q: Quarantine,
     latencyMs: number,
     from: Stage | "-",
     detail: string,
+    deal?: Deal,
   ): void {
     this.transaction(() => {
       this.appendEvent(q.dealId, from, "quarantined", detail);
-      this.upsertQuarantine(q, latencyMs);
+      this.upsertQuarantine(q, latencyMs, deal);
     });
   }
 
@@ -5772,11 +5930,7 @@ export class Store {
 
   quarantinedRecords(
     limit?: number,
-  ): Array<{
-    quarantine: Quarantine;
-    updatedAt: string;
-    externalStage: ExternalStageState | null;
-  }> {
+  ): QuarantinedRecord[] {
     const cappedLimit =
       limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
     const rows =
@@ -5785,11 +5939,12 @@ export class Store {
             .prepare(
               `SELECT quarantine, updated_at, external_system, external_id,
                       external_stage_id, external_stage_label,
-                      external_stage_updated_at
+                      external_stage_updated_at, payload
                FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC`,
             )
             .all() as Array<{
             quarantine: string;
+            payload: string | null;
             updated_at: string;
             external_system: string | null;
             external_id: string | null;
@@ -5801,11 +5956,12 @@ export class Store {
             .prepare(
               `SELECT quarantine, updated_at, external_system, external_id,
                       external_stage_id, external_stage_label,
-                      external_stage_updated_at
+                      external_stage_updated_at, payload
                FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC LIMIT ?`,
             )
             .all(cappedLimit) as Array<{
             quarantine: string;
+            payload: string | null;
             updated_at: string;
             external_system: string | null;
             external_id: string | null;
@@ -5815,9 +5971,34 @@ export class Store {
           }>);
     return rows.map((r) => ({
       quarantine: JSON.parse(r.quarantine) as Quarantine,
+      deal: dealFromPayload(r.payload),
       updatedAt: r.updated_at,
       externalStage: this.externalStageFromRow(r),
     }));
+  }
+
+  quarantinedDeal(dealId: string): {
+    quarantine: Quarantine;
+    deal: Deal | null;
+    updatedAt: string;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT quarantine, payload, updated_at
+         FROM deals
+         WHERE id = ?
+           AND stage = 'quarantined'`,
+      )
+      .get(dealId) as
+      | { quarantine: string; payload: string | null; updated_at: string }
+      | undefined;
+    return row
+      ? {
+          quarantine: JSON.parse(row.quarantine) as Quarantine,
+          deal: dealFromPayload(row.payload),
+          updatedAt: row.updated_at,
+        }
+      : null;
   }
 
   intakeLabels(dealIds: string[]): Map<string, string> {

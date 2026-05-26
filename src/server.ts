@@ -10,6 +10,7 @@
  *   POST /deals               ingest one deal or an array
  *   POST /webhooks/hubspot    receive HubSpot dealstage changes
  *   POST /enrichment-observations local-only manual company evidence
+ *   POST /quarantine-replay   local-only replay after enrichment repair
  *   POST /agent-suggestions   local-only agent draft ledger
  *   POST /agent-suggestions/:id/decision
  *   POST /agent-suggestion-runs/policy-evaluation
@@ -27,6 +28,7 @@ import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import {
   ENRICHMENT_FACT_MAX_AGE_DAYS,
+  ENRICHMENT_FACT_MIN_CONFIDENCE,
   MAX_FUTURE_SKEW_MS,
 } from "./constants.js";
 import { enrichmentSubjectKey, type Enricher } from "./enrich.js";
@@ -43,10 +45,20 @@ import {
 import { normalize } from "./intake.js";
 import { enrichWithGate, processBatch, scoreAndRoute } from "./pipeline.js";
 import type { PipelineOptions } from "./pipeline.js";
+import {
+  DEFAULT_RETRY,
+  LoggingSink,
+  SinkExhaustedError,
+  TerminalSinkError,
+  withRetry,
+  type SinkReceipt,
+} from "./sink.js";
 import type { Store } from "./store.js";
 import type {
   AgentSuggestionRecord,
+  Deal,
   DeploymentReadinessState,
+  Enrichment,
   EnrichedSubjectFacts,
   CommercialTerminalDriftAlertClaim,
   CommercialTerminalDriftAlertRetryCandidate,
@@ -251,6 +263,18 @@ const LocalEnrichmentObservationBody = z.object({
   note: z.string().trim().max(500).optional(),
 });
 
+const LocalQuarantineReplayBody = z.object({
+  dealId: z.string().trim().min(1),
+  contactName: z.string().trim().min(1).max(120),
+  contactEmail: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .email("contactEmail must be a valid email"),
+  operator: z.string().trim().min(1).max(120),
+  reason: z.string().trim().max(500).optional(),
+});
+
 const LocalAgentSuggestionBody = z.object({
   dealId: z.string().trim().min(1),
   sourceEventId: z.string().regex(UUID_V4, "sourceEventId must be UUIDv4"),
@@ -303,12 +327,22 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     record,
     subjectKey: enrichmentSubjectKey(record.deal),
   }));
-  // Enrichment projections are company-only in this slice, and the console
-  // attaches projected facts only to routed deals. Quarantined deal triage will
-  // need a ledger-observation view rather than this routed read model.
+  const quarantinedWithSubjectKeys = quarantined.map((record) => ({
+    record,
+    subjectKey: record.deal ? enrichmentSubjectKey(record.deal) : null,
+  }));
+  // Enrichment projections are company-only in this slice. Quarantined records
+  // with a normalized deal payload can now show repair evidence too.
   const enrichmentFacts = store.enrichedSubjectFactsForKeys(
     "company",
-    [...new Set(routedWithSubjectKeys.map(({ subjectKey }) => subjectKey))],
+    [
+      ...new Set([
+        ...routedWithSubjectKeys.map(({ subjectKey }) => subjectKey),
+        ...quarantinedWithSubjectKeys.flatMap(({ subjectKey }) =>
+          subjectKey ? [subjectKey] : [],
+        ),
+      ]),
+    ],
     now,
   );
   const quarantineLabels = store.intakeLabels(
@@ -335,19 +369,27 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
       enrichmentFacts: enrichmentFacts.get(subjectKey) ?? null,
     };
   });
-  const quarantinedQueue: ConsoleDeal[] = quarantined.map(
-    ({ quarantine, updatedAt, externalStage }) => {
+  const quarantinedQueue: ConsoleDeal[] = quarantinedWithSubjectKeys.map(
+    ({ record, subjectKey }) => {
+      const { quarantine, deal, updatedAt, externalStage } = record;
       return {
         id: quarantine.dealId,
-        company: quarantineCompany(quarantine, quarantineLabels),
+        company: deal?.company ?? quarantineCompany(quarantine, quarantineLabels),
         stage: "quarantined",
-        amount: 0,
+        amount: deal?.dealUSD ?? 0,
         route: "-",
         reason: quarantine.code,
         status: "quarantined",
         updatedAt,
         quarantine,
         externalStage,
+        enrichmentFacts: subjectKey ? enrichmentFacts.get(subjectKey) ?? null : null,
+        ...(deal
+          ? {
+              sourceChannel: deal.sourceChannel,
+            }
+          : {}),
+        ...(subjectKey ? { enrichmentSubjectKey: subjectKey } : {}),
       };
     },
   );
@@ -816,6 +858,73 @@ function manualEnrichmentForm(deal, facts){
     labeledInput("Operator", operator),
     labeledInput("Tech Signals", techSignals),
     labeledInput("Evidence Note", note),
+    button,
+    status
+  );
+  return wrap;
+}
+function quarantineReplayForm(deal){
+  if (!deal?.quarantine) return null;
+  const wrap = document.createElement("form");
+  wrap.className = "mini-form";
+  wrap.append(el("div", "muted", "Quarantine repair"));
+  const code = deal.quarantine.code;
+  if (code !== "enrichment_unresolved" && code !== "insufficient_data") {
+    wrap.append(el("div", "empty", "Replay is only available for enrichment quarantines."));
+    return wrap;
+  }
+  if (!deal.enrichmentSubjectKey) {
+    wrap.append(el("div", "empty", "No normalized deal payload is available for replay."));
+    return wrap;
+  }
+  if (!deal.enrichmentFacts || deal.enrichmentFacts.freshnessStatus !== "fresh") {
+    wrap.append(el("div", "empty", "Fresh, high-confidence enrichment evidence is required before replay."));
+    return wrap;
+  }
+  const contactName = document.createElement("input");
+  contactName.required = true;
+  contactName.autocomplete = "name";
+  contactName.placeholder = "Current contact";
+  const contactEmail = document.createElement("input");
+  contactEmail.type = "email";
+  contactEmail.required = true;
+  contactEmail.autocomplete = "email";
+  contactEmail.placeholder = "contact@company.com";
+  const status = el("div", "action-status");
+  const button = el("button", "secondary", "Replay Quarantine");
+  button.type = "submit";
+  wrap.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (button.disabled) return;
+    button.disabled = true;
+    status.className = "action-status";
+    status.textContent = "Replaying quarantine...";
+    try {
+      const result = await fetchJson("/quarantine-replay", {
+        method: "POST",
+        headers: localWriteHeaders(),
+        body: JSON.stringify({
+          dealId: deal.id,
+          contactName: contactName.value.trim(),
+          contactEmail: contactEmail.value.trim(),
+          operator: OPERATOR_PRINCIPAL,
+          reason: "fresh enrichment evidence available"
+        })
+      });
+      status.className = "action-status pass";
+      status.textContent = "Replay " + result.status + ". Refreshing state...";
+      await loadState();
+    } catch (err) {
+      status.className = "action-status fail";
+      status.textContent = String(err);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  wrap.append(
+    el("div", "muted", "Using " + deal.enrichmentFacts.sourceProvider + " evidence for " + deal.enrichmentSubjectKey),
+    labeledInput("Contact", contactName),
+    labeledInput("Email", contactEmail),
     button,
     status
   );
@@ -1766,6 +1875,8 @@ async function renderDetail(seq){
     enrichmentBox.append(el("div", "empty", "No projected enrichment facts available."));
   }
   enrichmentBox.append(manualEnrichmentForm(deal, facts));
+  const replayForm = quarantineReplayForm(deal);
+  if (replayForm) enrichmentBox.append(replayForm);
   const suggestions = dealSuggestionSection(detailId);
   const journey = el("div", "section");
   journey.append(el("h2", null, "Deal Journey"));
@@ -2807,6 +2918,26 @@ function localEnrichmentObservationStatusCode(
   }
 }
 
+function enrichmentFromFacts(facts: EnrichedSubjectFacts): Enrichment {
+  return {
+    employees: facts.employees,
+    industry: facts.industry,
+    techSignals: facts.techSignals,
+    regulated: facts.regulated,
+    confidence: facts.confidence,
+  };
+}
+
+function renderSinkReceipts(receipts: SinkReceipt[]): string {
+  if (receipts.length === 0) return "sink: no downstream receipt";
+  return receipts
+    .map((receipt) => {
+      const url = receipt.url ? ` (${receipt.url})` : "";
+      return `${receipt.system}:${receipt.externalId} ${receipt.detail}${url}`;
+    })
+    .join(" | ");
+}
+
 function localAgentSuggestionMutated(
   status: ReturnType<Store["recordLocalAgentSuggestion"]>["status"],
 ): boolean {
@@ -3127,6 +3258,243 @@ async function handleLocalEnrichmentObservation(
   });
   if (localEnrichmentObservationMutated(result.status)) invalidateStateCache();
   json(res, localEnrichmentObservationStatusCode(result.status), result);
+}
+
+async function handleQuarantineReplay(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  pipelineOptions: Partial<PipelineOptions>,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (!guardLocalWriteRequest(req, res, localWrites, "/quarantine-replay")) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalQuarantineReplayBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid quarantine-replay request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const record = store.quarantinedDeal(body.data.dealId);
+  if (!record) {
+    json(res, 404, { status: "not_found", error: "quarantined deal not found" });
+    return;
+  }
+  if (!record.deal) {
+    json(res, 409, {
+      status: "no_replay_payload",
+      error: "quarantine has no normalized deal payload to replay",
+    });
+    return;
+  }
+  if (
+    record.quarantine.code !== "enrichment_unresolved" &&
+    record.quarantine.code !== "insufficient_data"
+  ) {
+    json(res, 409, {
+      status: "unsupported_quarantine",
+      error: `quarantine code ${record.quarantine.code} cannot be replayed from enrichment evidence`,
+    });
+    return;
+  }
+
+  const subjectKey = enrichmentSubjectKey(record.deal);
+  const facts = store.enrichedSubjectFacts("company", subjectKey);
+  if (!facts || facts.freshnessStatus !== "fresh") {
+    const latestObservation = store.providerObservations("company", subjectKey, 1)[0];
+    const lowConfidence =
+      latestObservation !== undefined &&
+      latestObservation.confidence < ENRICHMENT_FACT_MIN_CONFIDENCE;
+    const status = lowConfidence ? "low_confidence" : "no_fresh_facts";
+    const error = lowConfidence
+      ? facts?.freshnessStatus === "stale"
+        ? `projected enrichment facts are stale and latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
+        : `latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
+      : "fresh, high-confidence enrichment facts are required before replay";
+    const audit = store.recordQuarantineReplayFailureOrStateRace(
+      record.deal.id,
+      `quarantine replay ${status}: ${error}`,
+      `quarantine replay ${status} after state moved: ${error}`,
+    );
+    if (audit.auditRecorded) invalidateStateCache();
+    json(res, 409, {
+      status,
+      error,
+      subjectKey,
+      freshnessStatus: facts?.freshnessStatus ?? null,
+      latestObservationConfidence: latestObservation?.confidence ?? null,
+      minimumConfidence: ENRICHMENT_FACT_MIN_CONFIDENCE,
+      auditRecorded: audit.auditRecorded,
+      stateChanged: audit.stateChanged,
+      auditUnavailable: audit.auditUnavailable,
+    });
+    return;
+  }
+
+  const startedAt = performance.now();
+  const replayDeal: Deal = {
+    ...record.deal,
+    contactName: body.data.contactName,
+    contactEmail: body.data.contactEmail,
+  };
+  let routed: RoutedDeal;
+  try {
+    const gate = await enrichWithGate(replayDeal, {
+      name: facts.sourceProvider,
+      async enrich() {
+        return enrichmentFromFacts(facts);
+      },
+    });
+    if (!gate.ok) {
+      const audit = store.recordQuarantineReplayFailureOrStateRace(
+        record.deal.id,
+        `quarantine replay ${gate.code}: ${gate.reason}`,
+        `quarantine replay ${gate.code} after state moved: ${gate.reason}`,
+      );
+      if (audit.auditRecorded) invalidateStateCache();
+      json(res, 409, {
+        status: gate.code,
+        error: gate.reason,
+        subjectKey,
+        auditRecorded: audit.auditRecorded,
+        stateChanged: audit.stateChanged,
+        auditUnavailable: audit.auditUnavailable,
+      });
+      return;
+    }
+    routed = scoreAndRoute(replayDeal, gate.enrichment);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const audit = store.recordQuarantineReplayFailureOrStateRace(
+      record.deal.id,
+      `quarantine replay score_error: ${message}`,
+      `quarantine replay score_error after state moved: ${message}`,
+    );
+    if (audit.auditRecorded) invalidateStateCache();
+    json(res, 422, {
+      status: "score_error",
+      error: message,
+      auditRecorded: audit.auditRecorded,
+      stateChanged: audit.stateChanged,
+      auditUnavailable: audit.auditUnavailable,
+    });
+    return;
+  }
+  const dryRun = pipelineOptions.dryRun ?? true;
+  const sink = pipelineOptions.sink ?? new LoggingSink();
+  const retry = pipelineOptions.retry ?? DEFAULT_RETRY;
+  let receipts: SinkReceipt[];
+  let sinkState: {
+    mode: "dry_run" | "live";
+    status: "synced" | "partial" | "dry_run";
+  };
+  try {
+    // Keep the original pipeline ordering: downstream upsert first, local
+    // routed state second. OpportunitySink implementations must be idempotent
+    // on deal.id so a retry after an interrupted replay cannot duplicate CRM
+    // opportunities.
+    if (dryRun) {
+      receipts = await sink.upsert(routed);
+      sinkState = { mode: "dry_run", status: "dry_run" };
+    } else {
+      receipts = await withRetry(() => sink.upsert(routed), retry);
+      sinkState = {
+        mode: "live",
+        status: receipts.some((receipt) => receipt.status === "warning")
+          ? "partial"
+          : "synced",
+      };
+    }
+  } catch (err) {
+    const status =
+      err instanceof TerminalSinkError
+        ? "sink_terminal"
+        : err instanceof SinkExhaustedError
+          ? "sink_exhausted"
+          : "sink_error";
+    const message = err instanceof Error ? err.message : String(err);
+    const audit = store.recordQuarantineReplayFailureOrStateRace(
+      record.deal.id,
+      `quarantine replay ${status}: ${message}`,
+      `quarantine replay ${status} after state moved: ${message}`,
+    );
+    if (audit.auditRecorded) invalidateStateCache();
+    json(res, 502, {
+      status,
+      error: message,
+      auditRecorded: audit.auditRecorded,
+      stateChanged: audit.stateChanged,
+      auditUnavailable: audit.auditUnavailable,
+    });
+    return;
+  }
+
+  const sinkDetail = dryRun
+    ? `sink: dry-run replay ${renderSinkReceipts(receipts)}`
+    : `sink: replay upserted via ${sink.name} ${renderSinkReceipts(receipts)}`;
+  let writeStatus: "inserted" | "updated";
+  try {
+    writeStatus = store.recordQuarantineReplay(
+      routed,
+      Math.round(performance.now() - startedAt),
+      sinkState,
+      `quarantine replay by ${body.data.operator} via ${facts.sourceProvider} ${facts.sourceObservationId}`,
+      `score ${routed.score.total.toFixed(2)} after quarantine replay`,
+      sinkDetail,
+      { kind: "sink", mode: sinkState.mode, receipts },
+      body.data.reason ? `quarantine replay note: ${body.data.reason}` : undefined,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const noLongerQuarantined = message.includes("currently quarantined");
+    const auditRecorded = noLongerQuarantined
+      ? store.recordQuarantineReplayStateRace(
+          routed.id,
+          `quarantine replay dropped after sink success because state moved: ${sinkDetail}`,
+          { kind: "sink", mode: sinkState.mode, receipts },
+        )
+      : false;
+    if (auditRecorded) invalidateStateCache();
+    json(res, noLongerQuarantined ? 409 : 500, {
+      status: noLongerQuarantined ? "not_quarantined" : "store_error",
+      error: message,
+      auditRecorded,
+      sink: noLongerQuarantined
+        ? { ...sinkState, receipts }
+        : undefined,
+    });
+    return;
+  }
+  invalidateStateCache();
+  json(res, 200, {
+    status: "routed",
+    writeStatus,
+    deal: routed,
+    facts,
+    sink: {
+      ...sinkState,
+      receipts,
+    },
+    previousQuarantine: record.quarantine,
+  });
 }
 
 async function handleLocalAgentSuggestion(
@@ -3637,6 +4005,17 @@ async function handleRequest(
       res,
       store,
       localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/quarantine-replay") {
+    await handleQuarantineReplay(
+      req,
+      res,
+      store,
+      localWrites,
+      options.pipelineOptions ?? {},
       invalidateStateCache,
     );
     return;
