@@ -189,6 +189,7 @@ type RoutedRecord = {
 type QuarantinedRecord = {
   quarantine: Quarantine;
   deal: Deal | null;
+  routedDeal: RoutedDeal | null;
   updatedAt: string;
   externalStage: ExternalStageState | null;
 };
@@ -203,10 +204,20 @@ type RoutedRecordRow = {
   external_stage_updated_at: string | null;
 };
 
-type QuarantineReplayPayload = Omit<Deal, "contactName" | "contactEmail">;
+type QuarantineReplayPayload = Omit<Deal, "contactName" | "contactEmail"> & {
+  payloadKind?: "deal" | "routed_deal";
+};
+type QuarantineRoutedReplayPayload = Omit<
+  RoutedDeal,
+  "contactName" | "contactEmail"
+> & {
+  payloadKind?: "routed_deal";
+};
 
-function quarantineReplayPayload(deal: Deal): QuarantineReplayPayload {
-  return {
+function quarantineReplayPayload(
+  deal: Deal | RoutedDeal,
+): QuarantineReplayPayload | QuarantineRoutedReplayPayload {
+  const base = {
     id: deal.id,
     company: deal.company,
     domain: deal.domain,
@@ -215,13 +226,71 @@ function quarantineReplayPayload(deal: Deal): QuarantineReplayPayload {
     sourceChannel: deal.sourceChannel,
     statedNeed: deal.statedNeed,
   };
+  return "enrichment" in deal
+    ? {
+        ...base,
+        payloadKind: "routed_deal",
+        enrichment: deal.enrichment,
+        score: deal.score,
+        route: deal.route,
+      }
+    : { ...base, payloadKind: "deal" };
 }
 
 function dealFromPayload(payload: string | null): Deal | null {
   if (!payload) return null;
   const parsed = JSON.parse(payload) as QuarantineReplayPayload;
   return {
-    ...parsed,
+    id: parsed.id,
+    company: parsed.company,
+    domain: parsed.domain,
+    dealUSD: parsed.dealUSD,
+    region: parsed.region,
+    sourceChannel: parsed.sourceChannel,
+    statedNeed: parsed.statedNeed,
+    contactName: "Redacted Contact",
+    contactEmail: "redacted@example.invalid",
+  };
+}
+
+function routedDealFromPayload(payload: string | null): RoutedDeal | null {
+  if (!payload) return null;
+  const parsed = JSON.parse(payload) as Partial<
+    Omit<RoutedDeal, "contactName" | "contactEmail">
+  > & { payloadKind?: "deal" | "routed_deal" };
+  if (parsed.payloadKind === "deal") return null;
+  if (
+    parsed.payloadKind !== undefined &&
+    parsed.payloadKind !== "routed_deal"
+  ) {
+    return null;
+  }
+  if (
+    typeof parsed.id !== "string" ||
+    typeof parsed.company !== "string" ||
+    typeof parsed.domain !== "string" ||
+    typeof parsed.dealUSD !== "number" ||
+    typeof parsed.region !== "string" ||
+    typeof parsed.sourceChannel !== "string" ||
+    typeof parsed.statedNeed !== "string" ||
+    !parsed.enrichment ||
+    !parsed.score ||
+    !parsed.route
+  ) {
+    return null;
+  }
+  const routedPayload = parsed as QuarantineRoutedReplayPayload;
+  return {
+    id: routedPayload.id,
+    company: routedPayload.company,
+    domain: routedPayload.domain,
+    dealUSD: routedPayload.dealUSD,
+    region: routedPayload.region,
+    sourceChannel: routedPayload.sourceChannel,
+    statedNeed: routedPayload.statedNeed,
+    enrichment: routedPayload.enrichment,
+    score: routedPayload.score,
+    route: routedPayload.route,
     contactName: "Redacted Contact",
     contactEmail: "redacted@example.invalid",
   };
@@ -1827,7 +1896,12 @@ export class Store {
     return existing ? "updated" : "inserted";
   }
 
-  upsertQuarantine(q: Quarantine, latencyMs: number, deal?: Deal): void {
+  upsertQuarantine(
+    q: Quarantine,
+    latencyMs: number,
+    deal?: Deal,
+    routedDeal?: RoutedDeal,
+  ): void {
     const now = new Date().toISOString();
     const sink = this.sinkStateFromEvents(q.dealId);
     this.db
@@ -1853,7 +1927,11 @@ export class Store {
       )
       .run(
         q.dealId,
-        deal ? JSON.stringify(quarantineReplayPayload(deal)) : null,
+        routedDeal
+          ? JSON.stringify(quarantineReplayPayload(routedDeal))
+          : deal
+            ? JSON.stringify(quarantineReplayPayload(deal))
+            : null,
         JSON.stringify(q),
         q.code,
         sink.mode,
@@ -1988,10 +2066,11 @@ export class Store {
     from: Stage | "-",
     detail: string,
     deal?: Deal,
+    routedDeal?: RoutedDeal,
   ): void {
     this.transaction(() => {
       this.appendEvent(q.dealId, from, "quarantined", detail);
-      this.upsertQuarantine(q, latencyMs, deal);
+      this.upsertQuarantine(q, latencyMs, deal, routedDeal);
     });
   }
 
@@ -5972,6 +6051,7 @@ export class Store {
     return rows.map((r) => ({
       quarantine: JSON.parse(r.quarantine) as Quarantine,
       deal: dealFromPayload(r.payload),
+      routedDeal: routedDealFromPayload(r.payload),
       updatedAt: r.updated_at,
       externalStage: this.externalStageFromRow(r),
     }));
@@ -5980,6 +6060,7 @@ export class Store {
   quarantinedDeal(dealId: string): {
     quarantine: Quarantine;
     deal: Deal | null;
+    routedDeal: RoutedDeal | null;
     updatedAt: string;
   } | null {
     const row = this.db
@@ -5996,6 +6077,7 @@ export class Store {
       ? {
           quarantine: JSON.parse(row.quarantine) as Quarantine,
           deal: dealFromPayload(row.payload),
+          routedDeal: routedDealFromPayload(row.payload),
           updatedAt: row.updated_at,
         }
       : null;

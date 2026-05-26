@@ -136,6 +136,7 @@ function quarantine(
   reason: string,
   t0: number,
   deal?: Deal,
+  routedDeal?: RoutedDeal,
 ): PipelineOutcome {
   const q: Quarantine = {
     dealId,
@@ -151,6 +152,7 @@ function quarantine(
       from,
       `${code}: ${reason}`,
       deal,
+      routedDeal,
     );
     return { ok: false, quarantine: q };
   } catch (err) {
@@ -361,6 +363,7 @@ export async function processOne(
           err.message,
           t0,
           deal,
+          routed,
         );
       }
       if (err instanceof SinkExhaustedError) {
@@ -373,6 +376,7 @@ export async function processOne(
           err.message,
           t0,
           deal,
+          routed,
         );
       }
       throw err; // unknown — do not absorb

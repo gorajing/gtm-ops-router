@@ -165,6 +165,7 @@ interface ConsoleDeal {
   enrichmentSubjectKey?: string;
   enrichmentFacts?: EnrichedSubjectFacts | null;
   quarantine?: Quarantine;
+  sinkReplayMode?: "stored_route" | "rederive_route";
 }
 
 interface ConsoleState {
@@ -383,6 +384,13 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
         updatedAt,
         quarantine,
         externalStage,
+        ...(quarantine.code === "sink_terminal" ||
+        quarantine.code === "sink_exhausted"
+          ? {
+              sinkReplayMode:
+                record.routedDeal !== null ? "stored_route" : "rederive_route",
+            }
+          : {}),
         enrichmentFacts: subjectKey ? enrichmentFacts.get(subjectKey) ?? null : null,
         ...(deal
           ? {
@@ -869,15 +877,17 @@ function quarantineReplayForm(deal){
   wrap.className = "mini-form";
   wrap.append(el("div", "muted", "Quarantine repair"));
   const code = deal.quarantine.code;
-  if (code !== "enrichment_unresolved" && code !== "insufficient_data") {
-    wrap.append(el("div", "empty", "Replay is only available for enrichment quarantines."));
+  const isEnrichmentReplay = code === "enrichment_unresolved" || code === "insufficient_data";
+  const isSinkReplay = code === "sink_terminal" || code === "sink_exhausted";
+  if (!isEnrichmentReplay && !isSinkReplay) {
+    wrap.append(el("div", "empty", "Replay is not available for this quarantine code."));
     return wrap;
   }
-  if (!deal.enrichmentSubjectKey) {
+  if (isEnrichmentReplay && !deal.enrichmentSubjectKey) {
     wrap.append(el("div", "empty", "No normalized deal payload is available for replay."));
     return wrap;
   }
-  if (!deal.enrichmentFacts || deal.enrichmentFacts.freshnessStatus !== "fresh") {
+  if (isEnrichmentReplay && (!deal.enrichmentFacts || deal.enrichmentFacts.freshnessStatus !== "fresh")) {
     wrap.append(el("div", "empty", "Fresh, high-confidence enrichment evidence is required before replay."));
     return wrap;
   }
@@ -908,7 +918,7 @@ function quarantineReplayForm(deal){
           contactName: contactName.value.trim(),
           contactEmail: contactEmail.value.trim(),
           operator: OPERATOR_PRINCIPAL,
-          reason: "fresh enrichment evidence available"
+          reason: isSinkReplay ? "downstream sink repaired" : "fresh enrichment evidence available"
         })
       });
       status.className = "action-status pass";
@@ -921,8 +931,18 @@ function quarantineReplayForm(deal){
       button.disabled = false;
     }
   });
+  let replayNote;
+  if (isSinkReplay && deal.sinkReplayMode === "stored_route") {
+    replayNote = "Retry downstream sync with the original stored route after fixing the integration or configuration.";
+  } else if (isSinkReplay && deal.enrichmentFacts?.freshnessStatus === "fresh") {
+    replayNote = "Retry downstream sync after rechecking routing from fresh " + deal.enrichmentFacts.sourceProvider + " evidence.";
+  } else if (isSinkReplay) {
+    replayNote = "Retry downstream sync after rechecking enrichment with the live provider and routing.";
+  } else {
+    replayNote = "Using " + deal.enrichmentFacts.sourceProvider + " evidence for " + deal.enrichmentSubjectKey;
+  }
   wrap.append(
-    el("div", "muted", "Using " + deal.enrichmentFacts.sourceProvider + " evidence for " + deal.enrichmentSubjectKey),
+    el("div", "muted", replayNote),
     labeledInput("Contact", contactName),
     labeledInput("Email", contactEmail),
     button,
@@ -2928,6 +2948,15 @@ function enrichmentFromFacts(facts: EnrichedSubjectFacts): Enrichment {
   };
 }
 
+function enricherFromFacts(facts: EnrichedSubjectFacts): Enricher {
+  return {
+    name: facts.sourceProvider,
+    async enrich() {
+      return enrichmentFromFacts(facts);
+    },
+  };
+}
+
 function renderSinkReceipts(receipts: SinkReceipt[]): string {
   if (receipts.length === 0) return "sink: no downstream receipt";
   return receipts
@@ -3265,6 +3294,7 @@ async function handleQuarantineReplay(
   res: ServerResponse,
   store: Store,
   localWrites: LocalWriteEndpointOptions,
+  enricher: Enricher,
   pipelineOptions: Partial<PipelineOptions>,
   invalidateStateCache: () => void,
 ): Promise<void> {
@@ -3305,96 +3335,157 @@ async function handleQuarantineReplay(
     });
     return;
   }
-  if (
-    record.quarantine.code !== "enrichment_unresolved" &&
-    record.quarantine.code !== "insufficient_data"
-  ) {
+  const replayMode =
+    record.quarantine.code === "enrichment_unresolved" ||
+    record.quarantine.code === "insufficient_data"
+      ? "enrichment_repair"
+      : record.quarantine.code === "sink_terminal" ||
+          record.quarantine.code === "sink_exhausted"
+        ? "sink_retry"
+        : null;
+  if (replayMode === null) {
     json(res, 409, {
       status: "unsupported_quarantine",
-      error: `quarantine code ${record.quarantine.code} cannot be replayed from enrichment evidence`,
-    });
-    return;
-  }
-
-  const subjectKey = enrichmentSubjectKey(record.deal);
-  const facts = store.enrichedSubjectFacts("company", subjectKey);
-  if (!facts || facts.freshnessStatus !== "fresh") {
-    const latestObservation = store.providerObservations("company", subjectKey, 1)[0];
-    const lowConfidence =
-      latestObservation !== undefined &&
-      latestObservation.confidence < ENRICHMENT_FACT_MIN_CONFIDENCE;
-    const status = lowConfidence ? "low_confidence" : "no_fresh_facts";
-    const error = lowConfidence
-      ? facts?.freshnessStatus === "stale"
-        ? `projected enrichment facts are stale and latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
-        : `latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
-      : "fresh, high-confidence enrichment facts are required before replay";
-    const audit = store.recordQuarantineReplayFailureOrStateRace(
-      record.deal.id,
-      `quarantine replay ${status}: ${error}`,
-      `quarantine replay ${status} after state moved: ${error}`,
-    );
-    if (audit.auditRecorded) invalidateStateCache();
-    json(res, 409, {
-      status,
-      error,
-      subjectKey,
-      freshnessStatus: facts?.freshnessStatus ?? null,
-      latestObservationConfidence: latestObservation?.confidence ?? null,
-      minimumConfidence: ENRICHMENT_FACT_MIN_CONFIDENCE,
-      auditRecorded: audit.auditRecorded,
-      stateChanged: audit.stateChanged,
-      auditUnavailable: audit.auditUnavailable,
+      error: `quarantine code ${record.quarantine.code} cannot be replayed by the operator console`,
     });
     return;
   }
 
   const startedAt = performance.now();
   const replayDeal: Deal = {
-    ...record.deal,
+    id: record.deal.id,
+    company: record.deal.company,
+    domain: record.deal.domain,
+    dealUSD: record.deal.dealUSD,
+    region: record.deal.region,
+    sourceChannel: record.deal.sourceChannel,
+    statedNeed: record.deal.statedNeed,
     contactName: body.data.contactName,
     contactEmail: body.data.contactEmail,
   };
-  let routed: RoutedDeal;
-  try {
-    const gate = await enrichWithGate(replayDeal, {
-      name: facts.sourceProvider,
-      async enrich() {
-        return enrichmentFromFacts(facts);
-      },
-    });
-    if (!gate.ok) {
+  let routed: RoutedDeal | null = null;
+  let replayFacts: EnrichedSubjectFacts | null = null;
+  let replaySource = "";
+  let routeDerivation:
+    | "stored_route"
+    | "rederived_from_evidence"
+    | "rederived_from_enricher"
+    | null = null;
+  let replayEnricher: Enricher | null = null;
+  if (replayMode === "sink_retry" && record.routedDeal) {
+    routed = {
+      ...record.routedDeal,
+      contactName: body.data.contactName,
+      contactEmail: body.data.contactEmail,
+    };
+    replaySource = `stored_route:${record.quarantine.code}`;
+    routeDerivation = "stored_route";
+  } else if (replayMode === "enrichment_repair") {
+    const subjectKey = enrichmentSubjectKey(replayDeal);
+    const facts = store.enrichedSubjectFacts("company", subjectKey);
+    if (!facts || facts.freshnessStatus !== "fresh") {
+      const latestObservation = store.providerObservations(
+        "company",
+        subjectKey,
+        1,
+      )[0];
+      const lowConfidence =
+        latestObservation !== undefined &&
+        latestObservation.confidence < ENRICHMENT_FACT_MIN_CONFIDENCE;
+      const status = lowConfidence ? "low_confidence" : "no_fresh_facts";
+      const error = lowConfidence
+        ? facts?.freshnessStatus === "stale"
+          ? `projected enrichment facts are stale and latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
+          : `latest enrichment confidence ${latestObservation.confidence.toFixed(2)} < ${ENRICHMENT_FACT_MIN_CONFIDENCE}`
+        : "fresh, high-confidence enrichment facts are required before replay";
       const audit = store.recordQuarantineReplayFailureOrStateRace(
-        record.deal.id,
-        `quarantine replay ${gate.code}: ${gate.reason}`,
-        `quarantine replay ${gate.code} after state moved: ${gate.reason}`,
+        replayDeal.id,
+        `quarantine replay ${status}: ${error}`,
+        `quarantine replay ${status} after state moved: ${error}`,
       );
       if (audit.auditRecorded) invalidateStateCache();
       json(res, 409, {
-        status: gate.code,
-        error: gate.reason,
+        status,
+        error,
         subjectKey,
+        freshnessStatus: facts?.freshnessStatus ?? null,
+        latestObservationConfidence: latestObservation?.confidence ?? null,
+        minimumConfidence: ENRICHMENT_FACT_MIN_CONFIDENCE,
         auditRecorded: audit.auditRecorded,
         stateChanged: audit.stateChanged,
         auditUnavailable: audit.auditUnavailable,
       });
       return;
     }
-    routed = scoreAndRoute(replayDeal, gate.enrichment);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const audit = store.recordQuarantineReplayFailureOrStateRace(
-      record.deal.id,
-      `quarantine replay score_error: ${message}`,
-      `quarantine replay score_error after state moved: ${message}`,
-    );
-    if (audit.auditRecorded) invalidateStateCache();
-    json(res, 422, {
-      status: "score_error",
-      error: message,
-      auditRecorded: audit.auditRecorded,
-      stateChanged: audit.stateChanged,
-      auditUnavailable: audit.auditUnavailable,
+    replayFacts = facts;
+    replaySource = `evidence:${facts.sourceProvider}:${facts.sourceObservationId}`;
+    routeDerivation = "rederived_from_evidence";
+    replayEnricher = enricherFromFacts(facts);
+  } else {
+    const subjectKey = enrichmentSubjectKey(replayDeal);
+    const facts = store.enrichedSubjectFacts("company", subjectKey);
+    if (facts?.freshnessStatus === "fresh") {
+      replayFacts = facts;
+      replaySource = `evidence:${facts.sourceProvider}:${facts.sourceObservationId}`;
+      routeDerivation = "rederived_from_evidence";
+      replayEnricher = enricherFromFacts(facts);
+    } else {
+      replaySource = `enricher:${enricher.name}`;
+      routeDerivation = "rederived_from_enricher";
+      replayEnricher = enricher;
+    }
+  }
+  if (!routed) {
+    if (!replayEnricher) {
+      json(res, 500, {
+        status: "pipeline_error",
+        error: "quarantine replay enricher was not selected",
+      });
+      return;
+    }
+    try {
+      const gate = await enrichWithGate(replayDeal, replayEnricher);
+      if (!gate.ok) {
+        const subjectKey = enrichmentSubjectKey(replayDeal);
+        const audit = store.recordQuarantineReplayFailureOrStateRace(
+          replayDeal.id,
+          `quarantine replay ${gate.code}: ${gate.reason}`,
+          `quarantine replay ${gate.code} after state moved: ${gate.reason}`,
+        );
+        if (audit.auditRecorded) invalidateStateCache();
+        json(res, 409, {
+          status: gate.code,
+          error: gate.reason,
+          subjectKey,
+          auditRecorded: audit.auditRecorded,
+          stateChanged: audit.stateChanged,
+          auditUnavailable: audit.auditUnavailable,
+        });
+        return;
+      }
+      routed = scoreAndRoute(replayDeal, gate.enrichment);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const audit = store.recordQuarantineReplayFailureOrStateRace(
+        replayDeal.id,
+        `quarantine replay score_error: ${message}`,
+        `quarantine replay score_error after state moved: ${message}`,
+      );
+      if (audit.auditRecorded) invalidateStateCache();
+      json(res, 422, {
+        status: "score_error",
+        error: message,
+        auditRecorded: audit.auditRecorded,
+        stateChanged: audit.stateChanged,
+        auditUnavailable: audit.auditUnavailable,
+      });
+      return;
+    }
+  }
+  if (routeDerivation === null) {
+    json(res, 500, {
+      status: "pipeline_error",
+      error: "quarantine replay route derivation was not selected",
     });
     return;
   }
@@ -3410,7 +3501,8 @@ async function handleQuarantineReplay(
     // Keep the original pipeline ordering: downstream upsert first, local
     // routed state second. OpportunitySink implementations must be idempotent
     // on deal.id so a retry after an interrupted replay cannot duplicate CRM
-    // opportunities.
+    // opportunities; sink quarantine replay relies on that same contract because
+    // an earlier failed attempt may already have written a partial receipt.
     if (dryRun) {
       receipts = await sink.upsert(routed);
       sinkState = { mode: "dry_run", status: "dry_run" };
@@ -3432,7 +3524,7 @@ async function handleQuarantineReplay(
           : "sink_error";
     const message = err instanceof Error ? err.message : String(err);
     const audit = store.recordQuarantineReplayFailureOrStateRace(
-      record.deal.id,
+      replayDeal.id,
       `quarantine replay ${status}: ${message}`,
       `quarantine replay ${status} after state moved: ${message}`,
     );
@@ -3456,7 +3548,7 @@ async function handleQuarantineReplay(
       routed,
       Math.round(performance.now() - startedAt),
       sinkState,
-      `quarantine replay by ${body.data.operator} via ${facts.sourceProvider} ${facts.sourceObservationId}`,
+      `quarantine replay by ${body.data.operator} via ${replaySource} (${routeDerivation})`,
       `score ${routed.score.total.toFixed(2)} after quarantine replay`,
       sinkDetail,
       { kind: "sink", mode: sinkState.mode, receipts },
@@ -3488,7 +3580,9 @@ async function handleQuarantineReplay(
     status: "routed",
     writeStatus,
     deal: routed,
-    facts,
+    ...(replayFacts ? { facts: replayFacts } : {}),
+    replaySource,
+    routeDerivation,
     sink: {
       ...sinkState,
       receipts,
@@ -4015,6 +4109,7 @@ async function handleRequest(
       res,
       store,
       localWrites,
+      enricher,
       options.pipelineOptions ?? {},
       invalidateStateCache,
     );

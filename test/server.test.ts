@@ -8,9 +8,9 @@ import {
   integrationOptionsFromEnv,
 } from "../src/integrations.js";
 import { startServer } from "../src/server.js";
-import type { OpportunitySink } from "../src/sink.js";
+import { TerminalSinkError, type OpportunitySink } from "../src/sink.js";
 import { Store } from "../src/store.js";
-import type { Deal, Enrichment, RoutedDeal } from "../src/types.js";
+import type { Deal, Enrichment, Quarantine, RoutedDeal } from "../src/types.js";
 
 const LOCAL_ENDPOINT_SECRET = "0123456789abcdef0123456789abcdef";
 const LOCAL_ENDPOINT_SECRET_HEADER = "x-local-endpoint-secret";
@@ -1062,6 +1062,383 @@ describe("local commercial-state endpoint", () => {
             detail: expect.stringContaining("quarantine replay by operator-console"),
           }),
         );
+      },
+    );
+  });
+
+  it("replays a sink quarantine after the downstream issue is fixed", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        let failSink = true;
+        const repairingSink: OpportunitySink = {
+          name: "repairing-sink",
+          async upsert(deal: RoutedDeal) {
+            if (failSink) {
+              throw new TerminalSinkError("HubSpot mapping is invalid");
+            }
+            return [
+              {
+                system: "hubspot",
+                externalId: deal.id,
+                detail: "upserted after repair",
+              },
+              {
+                system: "slack",
+                externalId: "C123",
+                detail: "posted after repair",
+              },
+            ];
+          },
+        };
+        const { baseUrl, store } = await app({
+          pipelineOptions: {
+            dryRun: false,
+            sink: repairingSink,
+            retry: { maxAttempts: 1, baseDelayMs: 0, sleep: async () => {} },
+          },
+        });
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const post = await fetch(`${baseUrl}/deals`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            company: "Sink Repair Logistics",
+            domain: "sinkrepair.example",
+            contactName: "Sia Ops",
+            contactEmail: "sia@sinkrepair.example",
+            dealUSD: 88000,
+            region: "NA",
+            sourceChannel: "referral",
+            statedNeed: "manual carrier calls are delaying exceptions",
+          }),
+        });
+        const postBody = (await post.json()) as {
+          quarantined: number;
+          outcomes: Array<{
+            ok: false;
+            quarantine: { dealId: string; code: string };
+          }>;
+        };
+        const dealId = postBody.outcomes[0]?.quarantine.dealId;
+        if (!dealId) throw new Error("expected quarantined deal id");
+
+        expect(postBody.quarantined).toBe(1);
+        expect(postBody.outcomes[0]?.quarantine.code).toBe("sink_terminal");
+        expect(store.quarantinedDeal(dealId)?.deal).toEqual(
+          expect.objectContaining({
+            company: "Sink Repair Logistics",
+            contactName: "Redacted Contact",
+            contactEmail: "redacted@example.invalid",
+            dealUSD: 88000,
+          }),
+        );
+
+        failSink = false;
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId,
+            contactName: "Sia Ops",
+            contactEmail: "sia@sinkrepair.example",
+            operator: "operator-console",
+            reason: "HubSpot mapping fixed",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          replaySource: string;
+          routeDerivation: string;
+          deal: {
+            contactEmail: string;
+            route: { kind: string; financeFlag: string | null };
+          };
+          sink: { mode: string; status: string; receipts: Array<{ system: string }> };
+        };
+        const state = (await fetch(`${baseUrl}/state`).then((res) =>
+          res.json(),
+        )) as {
+          queue: Array<{ id: string; stage: string; status: string }>;
+          exceptions: Array<{ dealId: string }>;
+        };
+        const row = state.queue.find((item) => item.id === dealId);
+        const events = (await fetch(
+          `${baseUrl}/deals/${encodeURIComponent(dealId)}/events`,
+        ).then((res) => res.json())) as {
+          events: Array<{ detail: string; from: string; to: string }>;
+        };
+
+        expect(replay.status).toBe(200);
+        expect(replayBody.status).toBe("routed");
+        expect(replayBody.replaySource).toBe("stored_route:sink_terminal");
+        expect(replayBody.routeDerivation).toBe("stored_route");
+        expect(replayBody.deal.contactEmail).toBe("sia@sinkrepair.example");
+        expect(replayBody.deal.route.kind).toBe("human_assisted");
+        expect(replayBody.deal.route.financeFlag).toBe("pricing_approval");
+        expect(replayBody.sink).toEqual(
+          expect.objectContaining({
+            mode: "live",
+            status: "synced",
+            receipts: expect.arrayContaining([
+              expect.objectContaining({ system: "hubspot" }),
+              expect.objectContaining({ system: "slack" }),
+            ]),
+          }),
+        );
+        expect(store.quarantinedDeal(dealId)).toBeNull();
+        expect(row).toEqual(
+          expect.objectContaining({
+            id: dealId,
+            stage: "routed",
+            status: "synced",
+          }),
+        );
+        expect(state.exceptions.some((item) => item.dealId === dealId)).toBe(
+          false,
+        );
+        expect(events.events).toContainEqual(
+          expect.objectContaining({
+            from: "quarantined",
+            to: "enriched",
+            detail: expect.stringContaining(
+              "quarantine replay by operator-console via stored_route:sink_terminal",
+            ),
+          }),
+        );
+      },
+    );
+  });
+
+  it("replays a legacy sink quarantine from fresh evidence before falling back to the live enricher", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        let enricherCalls = 0;
+        const replayAwareEnricher: Enricher = {
+          name: "fixture",
+          async enrich(): Promise<Enrichment> {
+            enricherCalls += 1;
+            return {
+              employees: 1200,
+              industry: "logistics",
+              techSignals: ["manual_ops", "enterprise"],
+              regulated: false,
+              confidence: 0.95,
+            };
+          },
+        };
+        const repairingSink: OpportunitySink = {
+          name: "repairing-sink",
+          async upsert(deal: RoutedDeal) {
+            return [
+              {
+                system: "hubspot",
+                externalId: deal.id,
+                detail: "upserted after repair",
+              },
+            ];
+          },
+        };
+        const { baseUrl, store } = await app(
+          {
+            pipelineOptions: {
+              dryRun: false,
+              sink: repairingSink,
+              retry: { maxAttempts: 1, baseDelayMs: 0, sleep: async () => {} },
+            },
+          },
+          replayAwareEnricher,
+        );
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+
+        const legacyDeal: Deal = {
+          id: "D-legacy-sink-evidence",
+          company: "Evidence Sink Logistics",
+          domain: "evidencesink.example",
+          contactName: "Eli Ops",
+          contactEmail: "eli@evidencesink.example",
+          dealUSD: 66000,
+          region: "NA",
+          sourceChannel: "event",
+          statedNeed: "manual tender follow-up is missing pickups",
+        };
+        const legacyQuarantine: Quarantine = {
+          dealId: legacyDeal.id,
+          stage: "routed",
+          code: "sink_terminal",
+          reason: "Slack channel is invalid",
+          at: new Date().toISOString(),
+        };
+        store.recordQuarantine(
+          legacyQuarantine,
+          0,
+          "scored",
+          "sink_terminal: Slack channel is invalid",
+          legacyDeal,
+        );
+
+        await fetch(`${baseUrl}/enrichment-observations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            subjectKey: "evidencesink.example",
+            sourceEventId: "93939393-9393-4393-9393-939393939393",
+            employees: 780,
+            industry: "freight brokerage",
+            techSignals: ["voice_ai_eval", "manual_ops"],
+            regulated: false,
+            confidence: 0.97,
+            operator: "operator-console",
+          }),
+        });
+
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId: legacyDeal.id,
+            contactName: "Eli Ops",
+            contactEmail: "eli@evidencesink.example",
+            operator: "operator-console",
+            reason: "Slack channel fixed",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          replaySource: string;
+          routeDerivation: string;
+          facts?: { sourceProvider: string; subjectKey: string };
+        };
+
+        expect(replay.status).toBe(200);
+        expect(replayBody.status).toBe("routed");
+        expect(replayBody.replaySource).toMatch(/^evidence:manual:/);
+        expect(replayBody.routeDerivation).toBe("rederived_from_evidence");
+        expect(replayBody.facts).toEqual(
+          expect.objectContaining({
+            sourceProvider: "manual",
+            subjectKey: "evidencesink.example",
+          }),
+        );
+        expect(enricherCalls).toBe(0);
+      },
+    );
+  });
+
+  it("replays a legacy sink quarantine through the live enricher when no fresh evidence exists", async () => {
+    await withEnv(
+      {
+        ALLOW_LOCAL_WRITE_ENDPOINTS: "1",
+        LOCAL_ENDPOINT_SECRET: LOCAL_ENDPOINT_SECRET,
+      },
+      async () => {
+        let enricherCalls = 0;
+        const replayAwareEnricher: Enricher = {
+          name: "fixture",
+          async enrich(deal: Deal): Promise<Enrichment> {
+            enricherCalls += 1;
+            expect(deal.id).toBe("D-legacy-sink-live");
+            return {
+              employees: 1400,
+              industry: "logistics",
+              techSignals: ["manual_ops", "enterprise"],
+              regulated: false,
+              confidence: 0.96,
+            };
+          },
+        };
+        const repairingSink: OpportunitySink = {
+          name: "repairing-sink",
+          async upsert(deal: RoutedDeal) {
+            return [
+              {
+                system: "hubspot",
+                externalId: deal.id,
+                detail: "upserted after live enrichment",
+              },
+            ];
+          },
+        };
+        const { baseUrl, store } = await app(
+          {
+            pipelineOptions: {
+              dryRun: false,
+              sink: repairingSink,
+              retry: { maxAttempts: 1, baseDelayMs: 0, sleep: async () => {} },
+            },
+          },
+          replayAwareEnricher,
+        );
+        const headers = {
+          "content-type": "application/json",
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        };
+        const legacyDeal: Deal = {
+          id: "D-legacy-sink-live",
+          company: "Live Sink Logistics",
+          domain: "livesink.example",
+          contactName: "Liv Ops",
+          contactEmail: "liv@livesink.example",
+          dealUSD: 72000,
+          region: "NA",
+          sourceChannel: "website_chat",
+          statedNeed: "dispatch team needs fewer manual check calls",
+        };
+        const legacyQuarantine: Quarantine = {
+          dealId: legacyDeal.id,
+          stage: "routed",
+          code: "sink_exhausted",
+          reason: "CRM timed out",
+          at: new Date().toISOString(),
+        };
+        store.recordQuarantine(
+          legacyQuarantine,
+          0,
+          "scored",
+          "sink_exhausted: CRM timed out",
+          legacyDeal,
+        );
+
+        const replay = await fetch(`${baseUrl}/quarantine-replay`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            dealId: legacyDeal.id,
+            contactName: "Liv Ops",
+            contactEmail: "liv@livesink.example",
+            operator: "operator-console",
+            reason: "CRM timeout cleared",
+          }),
+        });
+        const replayBody = (await replay.json()) as {
+          status: string;
+          replaySource: string;
+          routeDerivation: string;
+          facts?: unknown;
+          deal: { route: { kind: string } };
+        };
+
+        expect(replay.status).toBe(200);
+        expect(replayBody.status).toBe("routed");
+        expect(replayBody.replaySource).toBe("enricher:fixture");
+        expect(replayBody.routeDerivation).toBe("rederived_from_enricher");
+        expect(replayBody.facts).toBeUndefined();
+        expect(replayBody.deal.route.kind).toBe("human_assisted");
+        expect(enricherCalls).toBe(1);
       },
     );
   });
@@ -4378,6 +4755,7 @@ describe("server dashboard", () => {
     expect(dashboard).toContain("Manual company evidence");
     expect(dashboard).toContain("/enrichment-observations");
     expect(dashboard).toContain("Replay Quarantine");
+    expect(dashboard).toContain("Retry downstream sync");
     expect(dashboard).toContain("/quarantine-replay");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
     expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
