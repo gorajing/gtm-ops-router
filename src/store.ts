@@ -33,6 +33,7 @@ import type { IntegrationConfigBundle } from "./integrations.js";
 import {
   AGENT_SUGGESTION_KINDS,
   AGENT_SUGGESTION_STATUSES,
+  LOCAL_AGENT_SUGGESTION_WRITE_STATUSES,
   AgentSuggestionKind,
   AgentSuggestionStatus,
   DEPLOYMENT_BLOCKERS,
@@ -48,6 +49,8 @@ import {
   type EnrichedSubjectFacts,
   type AgentSuggestionDecision,
   type AgentSuggestionRecord,
+  type AgentSuggestionRunStatus,
+  AgentSuggestionWriteStatusCounts,
   type CommercialTerminalDriftAlertClaim,
   type CommercialTerminalDriftAlertDeliveryResult,
   type CommercialTerminalDriftAlertRetryCandidate,
@@ -84,9 +87,7 @@ import {
   type PolicyRecommendationRunRecord,
   type PolicyRecommendationRunInput,
   type PolicyRecommendationRunResult,
-  PolicyRecommendationRunStatus as PolicyRecommendationRunStatusSchema,
-  PolicyRecommendationRunStatusCounts,
-  type PolicyRecommendationRunStatus,
+  AgentSuggestionRunStatus as AgentSuggestionRunStatusSchema,
   type ProviderObservationInput,
   type ProviderObservationRecord,
   type ProviderObservationWriteResult,
@@ -113,6 +114,8 @@ import {
   type RoutedDeal,
   type Stage,
   type WorkItemRecord,
+  type WorkItemSuggestionRunInput,
+  type WorkItemSuggestionRunResult,
   type WorkItemStatus as WorkItemStatusType,
 } from "./types.js";
 
@@ -166,6 +169,8 @@ const POLICY_CLOSED_WON_STALLED_SLA_HOURS = READINESS_PENDING_SLA_HOURS;
 const POLICY_RECOMMENDATION_VERSION = 1;
 const DEFAULT_POLICY_RECOMMENDATION_LIMIT = 10;
 const MAX_POLICY_RECOMMENDATION_LIMIT = 25;
+const DEFAULT_WORK_ITEM_SUGGESTION_LIMIT = 10;
+const MAX_WORK_ITEM_SUGGESTION_LIMIT = 25;
 const DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 25;
 const MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 100;
 const POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER = 4;
@@ -496,6 +501,105 @@ function policyRecommendationBody(item: PolicyEvaluationDeal): string {
 function policyRecommendationRationale(item: PolicyEvaluationDeal): string {
   return truncateField(
     `Policy signal ${item.signal} observed at ${item.signalObservedAt}: ${item.reason}`,
+    1000,
+  );
+}
+
+// One assigned work item gets one draft suggestion. Assignment churn should not
+// fork agent work. Reopening a closed role-queue item creates a fresh work item
+// row, so reopened work receives a fresh draft through the new id. The derived
+// id is stored on the row at creation/backfill time so future formula changes
+// do not rewrite existing open work.
+function workItemSuggestionSourceEventId(
+  item: Pick<WorkItemRecord, "id">,
+): string {
+  return stableUuidV4(
+    canonicalJson({
+      kind: "work_item_suggestion",
+      workItemId: item.id,
+    }),
+  );
+}
+
+function workItemSuggestionKind(item: WorkItemRecord): AgentSuggestionKind {
+  switch (item.queue) {
+    case "ae_attention":
+    case "deployment_readiness":
+      return "handoff_summary";
+    case "finance_review":
+    case "legal_review":
+    case "growth_attribution":
+      return "missing_field_question";
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function workItemSuggestionTitle(item: WorkItemRecord): string {
+  switch (item.queue) {
+    case "ae_attention":
+      return truncateField(`Draft AE next step: ${item.title}`, 160);
+    case "finance_review":
+      return truncateField(`Draft finance review request: ${item.title}`, 160);
+    case "legal_review":
+      return truncateField(`Draft legal review request: ${item.title}`, 160);
+    case "deployment_readiness":
+      return truncateField(`Draft deployment handoff: ${item.title}`, 160);
+    case "growth_attribution":
+      return truncateField(`Draft growth follow-up: ${item.title}`, 160);
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function formatWorkItemDueAt(dueAt: string): string | null {
+  const date = new Date(dueAt);
+  if (Number.isNaN(date.getTime()) || date.toISOString() !== dueAt) {
+    return null;
+  }
+  const iso = date.toISOString();
+  // Display-only copy rounded to minutes for operators; the canonical dueAt
+  // remains on the work item.
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+function workItemSuggestionBody(item: WorkItemRecord): string {
+  const formattedDue = item.dueAt ? formatWorkItemDueAt(item.dueAt) : null;
+  const due = formattedDue ? ` Due ${formattedDue}.` : "";
+  switch (item.queue) {
+    case "ae_attention":
+      return truncateField(
+        `Prepare a concise owner follow-up. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "finance_review":
+      return truncateField(
+        `Ask finance to review pricing approval before close. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "legal_review":
+      return truncateField(
+        `Ask legal to review regulated-deal risk and required contract/privacy steps. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "deployment_readiness":
+      return truncateField(
+        `Summarize the deployment readiness gap and the next deployment-ops action. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "growth_attribution":
+      return truncateField(
+        `Summarize the growth attribution follow-up for this routed deal. Context: ${item.description}.${due}`,
+        4000,
+      );
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function workItemSuggestionRationale(item: WorkItemRecord): string {
+  return truncateField(
+    `Assigned work item ${item.id} (${item.queue}) is still open; draft evidence uses the work-item opening snapshot and no workflow action is executed automatically.`,
     1000,
   );
 }
@@ -959,6 +1063,7 @@ const SCHEMA: string[] = [
      title TEXT NOT NULL,
      description TEXT NOT NULL,
      due_at TEXT,
+     agent_suggestion_source_event_id TEXT,
      created_by TEXT NOT NULL,
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL,
@@ -1218,6 +1323,17 @@ function assertCanonicalIsoUtc(value: string, field: string): void {
   }
 }
 
+function nonEmptyLabel(value: string, field: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    throw new Error(`${field} must be non-empty`);
+  }
+  if (trimmed !== value) {
+    throw new Error(`${field} must not have surrounding whitespace`);
+  }
+  return value;
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
@@ -1255,12 +1371,12 @@ function pipelineStage(value: string): Stage | null {
     : null;
 }
 
-function policyRecommendationRunStatus(counts: {
+function agentSuggestionRunStatus(counts: {
   recorded: number;
   duplicate: number;
   idempotencyConflict: number;
   skipped: number;
-}): PolicyRecommendationRunStatus {
+}): AgentSuggestionRunStatus {
   // Idempotency conflicts are correctness incidents, so they dominate even
   // when the same run also recorded useful suggestions; callers still receive
   // the full count breakdown for operator triage.
@@ -1271,6 +1387,12 @@ function policyRecommendationRunStatus(counts: {
   return "no_signals";
 }
 
+function emptyAgentSuggestionWriteStatusCounts(): AgentSuggestionWriteStatusCounts {
+  return Object.fromEntries(
+    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [status, 0]),
+  ) as AgentSuggestionWriteStatusCounts;
+}
+
 function policyRecommendationLimit(value: number | undefined): number {
   const raw = value ?? DEFAULT_POLICY_RECOMMENDATION_LIMIT;
   if (!Number.isFinite(raw)) {
@@ -1279,6 +1401,17 @@ function policyRecommendationLimit(value: number | undefined): number {
   return Math.max(
     1,
     Math.min(Math.trunc(raw), MAX_POLICY_RECOMMENDATION_LIMIT),
+  );
+}
+
+function workItemSuggestionLimit(value: number | undefined): number {
+  const raw = value ?? DEFAULT_WORK_ITEM_SUGGESTION_LIMIT;
+  if (!Number.isFinite(raw)) {
+    throw new Error("work item suggestion limit must be finite");
+  }
+  return Math.max(
+    1,
+    Math.min(Math.trunc(raw), MAX_WORK_ITEM_SUGGESTION_LIMIT),
   );
 }
 
@@ -1515,6 +1648,9 @@ export class Store {
     );
     this.ensureColumn("external_event_keys", "payload_hash", "TEXT");
     this.ensureExternalEventKeyGuards();
+    this.ensureColumn("work_items", "agent_suggestion_source_event_id", "TEXT");
+    this.backfillWorkItemSuggestionSourceEventIds();
+    this.ensureWorkItemSuggestionSourceIndex();
     this.ensureIdempotencyViolationScopes();
     this.ensurePolicyRecommendationRunStatuses();
     this.backfillExternalNotificationLeases();
@@ -1523,7 +1659,7 @@ export class Store {
   }
 
   private ensureColumn(
-    table: "deals" | "events" | "external_event_keys",
+    table: "deals" | "events" | "external_event_keys" | "work_items",
     name: string,
     type: string,
   ): void {
@@ -1538,6 +1674,63 @@ export class Store {
         if (!msg.includes("duplicate column name")) throw err;
       }
     }
+  }
+
+  private backfillWorkItemSuggestionSourceEventIds(): void {
+    this.transactionImmediate(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id
+           FROM work_items
+           WHERE agent_suggestion_source_event_id IS NULL`,
+        )
+        .all() as Array<{ id: string }>;
+      if (rows.length === 0) return;
+
+      const update = this.db.prepare(
+        `UPDATE work_items
+         SET agent_suggestion_source_event_id = ?
+         WHERE id = ?`,
+      );
+      for (const row of rows) {
+        update.run(
+          workItemSuggestionSourceEventId({ id: String(row.id) }),
+          row.id,
+        );
+      }
+    });
+  }
+
+  private ensureWorkItemSuggestionSourceIndex(): void {
+    // Clean up pre-release index names/shapes from earlier local builds; after
+    // the first open these drops are no-ops.
+    this.db.prepare("DROP INDEX IF EXISTS idx_work_items_suggestion_source").run();
+    this.db
+      .prepare("DROP INDEX IF EXISTS idx_work_items_assigned_suggestion_source")
+      .run();
+    this.db
+      .prepare(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_agent_suggestion_source_unique
+         ON work_items(agent_suggestion_source_event_id)
+         WHERE agent_suggestion_source_event_id IS NOT NULL`,
+      )
+      .run();
+    this.db
+      .prepare(
+        `CREATE INDEX IF NOT EXISTS idx_work_items_assigned_suggestion_fifo
+         ON work_items(
+           CASE priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           created_at,
+           id
+         )
+         WHERE status = 'assigned'`,
+      )
+      .run();
   }
 
   private ensureExternalEventKeyGuards(): void {
@@ -4742,6 +4935,82 @@ export class Store {
     return rows.map((row) => this.workItemFromRow(row));
   }
 
+  recordWorkItemSuggestions(
+    input: WorkItemSuggestionRunInput,
+  ): WorkItemSuggestionRunResult {
+    assertCanonicalIsoUtc(input.evaluatedAt, "work item suggestion evaluatedAt");
+    const createdBy = nonEmptyLabel(
+      input.createdBy,
+      "work item suggestion createdBy",
+    );
+    const limit = workItemSuggestionLimit(input.limit);
+
+    return this.transactionImmediate(() => {
+      const candidates = this.assignedWorkItemsForSuggestions(limit);
+      const results: WorkItemSuggestionRunResult["results"] = candidates.map(
+        (candidate) => {
+          const suggestionInput: LocalAgentSuggestionInput = {
+            dealId: candidate.dealId,
+            sourceEventId: candidate.agentSuggestionSourceEventId,
+            kind: workItemSuggestionKind(candidate),
+            title: workItemSuggestionTitle(candidate),
+            body: workItemSuggestionBody(candidate),
+            rationale: workItemSuggestionRationale(candidate),
+            createdBy,
+            // occurredAt is the source work-item signal time, not the run time.
+            // Keeping it stable prevents replayed runs from turning the same
+            // source event into an idempotency conflict.
+            occurredAt: candidate.createdAt,
+          };
+          const result =
+            this.recordLocalAgentSuggestionInTransaction(suggestionInput);
+          return {
+            workItemId: candidate.id,
+            dealId: candidate.dealId,
+            queue: candidate.queue,
+            sourceEventId: suggestionInput.sourceEventId,
+            status: result.status,
+            suggestionId: result.suggestion?.id ?? null,
+            title: suggestionInput.title,
+          };
+        },
+      );
+
+      const statusCounts = emptyAgentSuggestionWriteStatusCounts();
+      for (const result of results) {
+        statusCounts[result.status] += 1;
+      }
+      const recorded = statusCounts.recorded;
+      const duplicate = statusCounts.duplicate;
+      const idempotencyConflict = statusCounts.idempotency_conflict;
+      const skipped = statusCounts.not_found + statusCounts.not_routed;
+      if (skipped > 0) {
+        throw new Error(
+          "work item suggestion candidates must reference routed deals",
+        );
+      }
+
+      return {
+        status: agentSuggestionRunStatus({
+          recorded,
+          duplicate,
+          idempotencyConflict,
+          skipped,
+        }),
+        createdBy,
+        limit,
+        evaluatedAt: input.evaluatedAt,
+        attempted: results.length,
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+        statusCounts,
+        results,
+      };
+    });
+  }
+
   recordLocalWorkItem(
     input: LocalWorkItemInput,
     signal: RoleQueueItem,
@@ -4799,6 +5068,9 @@ export class Store {
 
       const now = new Date().toISOString();
       const workItemId = `WI-${sha256Hex(`${sourceKey}:${input.sourceEventId}`).slice(0, 20)}`;
+      const agentSuggestionSourceEventId = workItemSuggestionSourceEventId({
+        id: workItemId,
+      });
       const arrDescription = Number.isFinite(signal.amount)
         ? `$${Math.round(signal.amount).toLocaleString("en-US")}`
         : "unknown";
@@ -4815,10 +5087,10 @@ export class Store {
         .prepare(
           `INSERT INTO work_items (
              id, source_kind, source_key, deal_id, queue, status, priority,
-             owner, title, description, due_at, created_by, created_at,
-             updated_at
+             owner, title, description, due_at, agent_suggestion_source_event_id,
+             created_by, created_at, updated_at
            )
-           VALUES (?, 'role_queue', ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, 'role_queue', ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           workItemId,
@@ -4830,6 +5102,7 @@ export class Store {
           title,
           description,
           input.dueAt ?? null,
+          agentSuggestionSourceEventId,
           input.createdBy,
           input.occurredAt,
           input.occurredAt,
@@ -5152,19 +5425,59 @@ export class Store {
     return row ? this.workItemFromRow(row) : null;
   }
 
+  private assignedWorkItemsForSuggestions(limit: number): WorkItemRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT work_items.*
+         FROM work_items
+         JOIN deals
+           ON deals.id = work_items.deal_id
+          -- deals.stage is the pipeline storage state. Commercial closed-won
+          -- and post-sale outcomes live in their own tables, so those items
+          -- remain draftable while the routed deal row stays in this stage.
+          AND deals.stage = 'routed'
+         WHERE work_items.status = 'assigned'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM agent_suggestions
+             WHERE agent_suggestions.source = ?
+               AND agent_suggestions.source_event_id =
+                 work_items.agent_suggestion_source_event_id
+           )
+         ORDER BY
+           CASE work_items.priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           work_items.created_at ASC,
+           work_items.id
+         LIMIT ?`,
+      )
+      .all(LOCAL_AGENT_SUGGESTION_SOURCE, limit) as Record<string, unknown>[];
+    return rows.map((row) => this.workItemFromRow(row));
+  }
+
   private workItemFromRow(row: Record<string, unknown>): WorkItemRecord {
+    const id = String(row.id);
+    const queue = this.parseRoleQueueKind(row.queue);
+    if (typeof row.agent_suggestion_source_event_id !== "string") {
+      throw new Error(`work item ${id} is missing agent suggestion source id`);
+    }
     return {
-      id: String(row.id),
+      id,
       sourceKind: "role_queue",
       sourceKey: String(row.source_key),
       dealId: String(row.deal_id),
-      queue: this.parseRoleQueueKind(row.queue),
+      queue,
       status: WorkItemStatus.parse(row.status),
       priority: this.parseRoleQueuePriority(row.priority),
       owner: String(row.owner),
       title: String(row.title),
       description: String(row.description),
       dueAt: typeof row.due_at === "string" ? String(row.due_at) : null,
+      agentSuggestionSourceEventId: String(row.agent_suggestion_source_event_id),
       createdBy: String(row.created_by),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
@@ -7241,6 +7554,10 @@ export class Store {
     input: PolicyRecommendationRunInput,
   ): PolicyRecommendationRunResult {
     assertCanonicalIsoUtc(input.evaluatedAt, "policy recommendation evaluatedAt");
+    const createdBy = nonEmptyLabel(
+      input.createdBy,
+      "policy recommendation createdBy",
+    );
     const limit = policyRecommendationLimit(input.limit);
     const prefetchLimit = Math.min(
       250,
@@ -7264,7 +7581,7 @@ export class Store {
           title: policyRecommendationTitle(candidate),
           body: policyRecommendationBody(candidate),
           rationale: policyRecommendationRationale(candidate),
-          createdBy: input.createdBy,
+          createdBy,
           occurredAt: candidate.signalObservedAt,
         };
         const result =
@@ -7279,13 +7596,7 @@ export class Store {
         };
       });
 
-      const statusCounts: Record<LocalAgentSuggestionWriteResult["status"], number> = {
-        recorded: 0,
-        duplicate: 0,
-        idempotency_conflict: 0,
-        not_found: 0,
-        not_routed: 0,
-      };
+      const statusCounts = emptyAgentSuggestionWriteStatusCounts();
       for (const result of results) {
         statusCounts[result.status] += 1;
       }
@@ -7293,7 +7604,7 @@ export class Store {
       const duplicate = statusCounts.duplicate;
       const idempotencyConflict = statusCounts.idempotency_conflict;
       const skipped = statusCounts.not_found + statusCounts.not_routed;
-      const status = policyRecommendationRunStatus({
+      const status = agentSuggestionRunStatus({
         recorded,
         duplicate,
         idempotencyConflict,
@@ -7304,7 +7615,7 @@ export class Store {
       const run: PolicyRecommendationRunResult = {
         id: runId,
         status,
-        createdBy: input.createdBy,
+        createdBy,
         limit,
         evaluatedAt: input.evaluatedAt,
         createdAt,
@@ -7353,7 +7664,7 @@ export class Store {
   ): PolicyRecommendationRunRecord {
     return {
       id: String(row.id),
-      status: PolicyRecommendationRunStatusSchema.parse(row.status),
+      status: AgentSuggestionRunStatusSchema.parse(row.status),
       createdBy: String(row.created_by),
       evaluatedAt: String(row.evaluated_at),
       limit: Number(row.limit_count),
@@ -7363,7 +7674,7 @@ export class Store {
       duplicate: Number(row.duplicate),
       idempotencyConflict: Number(row.idempotency_conflict),
       skipped: Number(row.skipped),
-      statusCounts: PolicyRecommendationRunStatusCounts.parse(
+      statusCounts: AgentSuggestionWriteStatusCounts.parse(
         JSON.parse(String(row.status_counts_json)),
       ),
       results: PolicyRecommendationDraftResultSchema.array().parse(

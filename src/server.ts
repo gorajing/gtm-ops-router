@@ -14,6 +14,7 @@
  *   POST /agent-suggestions   local-only agent draft ledger
  *   POST /agent-suggestions/:id/decision
  *   POST /agent-suggestion-runs/policy-evaluation
+ *   POST /agent-suggestion-runs/work-items
  *   POST /work-items          local-only role-queue work item ledger
  *   POST /work-items/:id/action
  *
@@ -330,6 +331,8 @@ const LocalPolicyRecommendationRunBody = z.object({
   limit: z.number().int().min(1).max(25).optional(),
 });
 
+const LocalWorkItemSuggestionRunBody = LocalPolicyRecommendationRunBody;
+
 const NotificationRetryBody = z.object({
   dealId: z.string().min(1).optional(),
   fingerprint: z.string().min(1).optional(),
@@ -599,6 +602,7 @@ function consoleHtml(sinkLabel: string): string {
     <label>Local Secret<input id="local-secret" type="password" autocomplete="off" placeholder="LOCAL_ENDPOINT_SECRET"></label>
     <div class="actions">
      <button type="button" class="secondary" id="draft-policy-btn">Draft Policy Recommendations</button>
+     <button type="button" class="secondary" id="draft-work-item-btn">Draft Work Item Actions</button>
     </div>
     <div class="action-status" id="agent-action-status"></div>
    </div>
@@ -644,6 +648,7 @@ const LOCAL_SECRET_STORAGE_KEY = "gtm_ops_router_local_secret";
 const AGENT_SUGGESTION_DRAFT_LIMIT = 10;
 const DEAL_DETAIL_SUGGESTION_LIMIT = 5;
 const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
+const WORK_ITEM_SUGGESTION_RUNNER = "console-work-item-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
 const MANUAL_ENRICHMENT_MAX_EMPLOYEES = ${MAX_MANUAL_ENRICHMENT_EMPLOYEES};
 const MANUAL_ENRICHMENT_RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1826,6 +1831,34 @@ async function draftPolicyRecommendations(){
     button.disabled = false;
   }
 }
+async function draftWorkItemSuggestions(){
+  const button = qs("#draft-work-item-btn");
+  if (!button) {
+    setAgentActionStatus("Work item draft button is not available.", "fail");
+    return;
+  }
+  button.disabled = true;
+  setAgentActionStatus("Drafting work item actions...", "muted");
+  try {
+    const result = await fetchJson("/agent-suggestion-runs/work-items", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        createdBy: WORK_ITEM_SUGGESTION_RUNNER,
+        limit: AGENT_SUGGESTION_DRAFT_LIMIT
+      })
+    });
+    setAgentActionStatus(
+      "Work item run: " + result.recorded + " recorded, " + result.duplicate + " duplicate, " + result.skipped + " skipped.",
+      result.recorded > 0 ? "pass" : "muted"
+    );
+    await loadState();
+  } catch (err) {
+    setAgentActionStatus(String(err), "fail");
+  } finally {
+    button.disabled = false;
+  }
+}
 function defaultDecisionReason(decision){
   return decision === "accepted"
     ? "Accepted from operator console."
@@ -2246,6 +2279,7 @@ if (savedLocalSecret) qs("#local-secret").value = savedLocalSecret;
 qs("#preview-btn").addEventListener("click", preview);
 qs("#refresh-btn").addEventListener("click", () => { loadState(); loadHealth(); });
 qs("#draft-policy-btn").addEventListener("click", () => { void draftPolicyRecommendations(); });
+qs("#draft-work-item-btn").addEventListener("click", () => { void draftWorkItemSuggestions(); });
 qs("#deal-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const root = qs("#preview");
@@ -4273,6 +4307,70 @@ async function handleLocalPolicyRecommendationRun(
   json(res, 200, result);
 }
 
+async function handleLocalWorkItemSuggestionRun(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  localWrites: LocalWriteEndpointOptions,
+  invalidateStateCache: () => void,
+): Promise<void> {
+  if (
+    !guardLocalWriteRequest(
+      req,
+      res,
+      localWrites,
+      "/agent-suggestion-runs/work-items",
+    )
+  ) {
+    return;
+  }
+  if (!acceptsJsonBody(req)) {
+    rejectNonJson(res);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonBody(await readBody(req));
+  } catch (err) {
+    sendBodyError(res, err);
+    return;
+  }
+
+  const body = LocalWorkItemSuggestionRunBody.safeParse(parsed);
+  if (!body.success) {
+    json(res, 400, {
+      error: "invalid work item suggestion run request",
+      issues: body.error.issues,
+    });
+    return;
+  }
+
+  const evaluatedAt = resolveCanonicalTimestamp(body.data.evaluatedAt);
+  if (!evaluatedAt) {
+    json(res, 400, {
+      error: "evaluatedAt must be a canonical UTC ISO timestamp",
+    });
+    return;
+  }
+  if (evaluatedAt.date.getTime() - Date.now() > MAX_FUTURE_SKEW_MS) {
+    json(res, 422, {
+      error: `evaluatedAt is more than ${MAX_FUTURE_SKEW_MS}ms in the future`,
+    });
+    return;
+  }
+
+  // Local-only generator: suggestions are drafts attached to current assigned
+  // work items. Humans still accept/reject drafts and resolve/waive work items.
+  const result = store.recordWorkItemSuggestions({
+    createdBy: body.data.createdBy,
+    evaluatedAt: evaluatedAt.value,
+    ...(body.data.limit === undefined ? {} : { limit: body.data.limit }),
+  });
+  if (result.recorded > 0) invalidateStateCache();
+  json(res, 200, result);
+}
+
 async function handleNotificationRetry(
   req: IncomingMessage,
   res: ServerResponse,
@@ -4613,6 +4711,16 @@ async function handleRequest(
   }
   if (method === "POST" && url === "/agent-suggestion-runs/policy-evaluation") {
     await handleLocalPolicyRecommendationRun(
+      req,
+      res,
+      store,
+      localWrites,
+      invalidateStateCache,
+    );
+    return;
+  }
+  if (method === "POST" && url === "/agent-suggestion-runs/work-items") {
+    await handleLocalWorkItemSuggestionRun(
       req,
       res,
       store,

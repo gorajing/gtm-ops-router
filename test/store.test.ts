@@ -10,11 +10,14 @@ import {
 import { integrationConfigBundleFromEnv } from "../src/integrations.js";
 import { Store } from "../src/store.js";
 import type {
+  AgentSuggestionKind,
   ExternalStageState,
   LocalAgentSuggestionDecisionInput,
   LocalAgentSuggestionInput,
   LocalOutcomeInput,
   PipelineEventMeta,
+  RoleQueueItem,
+  RoleQueueKind,
   ProviderObservationInput,
   RoutedDeal,
 } from "../src/types.js";
@@ -3485,6 +3488,516 @@ describe("Store readiness derivation", () => {
           resolutionReason: "Queue signal reviewed and waived.",
         }),
       );
+    });
+  });
+
+  it("drafts agent suggestions from assigned work items", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-suggestion";
+      deal.company = "Suggestion Work Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "63636363-6363-4363-9363-636363636363",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(opened.workItem).toBeDefined();
+
+      const first = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:05:00.000Z",
+        limit: 5,
+      });
+      const reassigned = store.recordLocalWorkItemAction({
+        workItemId: opened.workItem!.id,
+        sourceEventId: "65656565-6565-4565-9565-656565656565",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T17:07:00.000Z",
+        owner: "ae.taylor",
+        reason: "Taylor owns follow-up.",
+      });
+      const replay = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:10:00.000Z",
+        limit: 5,
+      });
+      const resolved = store.recordLocalWorkItemAction({
+        workItemId: opened.workItem!.id,
+        sourceEventId: "64646464-6464-4464-9464-646464646464",
+        action: "resolve",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T17:15:00.000Z",
+        reason: "Suggestion reviewed.",
+      });
+      const afterResolve = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:20:00.000Z",
+        limit: 5,
+      });
+      const reopened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "66666666-6666-4666-9666-666666666666",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:25:00.000Z",
+          reason: "Deal returned to the queue.",
+        },
+        signal,
+      );
+      const afterReopen = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:30:00.000Z",
+        limit: 5,
+      });
+
+      expect(first).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          duplicate: 0,
+          skipped: 0,
+          results: [
+            expect.objectContaining({
+              workItemId: opened.workItem!.id,
+              dealId: deal.id,
+              queue: "ae_attention",
+              status: "recorded",
+              title: expect.stringContaining("Draft AE next step"),
+            }),
+          ],
+        }),
+      );
+      expect(first.results[0]?.sourceEventId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(reassigned.status).toBe("recorded");
+      expect(replay).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+        }),
+      );
+      expect(resolved.status).toBe("recorded");
+      expect(afterResolve).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+        }),
+      );
+      expect(reopened.status).toBe("recorded");
+      expect(reopened.workItem?.id).not.toBe(opened.workItem!.id);
+      expect(afterReopen).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          duplicate: 0,
+          results: [
+            expect.objectContaining({
+              workItemId: reopened.workItem!.id,
+              status: "recorded",
+            }),
+          ],
+        }),
+      );
+      expect(store.agentSuggestions()).toEqual([
+        expect.objectContaining({
+          dealId: deal.id,
+          kind: "handoff_summary",
+          status: "proposed",
+          title: expect.stringContaining("Draft AE next step"),
+        }),
+        expect.objectContaining({
+          dealId: deal.id,
+          kind: "handoff_summary",
+          status: "proposed",
+          title: expect.stringContaining("Draft AE next step"),
+        }),
+      ]);
+    });
+  });
+
+  it("rejects non-canonical work item due dates before drafting", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-bad-due";
+      deal.company = "Bad Due Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+
+      expect(() =>
+        store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: "68686868-6868-4868-9868-686868686868",
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-24T17:35:00.000Z",
+            dueAt: "2026-05-24T17:40:00Z",
+            reason: "Open from queue.",
+          },
+          signal,
+        ),
+      ).toThrow(/work item dueAt must be canonical UTC ISO timestamp/);
+
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "69696969-6969-4969-9969-696969696969",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:36:00.000Z",
+          dueAt: "2026-05-24T17:40:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare("UPDATE work_items SET due_at = ? WHERE id = ?").run(
+        "2026-05-24T17:40:00Z",
+        opened.workItem!.id,
+      );
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:45:00.000Z",
+        limit: 5,
+      });
+
+      expect(run.status).toBe("recorded");
+      expect(store.agentSuggestions()[0]?.body).not.toContain("Due ");
+    });
+  });
+
+  it("uses the stored work-item suggestion source id instead of recomputing it", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-stored-source";
+      deal.company = "Stored Source Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "67676767-6767-4767-9767-676767676767",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:40:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      const legacyStoredSourceId = "77777777-7777-4777-9777-777777777777";
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare(
+        `UPDATE work_items
+         SET agent_suggestion_source_event_id = ?
+         WHERE id = ?`,
+      ).run(legacyStoredSourceId, opened.workItem!.id);
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:45:00.000Z",
+        limit: 5,
+      });
+      const replay = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:50:00.000Z",
+        limit: 5,
+      });
+
+      expect(run.results[0]).toEqual(
+        expect.objectContaining({
+          sourceEventId: legacyStoredSourceId,
+          status: "recorded",
+        }),
+      );
+      expect(store.agentSuggestions()[0]?.sourceEventId).toBe(
+        legacyStoredSourceId,
+      );
+      expect(replay).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+        }),
+      );
+    });
+  });
+
+  it("drafts queue-specific suggestion kinds from assigned work items", () => {
+    withTempStore((store) => {
+      const cases: Array<{
+        queue: RoleQueueKind;
+        expectedKind: AgentSuggestionKind;
+        expectedTitle: string;
+      }> = [
+        {
+          queue: "ae_attention",
+          expectedKind: "handoff_summary",
+          expectedTitle: "Draft AE next step",
+        },
+        {
+          queue: "finance_review",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft finance review request",
+        },
+        {
+          queue: "legal_review",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft legal review request",
+        },
+        {
+          queue: "deployment_readiness",
+          expectedKind: "handoff_summary",
+          expectedTitle: "Draft deployment handoff",
+        },
+        {
+          queue: "growth_attribution",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft growth follow-up",
+        },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-kind-${index}`;
+        deal.company = `Queue Kind ${index}`;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: testCase.queue,
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: index === cases.length - 1 ? "low" : "medium",
+          reason: `${testCase.queue} needs operator follow-up.`,
+          status: "closed_won",
+          updatedAt: `2026-05-24T18:0${index}:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: testCase.queue,
+            sourceEventId: `90000000-0000-4000-8000-00000000000${index}`,
+            owner: "ops.owner",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.status).toBe("recorded");
+      }
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T18:10:00.000Z",
+        limit: 5,
+      });
+      const suggestionsById = new Map(
+        store.agentSuggestions().map((suggestion) => [suggestion.id, suggestion]),
+      );
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 5,
+          recorded: 5,
+          duplicate: 0,
+        }),
+      );
+      for (const testCase of cases) {
+        const result = run.results.find(
+          (candidate) => candidate.queue === testCase.queue,
+        );
+        expect(result).toEqual(
+          expect.objectContaining({
+            queue: testCase.queue,
+            status: "recorded",
+            title: expect.stringContaining(testCase.expectedTitle),
+          }),
+        );
+        expect(suggestionsById.get(result!.suggestionId!)?.kind).toBe(
+          testCase.expectedKind,
+        );
+      }
+    });
+  });
+
+  it("drafts by assignment age and skips previously drafted work items", () => {
+    withTempStore((store) => {
+      const openedIds: string[] = [];
+      for (const [index, company] of ["Oldest Freight", "Newest Freight"].entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-age-${index}`;
+        deal.company = company;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: "ae_attention",
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: "medium",
+          reason: "AE follow-up needed.",
+          status: "closed_won",
+          updatedAt: `2026-05-24T19:${index}0:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: `91000000-0000-4000-8000-00000000000${index}`,
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.workItem).toBeDefined();
+        openedIds.push(opened.workItem!.id);
+      }
+      const churnedOwner = store.recordLocalWorkItemAction({
+        workItemId: openedIds[0]!,
+        sourceEventId: "92000000-0000-4000-8000-000000000000",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T19:25:00.000Z",
+        owner: "ae.taylor",
+        reason: "Oldest item changed owner but should keep FIFO draft order.",
+      });
+      expect(churnedOwner.status).toBe("recorded");
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T19:30:00.000Z",
+        limit: 1,
+      });
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          attempted: 1,
+          recorded: 1,
+        }),
+      );
+      expect(run.results[0]?.workItemId).toBe(openedIds[0]);
+
+      const nextRun = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T19:35:00.000Z",
+        limit: 1,
+      });
+
+      expect(nextRun).toEqual(
+        expect.objectContaining({
+          attempted: 1,
+          duplicate: 0,
+          recorded: 1,
+        }),
+      );
+      expect(nextRun.results[0]?.workItemId).toBe(openedIds[1]);
+      expect(nextRun.results[0]?.status).toBe("recorded");
+    });
+  });
+
+  it("does not let unrouted work items consume draft-run slots", () => {
+    withTempStore((store) => {
+      const openedIds: string[] = [];
+      for (const [index, company] of ["Stale Freight", "Fresh Freight"].entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-routed-filter-${index}`;
+        deal.company = company;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: "ae_attention",
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: "medium",
+          reason: "AE follow-up needed.",
+          status: "closed_won",
+          updatedAt: `2026-05-24T20:${index}0:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: `93000000-0000-4000-8000-00000000000${index}`,
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.workItem).toBeDefined();
+        openedIds.push(opened.workItem!.id);
+      }
+
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare("UPDATE deals SET stage = 'quarantined' WHERE id = ?").run(
+        "D-work-item-routed-filter-0",
+      );
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T20:30:00.000Z",
+        limit: 1,
+      });
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          skipped: 0,
+        }),
+      );
+      expect(run.results[0]?.workItemId).toBe(openedIds[1]);
     });
   });
 

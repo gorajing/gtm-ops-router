@@ -402,6 +402,14 @@ describe("local commercial-state endpoint", () => {
           body: JSON.stringify({}),
         },
       );
+      const workItemSuggestionRun = await fetch(
+        `${baseUrl}/agent-suggestion-runs/work-items`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
       const workItem = await fetch(`${baseUrl}/work-items`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -421,6 +429,9 @@ describe("local commercial-state endpoint", () => {
       const suggestionDecisionBody = (await suggestionDecision.json()) as {
         error: string;
       };
+      const workItemSuggestionRunBody = (await workItemSuggestionRun.json()) as {
+        error: string;
+      };
       const workItemBody = (await workItem.json()) as { error: string };
       const workItemActionBody = (await workItemAction.json()) as { error: string };
 
@@ -431,6 +442,7 @@ describe("local commercial-state endpoint", () => {
       expect(replay.status).toBe(404);
       expect(suggestion.status).toBe(404);
       expect(suggestionDecision.status).toBe(404);
+      expect(workItemSuggestionRun.status).toBe(404);
       expect(workItem.status).toBe(404);
       expect(workItemAction.status).toBe(404);
       expect(commercialBody.error).toBe("not found");
@@ -440,6 +452,7 @@ describe("local commercial-state endpoint", () => {
       expect(replayBody.error).toBe("not found");
       expect(suggestionBody.error).toBe("not found");
       expect(suggestionDecisionBody.error).toBe("not found");
+      expect(workItemSuggestionRunBody.error).toBe("not found");
       expect(workItemBody.error).toBe("not found");
       expect(workItemActionBody.error).toBe("not found");
     });
@@ -571,6 +584,14 @@ describe("local commercial-state endpoint", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
+        const workItemSuggestionRun = await fetch(
+          `${baseUrl}/agent-suggestion-runs/work-items`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          },
+        );
         const workItem = await fetch(`${baseUrl}/work-items`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -594,6 +615,7 @@ describe("local commercial-state endpoint", () => {
         expect(enrichment.status).toBe(401);
         expect(replay.status).toBe(401);
         expect(suggestion.status).toBe(401);
+        expect(workItemSuggestionRun.status).toBe(401);
         expect(workItem.status).toBe(401);
         expect(workItemAction.status).toBe(401);
         expect(recommendationRun.status).toBe(401);
@@ -661,6 +683,17 @@ describe("local commercial-state endpoint", () => {
             reason: "bad timestamp",
           }),
         });
+        const workItemSuggestionRun = await fetch(
+          `${baseUrl}/agent-suggestion-runs/work-items`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "work-item-agent",
+              evaluatedAt: "2026-05-21T12:00:00",
+            }),
+          },
+        );
 
         await postClosedWon(baseUrl, dealId);
         const outcome = await fetch(`${baseUrl}/outcomes`, {
@@ -722,6 +755,7 @@ describe("local commercial-state endpoint", () => {
         expect(suggestion.status).toBe(400);
         expect(workItem.status).toBe(400);
         expect(workItemAction.status).toBe(400);
+        expect(workItemSuggestionRun.status).toBe(400);
         expect(recommendationRun.status).toBe(400);
         expect(store.deploymentFacts(dealId)).toBeNull();
         expect(store.outcomeEvents(dealId)).toHaveLength(0);
@@ -854,6 +888,82 @@ describe("local commercial-state endpoint", () => {
           }),
         );
 
+        const draft = await fetch(
+          `${baseUrl}/agent-suggestion-runs/work-items`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "work-item-agent",
+              evaluatedAt: "2026-05-24T15:06:00.000Z",
+              limit: 5,
+            }),
+          },
+        );
+        const draftBody = (await draft.json()) as {
+          status: string;
+          attempted: number;
+          recorded: number;
+          duplicate: number;
+          results: Array<{
+            workItemId: string;
+            dealId: string;
+            queue: string;
+            status: string;
+            sourceEventId: string;
+            suggestionId: string | null;
+            title: string;
+          }>;
+        };
+        const draftReplay = await fetch(
+          `${baseUrl}/agent-suggestion-runs/work-items`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              createdBy: "work-item-agent",
+              evaluatedAt: "2026-05-24T15:07:00.000Z",
+              limit: 5,
+            }),
+          },
+        );
+        const draftReplayBody = (await draftReplay.json()) as {
+          status: string;
+          attempted: number;
+          recorded: number;
+          duplicate: number;
+        };
+        expect(draft.status).toBe(200);
+        expect(draftBody).toEqual(
+          expect.objectContaining({
+            status: "recorded",
+            attempted: 1,
+            recorded: 1,
+            duplicate: 0,
+          }),
+        );
+        expect(draftBody.results[0]).toEqual(
+          expect.objectContaining({
+            workItemId,
+            dealId,
+            queue: "ae_attention",
+            status: "recorded",
+            title: expect.stringContaining("Draft AE next step"),
+            sourceEventId: expect.stringMatching(
+              /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+            ),
+          }),
+        );
+        expect(draftReplay.status).toBe(200);
+        expect(draftReplayBody).toEqual(
+          expect.objectContaining({
+            status: "no_signals",
+            attempted: 0,
+            recorded: 0,
+            duplicate: 0,
+          }),
+        );
+
         const missingAction = await fetch(
           `${baseUrl}/work-items/WI-missing/action`,
           {
@@ -907,11 +1017,25 @@ describe("local commercial-state endpoint", () => {
           r.json(),
         )) as {
           workItems: Array<{ dealId: string; status: string }>;
+          agentSuggestions: Array<{
+            dealId: string;
+            status: string;
+            kind: string;
+            title: string;
+          }>;
         };
         expect(state.workItems).toEqual([
           expect.objectContaining({
             dealId,
             status: "resolved",
+          }),
+        ]);
+        expect(state.agentSuggestions).toEqual([
+          expect.objectContaining({
+            dealId,
+            status: "proposed",
+            kind: "handoff_summary",
+            title: expect.stringContaining("Draft AE next step"),
           }),
         ]);
         expect(store.workItems()[0]?.status).toBe("resolved");
@@ -3138,6 +3262,7 @@ describe("server dashboard", () => {
       "deployment-handoff": "div",
       detail: "div",
       "draft-policy-btn": "button",
+      "draft-work-item-btn": "button",
       exceptions: "div",
       health: "div",
       kpis: "div",
@@ -4987,12 +5112,14 @@ describe("server dashboard", () => {
     expect(dashboard).toContain("Recent Policy Runs");
     expect(dashboard).toContain("policy-runs");
     expect(dashboard).toContain("Draft Policy Recommendations");
+    expect(dashboard).toContain("Draft Work Item Actions");
     expect(dashboard).toContain("Manual company evidence");
     expect(dashboard).toContain("/enrichment-observations");
     expect(dashboard).toContain("Replay Quarantine");
     expect(dashboard).toContain("Retry downstream sync");
     expect(dashboard).toContain("/quarantine-replay");
     expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
+    expect(dashboard).toContain("agent-suggestion-runs/work-items");
     expect(dashboard).toContain('encodeURIComponent(suggestion.id) + "/decision"');
     expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");
     expect(dashboard).toContain("sessionStorage");

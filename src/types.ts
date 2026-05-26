@@ -473,6 +473,21 @@ export interface LocalAgentSuggestionWriteResult {
   suggestion: AgentSuggestionRecord | null;
 }
 
+export const AgentSuggestionWriteStatusCounts = z.object(
+  Object.fromEntries(
+    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [
+      status,
+      z.number().int().nonnegative().optional().default(0),
+    ]),
+  ) as Record<
+    LocalAgentSuggestionWriteStatus,
+    z.ZodDefault<z.ZodOptional<z.ZodNumber>>
+  >,
+);
+export type AgentSuggestionWriteStatusCounts = z.infer<
+  typeof AgentSuggestionWriteStatusCounts
+>;
+
 export type LocalAgentSuggestionDecisionStatus =
   | "recorded"
   | "duplicate"
@@ -493,38 +508,21 @@ export interface PolicyRecommendationRunInput {
   limit?: number;
 }
 
-export const POLICY_RECOMMENDATION_RUN_STATUSES = [
+export const AGENT_SUGGESTION_RUN_STATUSES = [
   "recorded",
   "duplicate",
   "idempotency_conflict",
   "all_skipped",
   "no_signals",
 ] as const;
-export const PolicyRecommendationRunStatus = z.enum(
-  POLICY_RECOMMENDATION_RUN_STATUSES,
-);
-export type PolicyRecommendationRunStatus = z.infer<
-  typeof PolicyRecommendationRunStatus
->;
-
-export const PolicyRecommendationRunStatusCounts = z.object(
-  Object.fromEntries(
-    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [
-      status,
-      z.number().int().nonnegative().optional().default(0),
-    ]),
-  ) as Record<
-    LocalAgentSuggestionWriteStatus,
-    z.ZodDefault<z.ZodOptional<z.ZodNumber>>
-  >,
-);
-export type PolicyRecommendationRunStatusCounts = z.infer<
-  typeof PolicyRecommendationRunStatusCounts
->;
+// Stored in policy_recommendation_runs.status; values are stable across the
+// policy-specific to agent-wide naming change.
+export const AgentSuggestionRunStatus = z.enum(AGENT_SUGGESTION_RUN_STATUSES);
+export type AgentSuggestionRunStatus = z.infer<typeof AgentSuggestionRunStatus>;
 
 export interface PolicyRecommendationRunResult {
   id: string;
-  status: PolicyRecommendationRunStatus;
+  status: AgentSuggestionRunStatus;
   createdBy: string;
   limit: number;
   evaluatedAt: string;
@@ -534,7 +532,7 @@ export interface PolicyRecommendationRunResult {
   duplicate: number;
   idempotencyConflict: number;
   skipped: number;
-  statusCounts: PolicyRecommendationRunStatusCounts;
+  statusCounts: AgentSuggestionWriteStatusCounts;
   results: PolicyRecommendationDraftResult[];
 }
 
@@ -767,6 +765,8 @@ export interface WorkItemRecord {
   /** Opening-time queue context for operator display; not live queue state. */
   description: string;
   dueAt: string | null;
+  /** Stable local-agent source id used to dedupe one draft per work item. */
+  agentSuggestionSourceEventId: string;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -821,6 +821,41 @@ export interface LocalWorkItemActionResult {
   status: LocalWorkItemActionStatus;
   eventKey: string;
   workItem: WorkItemRecord | null;
+}
+
+export interface WorkItemSuggestionRunInput {
+  createdBy: string;
+  evaluatedAt: string;
+  limit?: number;
+}
+
+export const WorkItemSuggestionDraftResult = z.object({
+  workItemId: z.string(),
+  dealId: z.string(),
+  queue: z.enum(ROLE_QUEUE_KINDS),
+  sourceEventId: z.string(),
+  status: LocalAgentSuggestionWriteStatus,
+  suggestionId: z.string().nullable(),
+  title: z.string(),
+});
+export type WorkItemSuggestionDraftResult = z.infer<
+  typeof WorkItemSuggestionDraftResult
+>;
+
+// Work-item draft runs are intentionally ephemeral; the audit trail is the
+// proposed agent_suggestions rows keyed back to stable work item source ids.
+export interface WorkItemSuggestionRunResult {
+  status: AgentSuggestionRunStatus;
+  createdBy: string;
+  limit: number;
+  evaluatedAt: string;
+  attempted: number;
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+  statusCounts: AgentSuggestionWriteStatusCounts;
+  results: WorkItemSuggestionDraftResult[];
 }
 
 export const POLICY_EVALUATION_SIGNALS = [
