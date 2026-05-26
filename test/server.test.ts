@@ -3247,7 +3247,7 @@ describe("server dashboard", () => {
     const script = dashboardScripts[0];
     if (!script?.trim()) throw new Error("dashboard script is missing");
 
-    const document = new FakeConsoleDocument({
+    const dashboardElementTags = {
       "agent-action-status": "div",
       "agent-suggestions": "div",
       "deal-form": "form",
@@ -3280,7 +3280,8 @@ describe("server dashboard", () => {
       "work-items": "div",
       "workflow-guide": "div",
       "workflow-mode": "button",
-    });
+    };
+    const document = new FakeConsoleDocument(dashboardElementTags);
     type DashboardStateBase = {
       metrics: Record<string, unknown>;
       roleQueues: Record<string, unknown>;
@@ -3561,16 +3562,25 @@ describe("server dashboard", () => {
           blockerCode: "deployment_use_case_unclear",
           secondaryBlockerCodes: [],
           factsStatus: "missing",
+          notifyStatus: "failed",
           reason: "awaiting deployment facts",
           updatedAt: "2026-05-24T15:02:00.000Z",
         },
       ],
     };
-    const jsonResponse = (body: unknown): Response =>
+    const jsonResponse = (body: unknown, init?: ResponseInit): Response =>
       new Response(JSON.stringify(body), {
+        ...init,
         headers: { "content-type": "application/json" },
       });
     const pendingFetches = new Set<Promise<unknown>>();
+    const dashboardPosts: Array<{
+      url: string;
+      headers: Record<string, string>;
+      body: Record<string, unknown>;
+    }> = [];
+    let failNextCommercialStateRefresh = true;
+    let stateFetchFailuresRemaining = 0;
     const expectedFetchUrls = new Set([
       "/state",
       "/integration-health",
@@ -3587,13 +3597,53 @@ describe("server dashboard", () => {
             ? String((init as { method?: unknown }).method ?? "GET")
             : "GET";
         if (method.toUpperCase() !== "GET") {
-          throw new Error(
-            `unexpected dashboard fetch init: ${JSON.stringify(init)}`,
-          );
+          const initRecord = init as {
+            headers?: Record<string, string>;
+            body?: string;
+          };
+          const url = String(input);
+          const body = JSON.parse(String(initRecord.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          dashboardPosts.push({
+            url,
+            headers: initRecord.headers ?? {},
+            body,
+          });
+          if (url === "/commercial-state") {
+            if (
+              failNextCommercialStateRefresh &&
+              body.commercialState === "proposal_sent"
+            ) {
+              stateFetchFailuresRemaining += 1;
+              failNextCommercialStateRefresh = false;
+            }
+            return jsonResponse({ status: "recorded" });
+          }
+          if (url === "/deployment-facts") {
+            return jsonResponse({ status: "recorded" });
+          }
+          if (url === "/notification-retry") {
+            return jsonResponse({
+              attempted: 1,
+              results: [{ type: "primary", status: "ok", receipts: 1 }],
+            });
+          }
+          throw new Error(`unexpected dashboard POST url: ${url}`);
         }
         const url = String(input);
         expectedFetchUrls.delete(url);
-        if (url === "/state") return jsonResponse(representativeState);
+        if (url === "/state") {
+          if (stateFetchFailuresRemaining > 0) {
+            stateFetchFailuresRemaining -= 1;
+            return jsonResponse(
+              { error: "synthetic state refresh failure" },
+              { status: 503 },
+            );
+          }
+          return jsonResponse(representativeState);
+        }
         if (url === "/integration-health") {
           return jsonResponse([
             {
@@ -3642,17 +3692,32 @@ describe("server dashboard", () => {
         ].join(",")} active=${activeFetches} pending=${pendingFetches.size}`,
       );
     };
-    const waitForDashboardText = async (
+    const waitForDashboardDocumentText = async (
+      targetDocument: FakeConsoleDocument,
       id: string,
       text: string,
     ): Promise<void> => {
       for (let attempt = 0; attempt < 50; attempt += 1) {
-        if (document.text(id).includes(text)) return;
+        if (targetDocument.text(id).includes(text)) return;
         await Promise.allSettled([...pendingFetches]);
         await Promise.resolve();
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
       throw new Error(`dashboard text ${id} did not include ${text}`);
+    };
+    const waitForDashboardText = async (
+      id: string,
+      text: string,
+    ): Promise<void> => waitForDashboardDocumentText(document, id, text);
+    const expectDashboardPostsToStay = async (
+      expectedLength: number,
+    ): Promise<void> => {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await Promise.allSettled([...pendingFetches]);
+        await Promise.resolve();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(dashboardPosts).toHaveLength(expectedLength);
+      }
     };
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
@@ -3660,6 +3725,8 @@ describe("server dashboard", () => {
     };
     const scheduledTimeoutDelays: Array<number | undefined> = [];
     const sessionStorageValues = new Map<string, string>();
+    const pendingLocalActionsStorageKey =
+      "gtm_ops_router_pending_local_actions_v3";
     const storage = {
       getItem: (key: string) => sessionStorageValues.get(key) ?? null,
       setItem: (key: string, value: string) => {
@@ -3845,6 +3912,10 @@ describe("server dashboard", () => {
     expect(document.text("detail")).toContain("Enrichment Evidence");
     expect(document.text("detail")).toContain("fixture");
     expect(document.text("detail")).toContain("manual_ops, voice_ai_eval");
+    expect(document.text("detail")).toContain("Lifecycle Controls");
+    expect(document.text("detail")).toContain("Commercial state");
+    expect(document.text("detail")).toContain("Deployment facts");
+    expect(document.text("detail")).toContain("Retry Handoff Notification");
     expect(document.text("detail")).toContain("Agent Suggestions");
     expect(document.text("detail")).toContain(
       "Ask deployment to confirm owner and next milestone.",
@@ -3853,6 +3924,259 @@ describe("server dashboard", () => {
 
     const detail = document.querySelector("#detail");
     if (!detail) throw new Error("detail root missing from fake DOM");
+    const localSecretInput = document.querySelector("#local-secret");
+    if (!localSecretInput) throw new Error("local secret input missing");
+    localSecretInput.value = LOCAL_ENDPOINT_SECRET;
+    let lifecycle = findConsoleElement(
+      detail,
+      (node) => node.dataset.lifecycleControls === "true",
+    );
+    if (!lifecycle) throw new Error("lifecycle controls section missing");
+    const currentLifecycle = (): FakeConsoleElement => {
+      if (!lifecycle) throw new Error("lifecycle controls section missing");
+      return lifecycle;
+    };
+    const lifecycleButton = (text: string): FakeConsoleElement => {
+      const button = findConsoleElement(
+        currentLifecycle(),
+        (node) => node.tagName === "BUTTON" && node.textContent === text,
+      );
+      if (!button) throw new Error(`${text} button missing`);
+      return button;
+    };
+    const controlInLabel = (
+      labelText: string,
+      tagName: string,
+    ): FakeConsoleElement => {
+      const label = findConsoleElement(
+        currentLifecycle(),
+        (node) => node.tagName === "LABEL" && node.textContent.includes(labelText),
+      );
+      if (!label) throw new Error(`${labelText} label missing`);
+      const input = findConsoleElement(label, (node) => node.tagName === tagName);
+      if (!input) throw new Error(`${labelText} control missing`);
+      return input;
+    };
+    lifecycleButton("Record Commercial State").dispatch("click");
+    await expectDashboardPostsToStay(0);
+    expect(document.text("detail")).toContain("Select a commercial state.");
+    const commercialStateControl = controlInLabel("State", "SELECT");
+    commercialStateControl.value = "proposal_sent";
+    lifecycleButton("Record Commercial State").dispatch("click");
+    await waitForExpectedDashboardFetches();
+    expect(dashboardPosts[0]?.url).toBe("/commercial-state");
+    expect(dashboardPosts[0]?.headers).toEqual(
+      expect.objectContaining({
+        [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+      }),
+    );
+    expect(dashboardPosts[0]?.body).toEqual({
+      dealId: "D-console",
+      commercialState: "proposal_sent",
+      sourceEventId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+      occurredAt: expect.stringMatching(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+      ),
+    });
+    expect(document.text("detail")).toContain(
+      "Refresh failed; the write may already be recorded.",
+    );
+    const originalCommercialEvent = dashboardPosts[0]?.body;
+    const pendingRaw = sessionStorageValues.get(pendingLocalActionsStorageKey);
+    if (!pendingRaw) throw new Error("pending local action storage missing");
+    const pendingRows = JSON.parse(pendingRaw) as Array<
+      [string, Record<string, unknown>]
+    >;
+    expect(pendingRows).toHaveLength(1);
+    const pendingEvent = pendingRows[0]?.[1];
+    const expectedCommercialPayloadSignature = JSON.stringify([
+      "object",
+      [
+        ["commercialState", ["string", "proposal_sent"]],
+        ["dealId", ["string", "D-console"]],
+        ["reason", ["null"]],
+      ],
+    ]);
+    expect(pendingEvent).toEqual(
+      expect.objectContaining({
+        sourceEventId: originalCommercialEvent?.sourceEventId,
+        occurredAt: originalCommercialEvent?.occurredAt,
+        payloadSignature: expectedCommercialPayloadSignature,
+      }),
+    );
+    commercialStateControl.value = "closed_won";
+    lifecycleButton("Record Commercial State").dispatch("click");
+    await expectDashboardPostsToStay(1);
+    expect(document.text("detail")).toContain(
+      "A commercial-state write for this deal is still unconfirmed.",
+    );
+    const pendingAfterBlockedRaw = sessionStorageValues.get(
+      pendingLocalActionsStorageKey,
+    );
+    if (!pendingAfterBlockedRaw) {
+      throw new Error("pending local action storage missing after blocked write");
+    }
+    expect(JSON.parse(pendingAfterBlockedRaw)).toEqual(pendingRows);
+    const reloadDocument = new FakeConsoleDocument(dashboardElementTags);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      runInNewContext(script, {
+        console: dashboardConsole,
+        document: reloadDocument,
+        encodeURIComponent,
+        fetch: fetchImpl,
+        FormData: class FormData {
+          constructor() {
+            formDataConstructed += 1;
+          }
+
+          get(): never {
+            throw new Error("dashboard submit path is not covered by this smoke test");
+          }
+        },
+        Intl,
+        localStorage: storage,
+        sessionStorage: storage,
+        URLSearchParams,
+        setTimeout: (_handler: unknown, delay?: number) => {
+          scheduledTimeoutDelays.push(delay);
+          return scheduledTimeoutDelays.length;
+        },
+        clearTimeout: () => {},
+        window: {
+          prompt: () => {
+            promptCalls += 1;
+            return null;
+          },
+          location: {
+            search: "?demo=operator",
+          },
+        },
+      });
+      await waitForExpectedDashboardFetches();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+    const reloadDetail = reloadDocument.querySelector("#detail");
+    if (!reloadDetail) throw new Error("reload detail root missing");
+    lifecycle = findConsoleElement(
+      reloadDetail,
+      (node) => node.dataset.lifecycleControls === "true",
+    );
+    if (!lifecycle) throw new Error("reload lifecycle controls section missing");
+    controlInLabel("State", "SELECT").value = "closed_won";
+    lifecycleButton("Record Commercial State").dispatch("click");
+    await expectDashboardPostsToStay(1);
+    expect(reloadDocument.text("detail")).toContain(
+      "A commercial-state write for this deal is still unconfirmed.",
+    );
+    expect(JSON.parse(sessionStorageValues.get(pendingLocalActionsStorageKey) ?? "[]")).toEqual(
+      pendingRows,
+    );
+    controlInLabel("State", "SELECT").value = "proposal_sent";
+    lifecycleButton("Record Commercial State").dispatch("click");
+    await waitForExpectedDashboardFetches();
+    expect(dashboardPosts[1]?.url).toBe("/commercial-state");
+    expect(dashboardPosts[1]?.headers).toEqual(
+      expect.objectContaining({
+        [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+      }),
+    );
+    expect(dashboardPosts[1]?.body).toEqual(originalCommercialEvent);
+    expect(dashboardPosts[1]?.body).toEqual(
+      expect.objectContaining({
+        sourceEventId: pendingEvent?.sourceEventId,
+        occurredAt: pendingEvent?.occurredAt,
+      }),
+    );
+    expect(sessionStorageValues.get(pendingLocalActionsStorageKey)).toBe(
+      "[]",
+    );
+    await waitForDashboardDocumentText(
+      reloadDocument,
+      "detail",
+      "Retry Handoff Notification",
+    );
+    lifecycle = findConsoleElement(
+      reloadDetail,
+      (node) => node.dataset.lifecycleControls === "true",
+    );
+    if (!lifecycle) throw new Error("refreshed lifecycle controls section missing");
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await expectDashboardPostsToStay(2);
+    expect(sessionStorageValues.get(pendingLocalActionsStorageKey)).toBe("[]");
+    expect(reloadDocument.text("detail")).toContain(
+      "Select all deployment fact fields.",
+    );
+    controlInLabel("Use Case Clear", "SELECT").value = "true";
+    controlInLabel("Integrations Known", "SELECT").value = "false";
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await expectDashboardPostsToStay(2);
+    expect(sessionStorageValues.get(pendingLocalActionsStorageKey)).toBe("[]");
+    expect(reloadDocument.text("detail")).toContain(
+      "Select all deployment fact fields.",
+    );
+    controlInLabel("Integrations Known", "SELECT").value = "";
+    controlInLabel("Data Ready", "SELECT").value = "true";
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await expectDashboardPostsToStay(2);
+    expect(sessionStorageValues.get(pendingLocalActionsStorageKey)).toBe("[]");
+    expect(reloadDocument.text("detail")).toContain(
+      "Select all deployment fact fields.",
+    );
+    controlInLabel("Use Case Clear", "SELECT").value = "";
+    controlInLabel("Integrations Known", "SELECT").value = "false";
+    controlInLabel("Data Ready", "SELECT").value = "true";
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await expectDashboardPostsToStay(2);
+    expect(sessionStorageValues.get(pendingLocalActionsStorageKey)).toBe("[]");
+    expect(reloadDocument.text("detail")).toContain(
+      "Select all deployment fact fields.",
+    );
+    controlInLabel("Use Case Clear", "SELECT").value = "true";
+    controlInLabel("Integrations Known", "SELECT").value = "";
+    controlInLabel("Data Ready", "SELECT").value = "true";
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await expectDashboardPostsToStay(2);
+    expect(reloadDocument.text("detail")).toContain(
+      "Select all deployment fact fields.",
+    );
+    controlInLabel("Integrations Known", "SELECT").value = "false";
+    lifecycleButton("Record Deployment Facts").dispatch("click");
+    await waitForExpectedDashboardFetches();
+    expect(dashboardPosts[2]?.url).toBe("/deployment-facts");
+    expect(dashboardPosts[2]?.headers).toEqual(
+      expect.objectContaining({
+        [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+      }),
+    );
+    expect(dashboardPosts[2]?.body).toEqual({
+      dealId: "D-console",
+      useCaseClear: true,
+      integrationsKnown: false,
+      dataReady: true,
+      operator: "operator-console",
+      sourceEventId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+      occurredAt: expect.stringMatching(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+      ),
+    });
+    lifecycleButton("Retry Handoff Notification").dispatch("click");
+    await waitForExpectedDashboardFetches();
+    expect(dashboardPosts[3]).toEqual(
+      expect.objectContaining({
+        url: "/notification-retry",
+        headers: expect.objectContaining({
+          [LOCAL_ENDPOINT_SECRET_HEADER]: LOCAL_ENDPOINT_SECRET,
+        }),
+        body: { dealId: "D-console", limit: 1 },
+      }),
+    );
     const detailSuggestions = detail.querySelector(
       "[data-deal-suggestion-section='true']",
     );

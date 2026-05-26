@@ -665,6 +665,8 @@ const fmtMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "
 // Local-only convenience: sessionStorage avoids persisting the write secret
 // across browser restarts, but this console still must stay localhost-only.
 const LOCAL_SECRET_STORAGE_KEY = "gtm_ops_router_local_secret";
+const LOCAL_ACTION_EVENTS_STORAGE_KEY = "gtm_ops_router_pending_local_actions_v3";
+const LOCAL_ACTION_EVENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const AGENT_SUGGESTION_DRAFT_LIMIT = 10;
 const DEAL_DETAIL_SUGGESTION_LIMIT = 5;
 const AGENT_SUGGESTION_RUNNER = "console-policy-agent";
@@ -683,6 +685,7 @@ let healthRequestSeq = 0;
 let detailRequestSeq = 0;
 const pendingSuggestionDecisions = new Set();
 const pendingWorkItemActions = new Set();
+const pendingLocalActionEvents = new Map();
 let workItemDraftRunPending = false;
 
 function qs(sel){ return document.querySelector(sel); }
@@ -1071,6 +1074,157 @@ function deterministicUuidV4(input){
   const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
   const normalized = hex.slice(0, 12) + "4" + hex.slice(13, 16) + variant + hex.slice(17);
   return normalized.slice(0, 8) + "-" + normalized.slice(8, 12) + "-" + normalized.slice(12, 16) + "-" + normalized.slice(16, 20) + "-" + normalized.slice(20);
+}
+function compareCanonicalStrings(a, b){
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function canonicalLocalActionValue(value, seen){
+  if (value === null) return ["null"];
+  if (value === undefined) return ["undefined"];
+  if (typeof value === "string") return ["string", value];
+  if (typeof value === "boolean") return ["boolean", value];
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return ["number", "NaN"];
+    if (value === Infinity) return ["number", "Infinity"];
+    if (value === -Infinity) return ["number", "-Infinity"];
+    if (Object.is(value, -0)) return ["number", "-0"];
+    return ["number", value];
+  }
+  if (typeof value === "bigint") return ["bigint", value.toString()];
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new Error("local action keys must be JSON-like values");
+  }
+  if (seen.has(value)) throw new Error("local action keys cannot contain cycles");
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) return ["array", value.map((item) => canonicalLocalActionValue(item, seen))];
+    if (value instanceof Date) {
+      return ["date", Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString()];
+    }
+    if (value instanceof Map) {
+      return ["map", [...value.entries()]
+        .map(([key, entryValue]) => [canonicalLocalActionValue(key, seen), canonicalLocalActionValue(entryValue, seen)])
+        .sort((a, b) => compareCanonicalStrings(JSON.stringify(a), JSON.stringify(b)))];
+    }
+    if (value instanceof Set) {
+      return ["set", [...value.values()]
+        .map((item) => canonicalLocalActionValue(item, seen))
+        .sort((a, b) => compareCanonicalStrings(JSON.stringify(a), JSON.stringify(b)))];
+    }
+    if (value && typeof value === "object") {
+      const proto = Object.getPrototypeOf(value);
+      if (proto !== Object.prototype && proto !== null) {
+        throw new Error("local action keys must be plain objects");
+      }
+      return ["object", Object.keys(value).sort().map((key) => [key, canonicalLocalActionValue(value[key], seen)])];
+    }
+    throw new Error("unsupported local action key value");
+  } finally {
+    seen.delete(value);
+  }
+}
+function canonicalLocalActionJson(value){
+  return JSON.stringify(canonicalLocalActionValue(value, new WeakSet()));
+}
+function localActionStableKey(prefix, scopeKey){
+  return prefix + ":" + canonicalLocalActionJson(scopeKey);
+}
+function validStoredLocalActionEvent(event){
+  return event &&
+    typeof event === "object" &&
+    typeof event.occurredAt === "string" &&
+    typeof event.sourceEventId === "string" &&
+    typeof event.createdAtMs === "number" &&
+    typeof event.payloadSignature === "string";
+}
+function persistPendingLocalActionEvents(){
+  try {
+    sessionStorage.setItem(
+      LOCAL_ACTION_EVENTS_STORAGE_KEY,
+      JSON.stringify([...pendingLocalActionEvents])
+    );
+    return true;
+  } catch (err) {
+    console.warn("failed to persist pending local action events", err);
+    return false;
+  }
+}
+function sweepPendingLocalActionEvents(nowMs){
+  let changed = false;
+  for (const [key, event] of pendingLocalActionEvents) {
+    if (nowMs - event.createdAtMs > LOCAL_ACTION_EVENT_MAX_AGE_MS) {
+      pendingLocalActionEvents.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) persistPendingLocalActionEvents();
+}
+function hydratePendingLocalActionEvents(){
+  try {
+    const raw = sessionStorage.getItem(LOCAL_ACTION_EVENTS_STORAGE_KEY);
+    if (!raw) return;
+    const rows = JSON.parse(raw);
+    if (!Array.isArray(rows)) return;
+    const nowMs = Date.now();
+    pendingLocalActionEvents.clear();
+    for (const row of rows) {
+      if (!Array.isArray(row) || row.length !== 2) continue;
+      const [key, event] = row;
+      if (typeof key !== "string" || !validStoredLocalActionEvent(event)) continue;
+      if (nowMs - event.createdAtMs > LOCAL_ACTION_EVENT_MAX_AGE_MS) continue;
+      pendingLocalActionEvents.set(key, event);
+    }
+    persistPendingLocalActionEvents();
+  } catch (err) {
+    console.warn("failed to hydrate pending local action events", err);
+  }
+}
+function localActionEvent(prefix, scopeKey, payloadKey){
+  let stableKey;
+  let payloadSignature;
+  try {
+    stableKey = localActionStableKey(prefix, scopeKey);
+    payloadSignature = canonicalLocalActionJson(payloadKey);
+  } catch (err) {
+    return { status: "invalid_payload", detail: String(err) };
+  }
+  const nowMs = Date.now();
+  const existing = pendingLocalActionEvents.get(stableKey);
+  if (existing) {
+    if (nowMs - existing.createdAtMs > LOCAL_ACTION_EVENT_MAX_AGE_MS) {
+      pendingLocalActionEvents.delete(stableKey);
+      if (!persistPendingLocalActionEvents()) return { status: "persist_failed" };
+    } else {
+      if (existing.payloadSignature !== payloadSignature) {
+        return {
+          status: "payload_conflict",
+          pendingSourceEventId: existing.sourceEventId,
+          pendingOccurredAt: existing.occurredAt
+        };
+      }
+      return { status: "ok", event: existing };
+    }
+  }
+  sweepPendingLocalActionEvents(nowMs);
+  const occurredAt = new Date(nowMs).toISOString();
+  const next = {
+    occurredAt,
+    sourceEventId: deterministicUuidV4(stableKey + ":" + occurredAt + ":" + payloadSignature),
+    createdAtMs: nowMs,
+    payloadSignature
+  };
+  pendingLocalActionEvents.set(stableKey, next);
+  if (!persistPendingLocalActionEvents()) {
+    pendingLocalActionEvents.delete(stableKey);
+    return { status: "persist_failed" };
+  }
+  return { status: "ok", event: next };
+}
+function clearLocalActionEvent(prefix, scopeKey){
+  pendingLocalActionEvents.delete(localActionStableKey(prefix, scopeKey));
+  if (!persistPendingLocalActionEvents()) {
+    throw new Error("pending local action clear could not be persisted");
+  }
 }
 function randomUuidV4(fallbackKey){
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
@@ -2383,6 +2537,19 @@ function blockerDisplay(row){
   if (row.factsStatus === "stale") return "Facts stale";
   return "-";
 }
+function notifyStatusLabel(status){
+  if (!status) return "unnotified";
+  return status;
+}
+function notifyStatusClass(status){
+  if (status === "ok") return "pass";
+  if (status === "failed" || status === "max_attempts_exceeded") return "fail";
+  if (status === "pending") return "warn";
+  return "muted";
+}
+function notificationRetryable(status){
+  return status === "failed" || status === "pending" || status === "max_attempts_exceeded";
+}
 function renderDeploymentHandoff(){
   const root = qs("#deployment-handoff");
   const rows = state.deploymentReadiness || [];
@@ -2392,7 +2559,7 @@ function renderDeploymentHandoff(){
   }
   const table = el("table");
   const head = document.createElement("tr");
-  ["Router ID", "Readiness", "Blocker", "Reason", "Last Updated"].forEach((h) => head.append(el("th", null, h)));
+  ["Router ID", "Readiness", "Blocker", "Notify", "Reason", "Last Updated"].forEach((h) => head.append(el("th", null, h)));
   table.append(head);
   for (const rowState of rows) {
     const row = el("tr", "selectable" + (rowState.dealId === selectedId ? " selected" : ""));
@@ -2402,12 +2569,336 @@ function renderDeploymentHandoff(){
       cell(rowState.dealId),
       cell(readinessDisplay(rowState), readinessClass(rowState)),
       cell(blockerDisplay(rowState)),
+      cell(notifyStatusLabel(rowState.notifyStatus), notifyStatusClass(rowState.notifyStatus)),
       cell(reason),
       cell(rowState.updatedAt)
     );
     table.append(row);
   }
   root.replaceChildren(table);
+}
+function option(value, label, selected){
+  const node = document.createElement("option");
+  node.value = value;
+  node.textContent = label;
+  if (selected) node.selected = true;
+  return node;
+}
+function booleanSelect(defaultValue){
+  const input = document.createElement("select");
+  input.required = true;
+  input.append(
+    option("", "Select...", defaultValue === null || defaultValue === undefined),
+    option("true", "Yes", defaultValue === true),
+    option("false", "No", defaultValue === false)
+  );
+  input.value = defaultValue === true ? "true" : defaultValue === false ? "false" : "";
+  return input;
+}
+function parseBooleanSelect(input){
+  if (input.value === "true") return true;
+  if (input.value === "false") return false;
+  return null;
+}
+async function refreshAfterLocalWrite(status, successMessage, onRefreshOk){
+  status.className = "action-status pass";
+  status.textContent = successMessage + " Refreshing state...";
+  const refreshStatus = await loadState();
+  if (refreshStatus === "ok") {
+    try {
+      onRefreshOk();
+      return true;
+    } catch (err) {
+      status.className = "action-status warn";
+      status.textContent = successMessage + " Refresh succeeded, but local retry state could not be cleared: " + String(err);
+      return false;
+    }
+  }
+  status.className = "action-status warn";
+  status.textContent = successMessage + " Refresh failed; the write may already be recorded. Retry after refreshing the dashboard.";
+  return false;
+}
+function localWriteResultStatus(result){
+  return result && typeof result.status === "string" && result.status.trim() ? result.status : "recorded";
+}
+function showPendingLocalActionConflict(status, prefix, scopeKey, label, conflict){
+  status.className = "action-status warn";
+  const clearButton = el("button", "secondary", "Clear Pending Write");
+  clearButton.type = "button";
+  clearButton.addEventListener("click", () => {
+    try {
+      clearLocalActionEvent(prefix, scopeKey);
+      status.className = "action-status";
+      status.textContent = "Pending " + label + " write cleared. Submit again only if this is a new operator action.";
+    } catch (err) {
+      status.className = "action-status fail";
+      status.textContent = String(err);
+    }
+  });
+  status.replaceChildren(
+    "A " + label + " write for this deal is still unconfirmed. Use the same values, refresh the dashboard, or clear the pending write before changing fields. Pending event: " + conflict.pendingSourceEventId + " ",
+    clearButton
+  );
+}
+async function postCommercialStateControl(dealId, commercialState, reason, button, status){
+  const normalizedReason = reason.value.trim();
+  if (!commercialState.value) {
+    status.className = "action-status fail";
+    status.textContent = "Select a commercial state.";
+    return;
+  }
+  const payloadKey = {
+    dealId,
+    commercialState: commercialState.value,
+    reason: normalizedReason || null
+  };
+  const scopeKey = { dealId };
+  const actionEventResult = localActionEvent("commercial-state", scopeKey, payloadKey);
+  if (actionEventResult.status === "invalid_payload") {
+    status.className = "action-status fail";
+    status.textContent = "Commercial-state write is not retry-safe: " + actionEventResult.detail;
+    return;
+  }
+  if (actionEventResult.status === "persist_failed") {
+    status.className = "action-status fail";
+    status.textContent = "Could not persist the local retry guard; not sending commercial-state write.";
+    return;
+  }
+  if (actionEventResult.status !== "ok") {
+    showPendingLocalActionConflict(
+      status,
+      "commercial-state",
+      scopeKey,
+      "commercial-state",
+      actionEventResult
+    );
+    return;
+  }
+  const actionEvent = actionEventResult.event;
+  button.disabled = true;
+  status.className = "action-status";
+  status.textContent = "Recording commercial state...";
+  pauseDemoAutoPilot();
+  try {
+    const result = await fetchJson("/commercial-state", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        dealId,
+        commercialState: commercialState.value,
+        sourceEventId: actionEvent.sourceEventId,
+        occurredAt: actionEvent.occurredAt,
+        ...(normalizedReason ? { reason: normalizedReason } : {})
+      })
+    });
+    await refreshAfterLocalWrite(
+      status,
+      "Commercial state " + localWriteResultStatus(result) + ".",
+      () => clearLocalActionEvent("commercial-state", scopeKey)
+    );
+  } catch (err) {
+    status.className = "action-status fail";
+    status.textContent = String(err);
+  } finally {
+    button.disabled = false;
+  }
+}
+async function postDeploymentFactsControl(dealId, useCaseClear, integrationsKnown, dataReady, operator, button, status){
+  const parsedUseCaseClear = parseBooleanSelect(useCaseClear);
+  const parsedIntegrationsKnown = parseBooleanSelect(integrationsKnown);
+  const parsedDataReady = parseBooleanSelect(dataReady);
+  const normalizedOperator = operator.value.trim();
+  if (parsedUseCaseClear === null || parsedIntegrationsKnown === null || parsedDataReady === null) {
+    status.className = "action-status fail";
+    status.textContent = "Select all deployment fact fields.";
+    return;
+  }
+  if (!normalizedOperator) {
+    status.className = "action-status fail";
+    status.textContent = "Operator is required.";
+    return;
+  }
+  const payloadKey = {
+    dealId,
+    useCaseClear: parsedUseCaseClear,
+    integrationsKnown: parsedIntegrationsKnown,
+    dataReady: parsedDataReady,
+    operator: normalizedOperator
+  };
+  const scopeKey = { dealId };
+  const actionEventResult = localActionEvent("deployment-facts", scopeKey, payloadKey);
+  if (actionEventResult.status === "invalid_payload") {
+    status.className = "action-status fail";
+    status.textContent = "Deployment-facts write is not retry-safe: " + actionEventResult.detail;
+    return;
+  }
+  if (actionEventResult.status === "persist_failed") {
+    status.className = "action-status fail";
+    status.textContent = "Could not persist the local retry guard; not sending deployment-facts write.";
+    return;
+  }
+  if (actionEventResult.status !== "ok") {
+    showPendingLocalActionConflict(
+      status,
+      "deployment-facts",
+      scopeKey,
+      "deployment-facts",
+      actionEventResult
+    );
+    return;
+  }
+  const actionEvent = actionEventResult.event;
+  button.disabled = true;
+  status.className = "action-status";
+  status.textContent = "Recording deployment facts...";
+  pauseDemoAutoPilot();
+  try {
+    const result = await fetchJson("/deployment-facts", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({
+        dealId,
+        sourceEventId: actionEvent.sourceEventId,
+        occurredAt: actionEvent.occurredAt,
+        useCaseClear: parsedUseCaseClear,
+        integrationsKnown: parsedIntegrationsKnown,
+        dataReady: parsedDataReady,
+        operator: normalizedOperator
+      })
+    });
+    await refreshAfterLocalWrite(
+      status,
+      "Deployment facts " + localWriteResultStatus(result) + ".",
+      () => clearLocalActionEvent("deployment-facts", scopeKey)
+    );
+  } catch (err) {
+    status.className = "action-status fail";
+    status.textContent = String(err);
+  } finally {
+    button.disabled = false;
+  }
+}
+async function retryDeploymentNotificationControl(dealId, button, status){
+  button.disabled = true;
+  status.className = "action-status";
+  status.textContent = "Retrying handoff notification...";
+  pauseDemoAutoPilot();
+  try {
+    const result = await fetchJson("/notification-retry", {
+      method: "POST",
+      headers: localWriteHeaders(),
+      body: JSON.stringify({ dealId, limit: 1 })
+    });
+    const attempted = result && typeof result.attempted === "number" ? result.attempted : 0;
+    const firstStatus = result?.results?.[0]?.status || "no_candidate";
+    status.className = "action-status " + (firstStatus === "ok" ? "pass" : "warn");
+    status.textContent = "Notification retry attempted " + attempted + " candidate(s): " + firstStatus + ". Refreshing state...";
+    const refreshStatus = await loadState();
+    if (refreshStatus !== "ok") {
+      status.className = "action-status warn";
+      status.textContent = "Notification retry attempted " + attempted + " candidate(s): " + firstStatus + ". Refresh failed; retry after refreshing the dashboard.";
+    }
+  } catch (err) {
+    status.className = "action-status fail";
+    status.textContent = String(err);
+  } finally {
+    button.disabled = false;
+  }
+}
+function lifecycleControlsSection(dealId, deal, readiness){
+  const section = el("div", "section");
+  section.dataset.lifecycleControls = "true";
+  section.append(el("h2", null, "Lifecycle Controls"));
+  if (deal?.status === "quarantined") {
+    section.append(el("div", "empty", "Lifecycle controls are available after a deal is routed."));
+    return section;
+  }
+
+  const commercialWrap = el("div", "mini-form");
+  commercialWrap.append(el("div", "muted", "Commercial state"));
+  const commercialState = document.createElement("select");
+  commercialState.required = true;
+  commercialState.append(option("", "Select...", true));
+  for (const [value, label] of [
+    ["open", "Open"],
+    ["proposal_sent", "Proposal Sent"],
+    ["negotiating", "Negotiating"],
+    ["closed_won", "Closed Won"],
+    ["closed_lost", "Closed Lost"]
+  ]) {
+    commercialState.append(option(value, label, false));
+  }
+  commercialState.value = "";
+  const commercialReason = document.createElement("textarea");
+  commercialReason.rows = 2;
+  commercialReason.maxLength = 500;
+  commercialReason.placeholder = "Optional reason";
+  const commercialButton = el("button", "secondary", "Record Commercial State");
+  commercialButton.type = "button";
+  const commercialStatus = el("div", "action-status");
+  commercialButton.addEventListener("click", () => {
+    void postCommercialStateControl(dealId, commercialState, commercialReason, commercialButton, commercialStatus);
+  });
+  const commercialRow = el("div", "two");
+  commercialRow.append(
+    labeledInput("State", commercialState),
+    labeledInput("Reason", commercialReason)
+  );
+  commercialWrap.append(
+    commercialRow,
+    commercialButton,
+    commercialStatus
+  );
+
+  const factsWrap = el("div", "mini-form");
+  factsWrap.append(el("div", "muted", "Deployment facts"));
+  const useCaseClear = booleanSelect(null);
+  const integrationsKnown = booleanSelect(null);
+  const dataReady = booleanSelect(null);
+  const operator = document.createElement("input");
+  operator.required = true;
+  operator.maxLength = 120;
+  operator.value = OPERATOR_PRINCIPAL;
+  const factsButton = el("button", "secondary", "Record Deployment Facts");
+  factsButton.type = "button";
+  const factsStatus = el("div", "action-status");
+  factsButton.addEventListener("click", () => {
+    void postDeploymentFactsControl(dealId, useCaseClear, integrationsKnown, dataReady, operator, factsButton, factsStatus);
+  });
+  const factsRow = el("div", "two");
+  factsRow.append(
+    labeledInput("Use Case Clear", useCaseClear),
+    labeledInput("Integrations Known", integrationsKnown)
+  );
+  factsWrap.append(
+    factsRow,
+    labeledInput("Data Ready", dataReady),
+    labeledInput("Operator", operator),
+    factsButton,
+    factsStatus
+  );
+
+  section.append(commercialWrap, factsWrap);
+  if (readiness) {
+    const notifyWrap = el("div", "mini-form");
+    notifyWrap.append(
+      el("div", "muted", "Deployment handoff notification"),
+      workflowLine("Notify status", notifyStatusLabel(readiness.notifyStatus), notifyStatusClass(readiness.notifyStatus))
+    );
+    if (notificationRetryable(readiness.notifyStatus)) {
+      const retryButton = el("button", "secondary", "Retry Handoff Notification");
+      retryButton.type = "button";
+      const retryStatus = el("div", "action-status");
+      retryButton.addEventListener("click", () => {
+        void retryDeploymentNotificationControl(dealId, retryButton, retryStatus);
+      });
+      notifyWrap.append(retryButton, retryStatus);
+    }
+    section.append(notifyWrap);
+  } else if (!deal) {
+    section.append(el("div", "empty", "No routed deal or readiness row is available for this record."));
+  }
+  return section;
 }
 function populateDealSuggestionSection(section, dealId){
   section.replaceChildren(el("h2", null, "Agent Suggestions"));
@@ -2544,6 +3035,7 @@ async function renderDetail(seq){
   }
   for (const [k, v] of fields) kv.append(el("div", null, k), el("div", null, v));
   title.append(kv, receiptBadges(events));
+  const lifecycle = lifecycleControlsSection(detailId, deal, detailReadiness);
   const scoreBox = el("div", "section");
   scoreBox.append(el("h2", null, "Score Explanation"));
   if (deal?.scoreNotes && deal.scoreNotes.length) {
@@ -2589,7 +3081,7 @@ async function renderDetail(seq){
     list.append(el("div", "event", event.from + " -> " + event.to + " | " + event.detail + "\\n" + event.ts));
   }
   journey.append(list);
-  root.replaceChildren(title, scoreBox, enrichmentBox, suggestions, journey);
+  root.replaceChildren(title, lifecycle, scoreBox, enrichmentBox, suggestions, journey);
 }
 async function loadState(){
   const seq = ++stateRequestSeq;
@@ -2676,6 +3168,7 @@ async function preview(){
     root.textContent = "ERROR\\n" + String(err);
   }
 }
+hydratePendingLocalActionEvents();
 const savedLocalSecret = sessionStorage.getItem(LOCAL_SECRET_STORAGE_KEY);
 if (savedLocalSecret) qs("#local-secret").value = savedLocalSecret;
 qs("#preview-btn").addEventListener("click", preview);
