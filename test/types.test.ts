@@ -8,7 +8,11 @@ import {
   OutcomeReasonCategory,
   OutcomeRejectionKind,
   OutcomeState,
+  ProviderObservationProvider,
+  ProviderObservationSubjectType,
+  EnrichedFactFreshnessStatus,
   type DeploymentReadinessRecord,
+  type EnrichedSubjectFacts,
   type LocalOutcomeInput,
   type LocalOutcomeWriteStatus,
   type OutcomeEventRecord,
@@ -119,6 +123,47 @@ describe("Phase 2 outcome vocabulary", () => {
 
     expect(deployed.outcome).toBe("deployed");
     expect(deployed.arrDeltaUsd).toBeNull();
+  });
+});
+
+describe("enrichment evidence vocabulary", () => {
+  it("keeps provider observation subjects and providers explicit", () => {
+    expect(ProviderObservationSubjectType.options).toEqual(["company"]);
+    expect(ProviderObservationProvider.options).toEqual([
+      "fixture",
+      "manual",
+      "website",
+      "hubspot",
+      "apollo",
+      "clearbit",
+      "clay",
+      "warehouse",
+      "csv",
+      "agent",
+    ]);
+    expect(ProviderObservationSubjectType.safeParse("contact").success).toBe(false);
+    expect(ProviderObservationProvider.safeParse("linkedin").success).toBe(false);
+  });
+
+  it("models normalized enrichment facts with freshness provenance", () => {
+    const facts: EnrichedSubjectFacts = {
+      subjectType: "company",
+      subjectKey: "ryder-digital.com",
+      employees: 1200,
+      industry: "logistics",
+      techSignals: ["twilio", "salesforce"],
+      regulated: true,
+      confidence: 0.95,
+      sourceProvider: "fixture",
+      sourceObservationId: "PO-abc",
+      observedAt: "2026-05-21T00:00:00.000Z",
+      expiresAt: "2026-06-20T00:00:00.000Z",
+      freshnessStatus: "fresh",
+      updatedAt: "2026-05-21T00:00:00.000Z",
+    };
+
+    expect(EnrichedFactFreshnessStatus.options).toEqual(["fresh", "stale"]);
+    expect(facts.sourceProvider).toBe("fixture");
   });
 });
 

@@ -1,7 +1,7 @@
 # Phase 2 Spec: Outcome Loop
 
-**Status:** Proposed  
-**Date:** 2026-05-21  
+**Status:** Implemented (base outcome loop + deterministic demo fixtures)
+**Date:** 2026-05-21
 **Depends on:** Phase 1 deployment readiness handoff
 
 Phase 2 records what happened after deployment so routing policy can be judged
@@ -87,8 +87,13 @@ Field rules:
   can legitimately move through the same outcome more than once only after a
   future reactivation spec.
 - `operator` is self-reported display context, not authentication.
-- `occurredAt` must be valid ISO and cannot be more than
-  `MAX_FUTURE_SKEW_MS` ahead of server time.
+- `occurredAt` must be canonical UTC ISO with milliseconds
+  (`YYYY-MM-DDTHH:mm:ss.sssZ`) and cannot be more than
+  `MAX_FUTURE_SKEW_MS` ahead of server time. The store enforces the canonical
+  form for commercial-state, deployment-fact, and outcome writes because cycle
+  metrics compare event timestamps lexicographically in SQLite. Databases
+  written by versions before this invariant should be refreshed or audited
+  before relying on cycle-time medians.
 - `arrDeltaUsd` must be an integer if present. The semantic ARR rule is
   post-claim validation: it is required and positive for `expanded`, and must
   be absent for all other outcomes. Violations record `invalid_arr_delta`.
@@ -118,6 +123,28 @@ other
 6. source-event idempotency claim.
 7. outcome lifecycle and ARR semantic validation.
 8. append outcome event and timeline event in one SQLite transaction.
+
+On `idempotency_conflict`, the response returns `event=null` and
+`rejection=null` because the stored row belongs to the first payload, not the
+conflicting input. The idempotency violation table is the diagnostic source for
+the mismatch.
+
+Preconditions intentionally run before idempotency replay checks. If a deal is
+later corrected away from `closed_won`, replaying a previously accepted outcome
+returns `not_closed_won`, not `duplicate`.
+
+Semantic rejection precedence is deterministic:
+
+```text
+invalid_arr_delta
+post_churn_outcome
+duplicate_semantic_outcome
+missing_prior_outcome
+```
+
+For example, a second `churned` after churn is classified as
+`post_churn_outcome`, because post-churn invalidity wins over duplicate
+classification.
 
 Unknown deals return 404 and do not claim the source event key, mirroring
 `/deployment-facts`.
@@ -332,7 +359,7 @@ Audit rules:
   `closed_won`, report `outcomeCommercialStateConflicts`.
 - If a deal has `churned` before `deployed`, report
   `outcomeChurnBeforeDeploy`.
-- `outcomeInvalidHistories` is the sum of accepted rows matching any of these
+- `outcomeInvalidHistories` is the sum of accepted outcome-event rows matching any of these
   impossible histories:
   - `deployed` without a prior accepted `deployment_started`.
   - `landed` without a prior accepted `deployed`.
@@ -377,14 +404,25 @@ Phase 2 metrics query `outcome_events` history:
 - `medianTimeClosedWonToDeployedHours`
 - `medianTimeDeployedToLandedHours`
 
-`medianTimeClosedWonToDeployedHours` uses
-`commercial_states.state_entered_at` from the current accepted `closed_won`
-projection as the start timestamp. Deals without current `closed_won` are
-excluded from the median and counted by `outcomeCommercialStateConflicts`
-instead. `medianTimeDeployedToLandedHours` uses the first accepted `deployed`
-and first later accepted `landed` outcome by `occurred_at`.
+`medianTimeClosedWonToDeployedHours` uses the customer-reported `occurredAt`
+from the first projected local `closed_won` commercial-state timeline event as
+the start timestamp, while `commercial_states` remains the current-state
+eligibility/conflict check. HubSpot stage-change receipts update external-stage
+audit fields, not the local commercial-state projection, so they do not enter
+this median until a local commercial-state write confirms the close. Deals
+without current `closed_won` are excluded from the median and counted by
+`outcomeCommercialStateConflicts` instead. Deals with invalid accepted outcome
+histories are excluded from cycle-time medians so failing audit output does not
+display misleading timing. `medianTimeDeployedToLandedHours` uses the first
+accepted `deployed` and first later accepted `landed` outcome by `occurred_at`.
+Both the TypeScript `/metrics` shape and `ops_audit.py --json` emit `null`, not
+`0`, when a cycle-time median has no valid sample.
+Compatibility note: this intentionally changes those JSON fields from
+always-number to `number | null`; downstream readers should render `null` as
+`n/a`, not coerce it to zero.
 
-Cohort breakdowns should join back to existing route/source fields:
+Deferred beyond the base Phase 2 slice: follow-up cohort breakdowns should join
+back to existing route/source fields:
 
 - route kind.
 - sales owner.
@@ -393,7 +431,7 @@ Cohort breakdowns should join back to existing route/source fields:
 - legal flag.
 - deployment readiness at first `deployment_started`.
 
-Indexes:
+Implemented indexes:
 
 - `idx_outcome_events_deal` on `(deal_id, occurred_at)`.
 - `idx_outcome_events_deal_outcome` on `(deal_id, outcome, occurred_at)`.
@@ -447,6 +485,17 @@ Indexes:
   outcome/commercial conflicts plus invalid histories as exit-blocking.
 - `/state` exposes outcome counters without treating a single latest projection
   as the source of truth.
+- Demo outcome fixtures match known seed deals by stable router deal id, not
+  company text. Their commercial-state reasons include `demo outcome loop`, and
+  their outcome operators are prefixed with `demo:` so persistent demo rows are
+  distinguishable from real local writes.
+- Persistent `--demo-outcomes` runs recognize demo outcome and projected
+  commercial-state rows by their deterministic fixture source-event ids and
+  refuse to layer fixture rows into a DB that already contains non-demo outcome
+  rows or non-demo projected local commercial-state rows on the fixture deals.
+  Observe-only local commercial-state observations such as stale/same-state
+  rows or terminal-drift alerts remain visible in the ledger, but do not by
+  themselves block deterministic fixture reconciliation.
 
 ## Implementation Order
 

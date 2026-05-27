@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 
 TERMINAL_STAGES = ("routed", "quarantined")
+ROUTE_KINDS = ("nurture", "self_serve", "human_assisted")
 
 
 def percentile(values: list[int], p: float) -> int:
@@ -37,9 +40,9 @@ def percentile(values: list[int], p: float) -> int:
     return s[idx]
 
 
-def median(values: list[float]) -> float:
+def median(values: list[float]) -> float | None:
     if not values:
-        return 0.0
+        return None
     s = sorted(values)
     mid = len(s) // 2
     if len(s) % 2:
@@ -48,19 +51,20 @@ def median(values: list[float]) -> float:
 
 
 def hours_between(start_iso: str, end_iso: str) -> float | None:
-    from datetime import datetime
-
-    def parse(value: str) -> datetime:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
     try:
-        delta = parse(end_iso) - parse(start_iso)
+        delta = parse_iso(end_iso) - parse_iso(start_iso)
     except ValueError:
         return None
     seconds = delta.total_seconds()
     if seconds < 0:
         return None
-    return round(seconds / 3600, 2)
+    hours = seconds / 3600
+    # Half-up rounding matches TypeScript's Math.round for non-negative hours.
+    return math.floor(hours * 100 + 0.5) / 100
+
+
+def parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -78,9 +82,18 @@ def first_projected_closed_won_by_deal(
 ) -> dict[str, str]:
     if not table_exists(conn, "events"):
         return {}
-    closed_won_at: dict[str, str] = {}
+    closed_won_at: dict[str, tuple[str, float]] = {}
     for deal_id, meta_json in conn.execute(
-        "SELECT deal_id, meta FROM events WHERE meta IS NOT NULL ORDER BY ts, id"
+        """
+        SELECT deal_id, meta
+        FROM events
+        WHERE meta IS NOT NULL
+          AND json_valid(meta)
+          AND json_extract(meta, '$.kind') = 'commercial_state'
+          AND json_extract(meta, '$.commercialState') = 'closed_won'
+          AND json_extract(meta, '$.projected') = 1
+        ORDER BY ts, id
+        """
     ).fetchall():
         try:
             meta = json.loads(meta_json)
@@ -96,11 +109,18 @@ def first_projected_closed_won_by_deal(
         occurred_at = meta.get("occurredAt")
         if not isinstance(occurred_at, str):
             continue
+        try:
+            occurred_at_ts = parse_iso(occurred_at).timestamp()
+        except ValueError:
+            continue
         deal = str(deal_id)
         previous = closed_won_at.get(deal)
-        if previous is None or occurred_at < previous:
-            closed_won_at[deal] = occurred_at
-    return closed_won_at
+        if previous is None or occurred_at_ts < previous[1]:
+            closed_won_at[deal] = (occurred_at, occurred_at_ts)
+    return {
+        deal_id: occurred_at
+        for deal_id, (occurred_at, _) in closed_won_at.items()
+    }
 
 
 @dataclass
@@ -123,8 +143,8 @@ class AuditReport:
     outcome_churn_before_deploy: int = 0
     outcome_commercial_state_conflicts: int = 0
     outcome_invalid_histories: int = 0
-    median_time_closed_won_to_deployed_hours: float = 0.0
-    median_time_deployed_to_landed_hours: float = 0.0
+    median_time_closed_won_to_deployed_hours: float | None = None
+    median_time_deployed_to_landed_hours: float | None = None
     breaches: list[str] = field(default_factory=list)
 
     @property
@@ -293,17 +313,24 @@ def audit(
     r = AuditReport()
     r.intake = len(rows)
     latencies: list[int] = []
-    arr: dict[str, float] = {"nurture": 0.0, "self_serve": 0.0, "human_assisted": 0.0}
+    arr: dict[str, float] = {kind: 0.0 for kind in ROUTE_KINDS}
 
     for stage, payload, _quarantine, latency_ms in rows:
         if stage == "routed":
-            r.routed += 1
-            if payload:
+            if not payload:
+                r.breaches.append("INVARIANT routed_missing_payload")
+                r.stuck += 1
+            else:
                 deal = json.loads(payload)
                 kind = deal.get("route", {}).get("kind", "unknown")
                 usd = float(deal.get("dealUSD", 0))
-                arr[kind] = arr.get(kind, 0.0) + usd
-                r.routed_arr_usd += usd
+                if kind not in arr:
+                    r.breaches.append(f"INVARIANT unknown_route_kind {kind}")
+                    r.stuck += 1
+                else:
+                    r.routed += 1
+                    arr[kind] += usd
+                    r.routed_arr_usd += usd
         elif stage == "quarantined":
             r.quarantined += 1
         else:
@@ -340,6 +367,14 @@ def audit(
 
 
 def render(r: AuditReport) -> str:
+    def hours(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        if 0 < value < 0.01:
+            return "<0.01h"
+        rounded = math.floor(value * 100 + 0.5) / 100
+        return f"{rounded:.2f}".rstrip("0").rstrip(".") + "h"
+
     lines = [
         "OPS AUDIT",
         "-" * 48,
@@ -361,10 +396,10 @@ def render(r: AuditReport) -> str:
         f"    churned ........... {r.churned_deals}",
         f"    churn before deploy {r.outcome_churn_before_deploy}",
         f"    commercial conflict {r.outcome_commercial_state_conflicts}",
-        f"    invalid histories . {r.outcome_invalid_histories}",
+        f"    invalid events .... {r.outcome_invalid_histories}",
         f"    won-to-deployed med "
-        f"{r.median_time_closed_won_to_deployed_hours:g}h",
-        f"    deployed-to-landed  {r.median_time_deployed_to_landed_hours:g}h",
+        f"{hours(r.median_time_closed_won_to_deployed_hours)}",
+        f"    deployed-to-landed  {hours(r.median_time_deployed_to_landed_hours)}",
         "-" * 48,
         "  RESULT: " + ("PASS" if r.ok else "FAIL"),
         *[f"    - {b}" for b in r.breaches],

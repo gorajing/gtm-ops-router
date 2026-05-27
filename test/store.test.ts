@@ -10,9 +10,15 @@ import {
 import { integrationConfigBundleFromEnv } from "../src/integrations.js";
 import { Store } from "../src/store.js";
 import type {
+  AgentSuggestionKind,
   ExternalStageState,
+  LocalAgentSuggestionDecisionInput,
+  LocalAgentSuggestionInput,
   LocalOutcomeInput,
   PipelineEventMeta,
+  RoleQueueItem,
+  RoleQueueKind,
+  ProviderObservationInput,
   RoutedDeal,
 } from "../src/types.js";
 
@@ -116,6 +122,72 @@ function outcomeEventKey(sourceEventId: string): string {
   return JSON.stringify(["outcome", "local", sourceEventId]);
 }
 
+function agentSuggestionInput(
+  overrides: Partial<LocalAgentSuggestionInput> = {},
+): LocalAgentSuggestionInput {
+  return {
+    dealId: "D-lease",
+    sourceEventId: "33333333-3333-4333-8333-333333333333",
+    kind: "handoff_summary",
+    title: "Draft AE handoff",
+    body: "Summarize the freight scheduling pain, stakeholders, and next step.",
+    rationale: "High-ARR human-assisted deal needs a concise handoff.",
+    createdBy: "local-agent",
+    occurredAt: "2026-05-22T13:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function agentSuggestionDecisionInput(
+  suggestionId: string,
+  overrides: Partial<LocalAgentSuggestionDecisionInput> = {},
+): LocalAgentSuggestionDecisionInput {
+  return {
+    suggestionId,
+    sourceEventId: "44444444-4444-4444-8444-444444444444",
+    decision: "accepted",
+    humanPrincipal: "ops@example.com",
+    reason: "Handoff is accurate and ready for the AE.",
+    occurredAt: "2026-05-22T13:05:00.000Z",
+    ...overrides,
+  };
+}
+
+function agentSuggestionEventKey(sourceEventId: string): string {
+  return JSON.stringify(["agent_suggestion", "local_agent", sourceEventId]);
+}
+
+function agentSuggestionDecisionEventKey(sourceEventId: string): string {
+  return JSON.stringify([
+    "agent_suggestion_decision",
+    "local_agent",
+    sourceEventId,
+  ]);
+}
+
+function providerObservationInput(
+  overrides: Partial<ProviderObservationInput> = {},
+): ProviderObservationInput {
+  return {
+    subjectType: "company",
+    subjectKey: "acme.example",
+    provider: "fixture",
+    sourceEventId: "55555555-5555-4555-8555-555555555555",
+    observedAt: "2026-05-21T12:00:00.000Z",
+    expiresAt: "2026-06-20T12:00:00.000Z",
+    confidence: 0.9,
+    rawPayload: { source: "fixture" },
+    normalizedPayload: {
+      employees: 500,
+      industry: "logistics",
+      techSignals: ["manual_ops"],
+      regulated: true,
+      confidence: 0.9,
+    },
+    ...overrides,
+  };
+}
+
 function withTempStoreDb(test: (db: InstanceType<typeof DatabaseSync>) => void): void {
   const dir = join(tmpdir(), `gtm-router-schema-${process.pid}-${Date.now()}`);
   mkdirSync(dir);
@@ -177,6 +249,15 @@ interface ExternalEventKeyRow {
   notify_error: string | null;
 }
 
+interface IdempotencyViolationRow {
+  source: string;
+  source_event_id: string;
+  scope: string;
+  existing_payload_hash: string;
+  incoming_payload_hash: string;
+  reason: string;
+}
+
 function readReadiness(
   dbPath: string,
   dealId: string,
@@ -229,6 +310,27 @@ function readExternalEventKey(
          WHERE key = ?`,
       )
       .get(key) as ExternalEventKeyRow | undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function readIdempotencyViolation(
+  dbPath: string,
+  scope: string,
+  sourceEventId: string,
+): IdempotencyViolationRow | undefined {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT source, source_event_id, scope, existing_payload_hash,
+                incoming_payload_hash, reason
+         FROM idempotency_violations
+         WHERE scope = ?
+           AND source_event_id = ?`,
+      )
+      .get(scope, sourceEventId) as IdempotencyViolationRow | undefined;
   } finally {
     db.close();
   }
@@ -321,6 +423,8 @@ describe("Store Phase 1 storage schema", () => {
           "idempotency_violations",
           "outcome_events",
           "outcome_rejections",
+          "provider_observations",
+          "enriched_subject_facts",
         ]),
       );
     });
@@ -840,6 +944,292 @@ describe("Store Phase 1 storage schema", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("records provider observations and projects highest-confidence enrichment facts", () => {
+    withTempStore((store, dbPath) => {
+      const first = store.recordProviderObservation(providerObservationInput());
+      expect(first.status).toBe("recorded");
+      expect(first.observation?.id).toMatch(/^PO-[0-9a-f]{32}$/);
+      expect(first.facts).toEqual(
+        expect.objectContaining({
+          subjectType: "company",
+          subjectKey: "acme.example",
+          employees: 500,
+          industry: "logistics",
+          techSignals: ["manual_ops"],
+          regulated: true,
+          confidence: 0.9,
+          sourceProvider: "fixture",
+          freshnessStatus: "fresh",
+        }),
+      );
+
+      const duplicate = store.recordProviderObservation(providerObservationInput());
+      expect(duplicate.status).toBe("duplicate");
+      expect(duplicate.observation?.id).toBe(first.observation?.id);
+      expect(duplicate.observation?.observedAt).toBe(first.observation?.observedAt);
+
+      const refreshedDuplicate = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(refreshedDuplicate.status).toBe("refreshed");
+      expect(refreshedDuplicate.observation?.id).toBe(first.observation?.id);
+      expect(refreshedDuplicate.observation?.observedAt).toBe(
+        "2026-05-22T12:00:00.000Z",
+      );
+      expect(refreshedDuplicate.facts).toEqual(
+        expect.objectContaining({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+        }),
+      );
+
+      const expiryOnlyRefresh = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-22T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(expiryOnlyRefresh.status).toBe("refreshed");
+      expect(expiryOnlyRefresh.observation?.expiresAt).toBe(
+        "2026-06-22T12:00:00.000Z",
+      );
+      expect(expiryOnlyRefresh.facts?.expiresAt).toBe(
+        "2026-06-22T12:00:00.000Z",
+      );
+
+      const conflict = store.recordProviderObservation(
+        providerObservationInput({
+          normalizedPayload: {
+            employees: 501,
+            industry: "logistics",
+            techSignals: ["manual_ops"],
+            regulated: true,
+            confidence: 0.9,
+          },
+        }),
+      );
+      expect(conflict.status).toBe("idempotency_conflict");
+      expect(conflict.observation).toBeNull();
+      expect(
+        readIdempotencyViolation(
+          dbPath,
+          "provider_observation",
+          "55555555-5555-4555-8555-555555555555",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          source: "fixture",
+          scope: "provider_observation",
+          reason:
+            "provider observation source event id replayed with a different payload",
+        }),
+      );
+
+      const lowerConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          sourceEventId: "66666666-6666-4666-8666-666666666666",
+          observedAt: "2026-05-22T12:00:00.000Z",
+          expiresAt: "2026-06-21T12:00:00.000Z",
+          confidence: 0.2,
+          normalizedPayload: {
+            employees: 50,
+            industry: "freight",
+            techSignals: ["legacy-tms"],
+            regulated: false,
+            confidence: 0.2,
+          },
+        }),
+      );
+      expect(lowerConfidence.status).toBe("recorded");
+      expect(lowerConfidence.facts?.employees).toBe(500);
+
+      const higherConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          sourceEventId: "77777777-7777-4777-8777-777777777777",
+          observedAt: "2026-05-23T12:00:00.000Z",
+          expiresAt: "2026-06-22T12:00:00.000Z",
+          confidence: 0.95,
+          normalizedPayload: {
+            employees: 650,
+            industry: "3pl",
+            techSignals: ["manual_ops", "voice_ai_eval"],
+            regulated: false,
+            confidence: 0.95,
+          },
+        }),
+      );
+      expect(higherConfidence.status).toBe("recorded");
+      expect(higherConfidence.facts).toEqual(
+        expect.objectContaining({
+          employees: 650,
+          industry: "3pl",
+          techSignals: ["manual_ops", "voice_ai_eval"],
+          sourceObservationId: higherConfidence.observation?.id,
+        }),
+      );
+
+      const refreshedLowerConfidenceSource = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-24T12:00:00.000Z",
+          expiresAt: "2026-06-24T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(refreshedLowerConfidenceSource.status).toBe("refreshed");
+      expect(refreshedLowerConfidenceSource.observation?.observedAt).toBe(
+        "2026-05-24T12:00:00.000Z",
+      );
+      expect(refreshedLowerConfidenceSource.facts).toEqual(
+        expect.objectContaining({
+          employees: 650,
+          sourceObservationId: higherConfidence.observation?.id,
+        }),
+      );
+
+      const expiryShorteningReplay = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-24T12:00:00.000Z",
+          expiresAt: "2026-06-01T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(expiryShorteningReplay.status).toBe("duplicate");
+      expect(expiryShorteningReplay.observation?.expiresAt).toBe(
+        "2026-06-24T12:00:00.000Z",
+      );
+
+      const laterExpiryShorteningReplay = store.recordProviderObservation(
+        providerObservationInput({
+          observedAt: "2026-05-25T12:00:00.000Z",
+          expiresAt: "2026-06-01T12:00:00.000Z",
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(laterExpiryShorteningReplay.status).toBe("duplicate");
+      expect(laterExpiryShorteningReplay.observation?.observedAt).toBe(
+        "2026-05-24T12:00:00.000Z",
+      );
+      expect(laterExpiryShorteningReplay.observation?.expiresAt).toBe(
+        "2026-06-24T12:00:00.000Z",
+      );
+
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "acme.example",
+          "2026-06-23T12:00:00.000Z",
+        )?.freshnessStatus,
+      ).toBe("stale");
+      expect(store.providerObservations("company", "acme.example")).toHaveLength(3);
+    });
+  });
+
+  it("lets fresh usable facts replace stale higher-confidence facts", () => {
+    withTempStore((store) => {
+      const staleHighConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "stale.example",
+          sourceEventId: "88888888-8888-4888-8888-888888888888",
+          observedAt: "2026-04-20T12:00:00.000Z",
+          expiresAt: "2026-05-20T12:00:00.000Z",
+          confidence: 0.95,
+          normalizedPayload: {
+            employees: 900,
+            industry: "logistics",
+            techSignals: ["legacy-tms"],
+            regulated: true,
+            confidence: 0.95,
+          },
+        }),
+      );
+      expect(staleHighConfidence.status).toBe("recorded");
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "stale.example",
+          "2026-05-25T12:00:00.000Z",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          employees: 900,
+          confidence: 0.95,
+          freshnessStatus: "stale",
+        }),
+      );
+
+      const freshLowerConfidence = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "stale.example",
+          sourceEventId: "99999999-9999-4999-8999-999999999999",
+          observedAt: "2026-05-25T12:00:00.000Z",
+          expiresAt: "2026-06-24T12:00:00.000Z",
+          confidence: 0.7,
+          normalizedPayload: {
+            employees: 725,
+            industry: "3pl",
+            techSignals: ["voice_ai_eval"],
+            regulated: false,
+            confidence: 0.7,
+          },
+        }),
+      );
+      expect(freshLowerConfidence.status).toBe("recorded");
+      expect(
+        store.enrichedSubjectFacts(
+          "company",
+          "stale.example",
+          "2026-05-25T12:00:00.000Z",
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          employees: 725,
+          industry: "3pl",
+          confidence: 0.7,
+          freshnessStatus: "fresh",
+          sourceObservationId: freshLowerConfidence.observation?.id,
+        }),
+      );
+    });
+  });
+
+  it("allows duplicate refresh to extend bounded facts to unbounded expiry", () => {
+    withTempStore((store) => {
+      const first = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "unbounded.example",
+          sourceEventId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          expiresAt: "2026-06-20T12:00:00.000Z",
+        }),
+      );
+      expect(first.status).toBe("recorded");
+
+      const unbounded = store.recordProviderObservation(
+        providerObservationInput({
+          subjectKey: "unbounded.example",
+          sourceEventId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          observedAt: "2026-05-21T12:00:00.000Z",
+          expiresAt: null,
+          refreshOnDuplicate: true,
+        }),
+      );
+      expect(unbounded.status).toBe("refreshed");
+      expect(unbounded.observation?.expiresAt).toBeNull();
+      expect(unbounded.facts).toEqual(
+        expect.objectContaining({
+          expiresAt: null,
+          freshnessStatus: "fresh",
+          sourceObservationId: first.observation?.id,
+        }),
+      );
+    });
   });
 
   it("stores raw local commercial UUIDs in projections and observations", () => {
@@ -2703,6 +3093,1553 @@ describe("Store readiness derivation", () => {
     });
   });
 
+  it("derives role-specific queues from routed, commercial, and readiness state", () => {
+    withTempStore((store) => {
+      const openDeal = routed();
+      openDeal.id = "D-open";
+      openDeal.company = "Open Freight";
+      openDeal.dealUSD = 75000;
+      store.recordRouted(openDeal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const closedDeal = routed();
+      closedDeal.id = "D-closed";
+      closedDeal.company = "Closed Logistics";
+      closedDeal.dealUSD = 120000;
+      store.recordRouted(closedDeal, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-closed",
+        commercialState: "closed_won",
+        sourceEventId: "b6b6b6b6-b6b6-46b6-86b6-b6b6b6b6b6b6",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      const readyDeal = routed();
+      readyDeal.id = "D-ready";
+      readyDeal.company = "Ready Distribution";
+      store.recordRouted(readyDeal, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: "D-ready",
+        commercialState: "closed_won",
+        sourceEventId: "b7b7b7b7-b7b7-47b7-87b7-b7b7b7b7b7b7",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      store.recordLocalDeploymentFacts({
+        dealId: "D-ready",
+        sourceEventId: "b8b8b8b8-b8b8-48b8-88b8-b8b8b8b8b8b8",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-22T12:00:00.000Z",
+      });
+
+      const selfServeDeal = routed();
+      selfServeDeal.id = "D-self";
+      selfServeDeal.company = "Self Serve Ops";
+      selfServeDeal.dealUSD = 12000;
+      selfServeDeal.sourceChannel = "event";
+      selfServeDeal.route = {
+        kind: "self_serve",
+        queue: "sales_self_serve",
+        slaHours: 24,
+      };
+      store.recordRouted(selfServeDeal, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+
+      const queues = store.roleQueues();
+
+      expect(queues.ae_attention).toEqual([
+        expect.objectContaining({
+          queue: "ae_attention",
+          dealId: "D-open",
+          company: "Open Freight",
+          salesOwner: "ae.morgan",
+          priority: "high",
+          status: "no_commercial_state",
+          reason: "human-assisted deal needs owner touch",
+        }),
+      ]);
+      expect(queues.finance_review.map((item) => item.dealId)).toEqual([
+        "D-open",
+      ]);
+      expect(queues.legal_review.map((item) => item.dealId)).toEqual([
+        "D-open",
+      ]);
+      expect(queues.deployment_readiness).toEqual([
+        expect.objectContaining({
+          queue: "deployment_readiness",
+          dealId: "D-closed",
+          priority: "medium",
+          status: "pending",
+          reason: "awaiting deployment facts",
+        }),
+      ]);
+      expect(queues.growth_attribution).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            dealId: "D-open",
+            routeKind: "human_assisted",
+            sourceChannel: "inbound_form",
+            status: "no_commercial_state",
+          }),
+          expect.objectContaining({
+            dealId: "D-closed",
+            routeKind: "human_assisted",
+            status: "closed_won",
+          }),
+          expect.objectContaining({
+            dealId: "D-self",
+            routeKind: "self_serve",
+            sourceChannel: "event",
+            priority: "low",
+          }),
+        ]),
+      );
+    });
+  });
+
+  it("keeps older pending readiness rows in role queues outside the recent scan", () => {
+    withTempStore((store) => {
+      const olderDeal = routed();
+      olderDeal.id = "D-older";
+      olderDeal.company = "Older Pending Handoff";
+      store.recordRouted(olderDeal, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      store.recordLocalCommercialState({
+        dealId: "D-older",
+        commercialState: "closed_won",
+        sourceEventId: "b9b9b9b9-b9b9-49b9-89b9-b9b9b9b9b9b9",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      for (let i = 0; i < 101; i += 1) {
+        const filler = routed();
+        filler.id = `D-fill-${String(i).padStart(3, "0")}`;
+        filler.company = `Filler ${i}`;
+        store.recordRouted(filler, 0, {
+          mode: "dry_run",
+          status: "dry_run",
+        });
+      }
+
+      expect(store.roleQueues(1).deployment_readiness).toEqual([
+        expect.objectContaining({
+          dealId: "D-older",
+          status: "pending",
+        }),
+      ]);
+    });
+  });
+
+  it("keeps older open human-assisted work in role queues outside the recent scan", () => {
+    withTempStore((store) => {
+      const olderDeal = routed();
+      olderDeal.id = "D-older-open";
+      olderDeal.company = "Older Strategic Freight";
+      olderDeal.dealUSD = 999999;
+      store.recordRouted(olderDeal, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+
+      for (let i = 0; i < 101; i += 1) {
+        const filler = routed();
+        filler.id = `D-open-fill-${String(i).padStart(3, "0")}`;
+        filler.company = `Open Filler ${i}`;
+        store.recordRouted(filler, 0, {
+          mode: "dry_run",
+          status: "dry_run",
+        });
+      }
+
+      expect(store.roleQueues(1).ae_attention).toEqual([
+        expect.objectContaining({
+          dealId: "D-older-open",
+          priority: "high",
+        }),
+      ]);
+      expect(store.roleQueues(1).finance_review).toEqual([
+        expect.objectContaining({
+          dealId: "D-older-open",
+        }),
+      ]);
+    });
+  });
+
+  it("opens and closes role-queue work items with idempotent local commands", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item";
+      deal.company = "Work Item Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "51515151-5151-4151-9151-515151515151",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(opened.status).toBe("recorded");
+      expect(opened.workItem).toBeDefined();
+      const workItemId = opened.workItem!.id;
+      expect(opened.workItem).toEqual(
+        expect.objectContaining({
+          dealId: deal.id,
+          queue: "ae_attention",
+          status: "assigned",
+          owner: "ae.morgan",
+          sourceKey: "role_queue:ae_attention:D-work-item",
+        }),
+      );
+
+      const duplicate = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "51515151-5151-4151-9151-515151515151",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(duplicate.status).toBe("duplicate");
+
+      const alreadyExists = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "52525252-5252-4252-9252-525252525252",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:05:00.000Z",
+          reason: "Second operator click.",
+        },
+        signal,
+      );
+      expect(alreadyExists.status).toBe("already_exists");
+
+      const reassigned = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "56565656-5656-4656-9656-565656565656",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:08:00.000Z",
+        owner: "ae.taylor",
+        reason: "Taylor owns this lane.",
+      });
+      expect(reassigned.status).toBe("recorded");
+      expect(reassigned.workItem?.owner).toBe("ae.taylor");
+
+      const staleAssign = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "57575757-5757-4757-9757-575757575757",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:06:00.000Z",
+        owner: "ae.older",
+        reason: "Older owner update arrived late.",
+      });
+      expect(staleAssign.status).toBe("superseded");
+      expect(staleAssign.workItem?.owner).toBe("ae.taylor");
+
+      const staleWaive = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "58585858-5858-4858-9858-585858585858",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:06:30.000Z",
+        reason: "Older terminal update arrived late.",
+      });
+      expect(staleWaive.status).toBe("superseded");
+      expect(staleWaive.workItem?.status).toBe("assigned");
+
+      const resolved = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "53535353-5353-4353-9353-535353535353",
+        action: "resolve",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:10:00.000Z",
+        reason: "AE followed up.",
+      });
+      expect(resolved.status).toBe("recorded");
+      expect(resolved.workItem).toEqual(
+        expect.objectContaining({
+          status: "resolved",
+          resolvedBy: "operator-console",
+          resolutionReason: "AE followed up.",
+        }),
+      );
+
+      const afterClose = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "54545454-5454-4454-9454-545454545454",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:15:00.000Z",
+        reason: "No longer needed.",
+      });
+      expect(afterClose.status).toBe("already_closed");
+
+      const assignAfterClose = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "59595959-5959-4959-9959-595959595959",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T15:16:00.000Z",
+        owner: "ae.closed",
+        reason: "Closed items should not be reassigned.",
+      });
+      expect(assignAfterClose.status).toBe("already_closed");
+
+      const reopened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "55555555-5555-4555-9555-555555555555",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T15:20:00.000Z",
+          reason: "Deal returned to the queue.",
+        },
+        signal,
+      );
+      expect(reopened.status).toBe("recorded");
+      expect(reopened.workItem).toEqual(
+        expect.objectContaining({
+          sourceKey: "role_queue:ae_attention:D-work-item",
+          status: "assigned",
+          resolvedAt: null,
+          resolvedBy: null,
+          resolutionReason: null,
+        }),
+      );
+      expect(reopened.workItem?.id).not.toBe(workItemId);
+      // The operator queue renders currently assigned work before closed history.
+      expect(store.workItems()).toEqual([
+        expect.objectContaining({
+          id: reopened.workItem?.id,
+          status: "assigned",
+        }),
+        expect.objectContaining({
+          id: workItemId,
+          status: "resolved",
+        }),
+      ]);
+    });
+  });
+
+  it("waives assigned role-queue work items", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-waive-work-item";
+      deal.company = "Waive Work Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "61616161-6161-4161-9161-616161616161",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T16:00:00.000Z",
+        },
+        signal,
+      );
+      expect(opened.workItem).toBeDefined();
+      const workItemId = opened.workItem!.id;
+      const waived = store.recordLocalWorkItemAction({
+        workItemId,
+        sourceEventId: "62626262-6262-4262-9262-626262626262",
+        action: "waive",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T16:05:00.000Z",
+        reason: "Queue signal reviewed and waived.",
+      });
+
+      expect(waived.status).toBe("recorded");
+      expect(waived.workItem).toEqual(
+        expect.objectContaining({
+          status: "waived",
+          resolvedBy: "operator-console",
+          resolutionReason: "Queue signal reviewed and waived.",
+        }),
+      );
+    });
+  });
+
+  it("drafts agent suggestions from assigned work items", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-suggestion";
+      deal.company = "Suggestion Work Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "63636363-6363-4363-9363-636363636363",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:00:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      expect(opened.workItem).toBeDefined();
+
+      const first = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:05:00.000Z",
+        limit: 5,
+      });
+      const reassigned = store.recordLocalWorkItemAction({
+        workItemId: opened.workItem!.id,
+        sourceEventId: "65656565-6565-4565-9565-656565656565",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T17:07:00.000Z",
+        owner: "ae.taylor",
+        reason: "Taylor owns follow-up.",
+      });
+      const replay = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:10:00.000Z",
+        limit: 5,
+      });
+      const resolved = store.recordLocalWorkItemAction({
+        workItemId: opened.workItem!.id,
+        sourceEventId: "64646464-6464-4464-9464-646464646464",
+        action: "resolve",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T17:15:00.000Z",
+        reason: "Suggestion reviewed.",
+      });
+      const afterResolve = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:20:00.000Z",
+        limit: 5,
+      });
+      const reopened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "66666666-6666-4666-9666-666666666666",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:25:00.000Z",
+          reason: "Deal returned to the queue.",
+        },
+        signal,
+      );
+      const afterReopen = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:30:00.000Z",
+        limit: 5,
+      });
+
+      expect(first).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          duplicate: 0,
+          skipped: 0,
+          results: [
+            expect.objectContaining({
+              workItemId: opened.workItem!.id,
+              dealId: deal.id,
+              queue: "ae_attention",
+              status: "recorded",
+              title: expect.stringContaining("Draft AE next step"),
+            }),
+          ],
+        }),
+      );
+      expect(first.results[0]?.sourceEventId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(reassigned.status).toBe("recorded");
+      expect(replay).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+        }),
+      );
+      expect(resolved.status).toBe("recorded");
+      expect(afterResolve).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+        }),
+      );
+      expect(reopened.status).toBe("recorded");
+      expect(reopened.workItem?.id).not.toBe(opened.workItem!.id);
+      expect(afterReopen).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          duplicate: 0,
+          results: [
+            expect.objectContaining({
+              workItemId: reopened.workItem!.id,
+              status: "recorded",
+            }),
+          ],
+        }),
+      );
+      expect(store.agentSuggestions()).toEqual([
+        expect.objectContaining({
+          dealId: deal.id,
+          kind: "handoff_summary",
+          status: "proposed",
+          title: expect.stringContaining("Draft AE next step"),
+        }),
+        expect.objectContaining({
+          dealId: deal.id,
+          kind: "handoff_summary",
+          status: "proposed",
+          title: expect.stringContaining("Draft AE next step"),
+        }),
+      ]);
+    });
+  });
+
+  it("rejects non-canonical work item due dates before drafting", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-bad-due";
+      deal.company = "Bad Due Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+
+      expect(() =>
+        store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: "68686868-6868-4868-9868-686868686868",
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: "2026-05-24T17:35:00.000Z",
+            dueAt: "2026-05-24T17:40:00Z",
+            reason: "Open from queue.",
+          },
+          signal,
+        ),
+      ).toThrow(/work item dueAt must be canonical UTC ISO timestamp/);
+
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "69696969-6969-4969-9969-696969696969",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:36:00.000Z",
+          dueAt: "2026-05-24T17:40:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare("UPDATE work_items SET due_at = ? WHERE id = ?").run(
+        "2026-05-24T17:40:00Z",
+        opened.workItem!.id,
+      );
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:45:00.000Z",
+        limit: 5,
+      });
+
+      expect(run.status).toBe("recorded");
+      expect(store.agentSuggestions()[0]?.body).not.toContain("Due ");
+    });
+  });
+
+  it("uses the stored work-item suggestion source id instead of recomputing it", () => {
+    withTempStore((store) => {
+      const deal = routed();
+      deal.id = "D-work-item-stored-source";
+      deal.company = "Stored Source Freight";
+      store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+      const signal = store.roleQueues().ae_attention[0];
+      if (!signal) throw new Error("expected AE attention signal");
+      const opened = store.recordLocalWorkItem(
+        {
+          dealId: deal.id,
+          queue: "ae_attention",
+          sourceEventId: "67676767-6767-4767-9767-676767676767",
+          owner: "ae.morgan",
+          createdBy: "operator-console",
+          occurredAt: "2026-05-24T17:40:00.000Z",
+          reason: "Open from queue.",
+        },
+        signal,
+      );
+      const legacyStoredSourceId = "77777777-7777-4777-9777-777777777777";
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare(
+        `UPDATE work_items
+         SET agent_suggestion_source_event_id = ?
+         WHERE id = ?`,
+      ).run(legacyStoredSourceId, opened.workItem!.id);
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:45:00.000Z",
+        limit: 5,
+      });
+      const replay = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T17:50:00.000Z",
+        limit: 5,
+      });
+
+      expect(run.results[0]).toEqual(
+        expect.objectContaining({
+          sourceEventId: legacyStoredSourceId,
+          status: "recorded",
+        }),
+      );
+      expect(store.agentSuggestions()[0]?.sourceEventId).toBe(
+        legacyStoredSourceId,
+      );
+      expect(replay).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          attempted: 0,
+          recorded: 0,
+        }),
+      );
+    });
+  });
+
+  it("drafts queue-specific suggestion kinds from assigned work items", () => {
+    withTempStore((store) => {
+      const cases: Array<{
+        queue: RoleQueueKind;
+        expectedKind: AgentSuggestionKind;
+        expectedTitle: string;
+      }> = [
+        {
+          queue: "ae_attention",
+          expectedKind: "handoff_summary",
+          expectedTitle: "Draft AE next step",
+        },
+        {
+          queue: "finance_review",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft finance review request",
+        },
+        {
+          queue: "legal_review",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft legal review request",
+        },
+        {
+          queue: "deployment_readiness",
+          expectedKind: "handoff_summary",
+          expectedTitle: "Draft deployment handoff",
+        },
+        {
+          queue: "growth_attribution",
+          expectedKind: "missing_field_question",
+          expectedTitle: "Draft growth follow-up",
+        },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-kind-${index}`;
+        deal.company = `Queue Kind ${index}`;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: testCase.queue,
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: index === cases.length - 1 ? "low" : "medium",
+          reason: `${testCase.queue} needs operator follow-up.`,
+          status: "closed_won",
+          updatedAt: `2026-05-24T18:0${index}:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: testCase.queue,
+            sourceEventId: `90000000-0000-4000-8000-00000000000${index}`,
+            owner: "ops.owner",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.status).toBe("recorded");
+      }
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T18:10:00.000Z",
+        limit: 5,
+      });
+      const suggestionsById = new Map(
+        store.agentSuggestions().map((suggestion) => [suggestion.id, suggestion]),
+      );
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 5,
+          recorded: 5,
+          duplicate: 0,
+        }),
+      );
+      for (const testCase of cases) {
+        const result = run.results.find(
+          (candidate) => candidate.queue === testCase.queue,
+        );
+        expect(result).toEqual(
+          expect.objectContaining({
+            queue: testCase.queue,
+            status: "recorded",
+            title: expect.stringContaining(testCase.expectedTitle),
+          }),
+        );
+        expect(suggestionsById.get(result!.suggestionId!)?.kind).toBe(
+          testCase.expectedKind,
+        );
+      }
+    });
+  });
+
+  it("drafts by assignment age and skips previously drafted work items", () => {
+    withTempStore((store) => {
+      const openedIds: string[] = [];
+      for (const [index, company] of ["Oldest Freight", "Newest Freight"].entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-age-${index}`;
+        deal.company = company;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: "ae_attention",
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: "medium",
+          reason: "AE follow-up needed.",
+          status: "closed_won",
+          updatedAt: `2026-05-24T19:${index}0:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: `91000000-0000-4000-8000-00000000000${index}`,
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.workItem).toBeDefined();
+        openedIds.push(opened.workItem!.id);
+      }
+      const churnedOwner = store.recordLocalWorkItemAction({
+        workItemId: openedIds[0]!,
+        sourceEventId: "92000000-0000-4000-8000-000000000000",
+        action: "assign",
+        humanPrincipal: "operator-console",
+        occurredAt: "2026-05-24T19:25:00.000Z",
+        owner: "ae.taylor",
+        reason: "Oldest item changed owner but should keep FIFO draft order.",
+      });
+      expect(churnedOwner.status).toBe("recorded");
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T19:30:00.000Z",
+        limit: 1,
+      });
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          attempted: 1,
+          recorded: 1,
+        }),
+      );
+      expect(run.results[0]?.workItemId).toBe(openedIds[0]);
+
+      const nextRun = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T19:35:00.000Z",
+        limit: 1,
+      });
+
+      expect(nextRun).toEqual(
+        expect.objectContaining({
+          attempted: 1,
+          duplicate: 0,
+          recorded: 1,
+        }),
+      );
+      expect(nextRun.results[0]?.workItemId).toBe(openedIds[1]);
+      expect(nextRun.results[0]?.status).toBe("recorded");
+    });
+  });
+
+  it("does not let unrouted work items consume draft-run slots", () => {
+    withTempStore((store) => {
+      const openedIds: string[] = [];
+      for (const [index, company] of ["Stale Freight", "Fresh Freight"].entries()) {
+        const deal = routed();
+        deal.id = `D-work-item-routed-filter-${index}`;
+        deal.company = company;
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+
+        const signal: RoleQueueItem = {
+          queue: "ae_attention",
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: "ae.morgan",
+          priority: "medium",
+          reason: "AE follow-up needed.",
+          status: "closed_won",
+          updatedAt: `2026-05-24T20:${index}0:00.000Z`,
+        };
+        const opened = store.recordLocalWorkItem(
+          {
+            dealId: deal.id,
+            queue: "ae_attention",
+            sourceEventId: `93000000-0000-4000-8000-00000000000${index}`,
+            owner: "ae.morgan",
+            createdBy: "operator-console",
+            occurredAt: signal.updatedAt,
+            reason: "Open from queue.",
+          },
+          signal,
+        );
+        expect(opened.workItem).toBeDefined();
+        openedIds.push(opened.workItem!.id);
+      }
+
+      const db = (store as unknown as {
+        db: InstanceType<typeof DatabaseSync>;
+      }).db;
+      db.prepare("UPDATE deals SET stage = 'quarantined' WHERE id = ?").run(
+        "D-work-item-routed-filter-0",
+      );
+
+      const run = store.recordWorkItemSuggestions({
+        createdBy: "work-item-agent",
+        evaluatedAt: "2026-05-24T20:30:00.000Z",
+        limit: 1,
+      });
+
+      expect(run).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          attempted: 1,
+          recorded: 1,
+          skipped: 0,
+        }),
+      );
+      expect(run.results[0]?.workItemId).toBe(openedIds[1]);
+    });
+  });
+
+	  it("evaluates routing policy against post-sale outcomes without changing policy", () => {
+	    withTempStore((store) => {
+      const closeDeal = (
+        deal: RoutedDeal,
+        sourceEventId: string,
+      ): void => {
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+        store.recordLocalCommercialState({
+          dealId: deal.id,
+          commercialState: "closed_won",
+          sourceEventId,
+          occurredAt: "2026-05-21T12:00:00.000Z",
+          reason: null,
+          expectedRedPath: false,
+        });
+      };
+      const writeOutcome = (
+        dealId: string,
+        sourceEventId: string,
+        outcome: LocalOutcomeInput["outcome"],
+        occurredAt: string,
+        arrDeltaUsd: number | null = null,
+      ): void => {
+        expect(
+          store.recordLocalOutcome(
+            outcomeInput({
+              dealId,
+              sourceEventId,
+              outcome,
+              occurredAt,
+              arrDeltaUsd,
+              reasonCategory: outcome === "expanded" ? "scope_expanded" : null,
+            }),
+          ).status,
+        ).toBe("recorded");
+      };
+
+      const selfServe = routed();
+      selfServe.id = "D-self-expanded";
+      selfServe.company = "Self Serve Expansion";
+      selfServe.dealUSD = 18_000;
+      selfServe.sourceChannel = "event";
+      selfServe.route = {
+        kind: "self_serve",
+        queue: "sales_self_serve",
+        slaHours: 24,
+      };
+      closeDeal(selfServe, "33333333-3333-4333-8333-333333333331");
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444401",
+        "deployment_started",
+        "2026-05-22T10:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444402",
+        "deployed",
+        "2026-05-22T11:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444403",
+        "landed",
+        "2026-05-22T12:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444404",
+        "expanded",
+        "2026-05-22T13:00:00.000Z",
+        25_000,
+      );
+
+      const churned = routed();
+      churned.id = "D-human-churned";
+      churned.company = "Churned Human Deal";
+      churned.dealUSD = 90_000;
+      churned.sourceChannel = "event";
+      closeDeal(churned, "33333333-3333-4333-8333-333333333332");
+      writeOutcome(
+        churned.id,
+        "44444444-4444-4444-8444-444444444405",
+        "deployment_started",
+        "2026-05-22T10:00:00.000Z",
+      );
+      writeOutcome(
+        churned.id,
+        "44444444-4444-4444-8444-444444444406",
+        "churned",
+        "2026-05-22T14:00:00.000Z",
+      );
+
+      const stalled = routed();
+      stalled.id = "D-human-stalled";
+      stalled.company = "Stalled Human Deal";
+      stalled.dealUSD = 70_000;
+      stalled.sourceChannel = "inbound_form";
+      closeDeal(stalled, "33333333-3333-4333-8333-333333333333");
+
+      const readyNotStarted = routed();
+      readyNotStarted.id = "D-human-ready-not-started";
+      readyNotStarted.company = "Ready But Not Started";
+      readyNotStarted.dealUSD = 80_000;
+      readyNotStarted.sourceChannel = "cold_reply";
+      closeDeal(readyNotStarted, "33333333-3333-4333-8333-333333333334");
+      store.recordLocalDeploymentFacts({
+        dealId: readyNotStarted.id,
+        sourceEventId: "55555555-5555-4555-8555-555555555501",
+        useCaseClear: true,
+        integrationsKnown: true,
+        dataReady: true,
+        operator: "DS",
+        occurredAt: "2026-05-22T12:00:00.000Z",
+      });
+
+      const report = store.policyEvaluation(
+        50,
+        undefined,
+        "2026-05-23T12:00:00.000Z",
+      );
+
+      expect(report.candidateRouted).toBe(4);
+      expect(report.candidateLimit).toBe(500);
+      expect(report.selfServeExpanded).toEqual([
+        expect.objectContaining({
+          dealId: selfServe.id,
+          signal: "self_serve_expanded",
+          sourceChannel: "event",
+          salesOwner: null,
+          lastOutcomeAt: "2026-05-22T13:00:00.000Z",
+          arrDeltaUsd: 25_000,
+        }),
+      ]);
+      expect(report.humanAssistedRisk).toEqual([
+        expect.objectContaining({
+          dealId: churned.id,
+          signal: "human_assisted_churned",
+          salesOwner: "ae.morgan",
+          lastOutcomeAt: "2026-05-22T14:00:00.000Z",
+        }),
+        expect.objectContaining({
+          dealId: readyNotStarted.id,
+          signal: "human_assisted_ready_not_started",
+          reason: "deployment ready but no deployment start recorded",
+          lastOutcomeAt: null,
+        }),
+        expect.objectContaining({
+          dealId: stalled.id,
+          signal: "human_assisted_stalled",
+          reason: "awaiting deployment facts",
+          lastOutcomeAt: null,
+        }),
+      ]);
+
+      const eventSummary = report.sourceChannels.find(
+        (summary) => summary.sourceChannel === "event",
+      );
+      expect(eventSummary).toEqual(
+        expect.objectContaining({
+          routed: 2,
+          closedWon: 2,
+          deploymentStarted: 2,
+          landed: 1,
+          expanded: 1,
+          churned: 1,
+          expandedArrDeltaUsd: 25_000,
+        }),
+      );
+      const inboundSummary = report.sourceChannels.find(
+        (summary) => summary.sourceChannel === "inbound_form",
+      );
+      expect(inboundSummary).toEqual(
+        expect.objectContaining({
+          routed: 1,
+          closedWon: 1,
+          deploymentStarted: 0,
+        }),
+      );
+      expect(report.flags).toEqual([
+        expect.objectContaining({
+          flag: "pricing_approval",
+          routed: 3,
+          closedWon: 3,
+          deploymentStarted: 1,
+          churned: 1,
+        }),
+        expect.objectContaining({
+          flag: "regulated_review",
+          routed: 3,
+          closedWon: 3,
+          deploymentStarted: 1,
+          churned: 1,
+        }),
+      ]);
+    });
+  });
+
+  it("drafts policy evaluation recommendations into the agent suggestion ledger", () => {
+    withTempStore((store) => {
+      const closeDeal = (deal: RoutedDeal, sourceEventId: string): void => {
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+        store.recordLocalCommercialState({
+          dealId: deal.id,
+          commercialState: "closed_won",
+          sourceEventId,
+          occurredAt: "2026-05-21T12:00:00.000Z",
+          reason: null,
+          expectedRedPath: false,
+        });
+      };
+      const writeOutcome = (
+        dealId: string,
+        sourceEventId: string,
+        outcome: LocalOutcomeInput["outcome"],
+        occurredAt: string,
+        arrDeltaUsd: number | null = null,
+      ): void => {
+        expect(
+          store.recordLocalOutcome(
+            outcomeInput({
+              dealId,
+              sourceEventId,
+              outcome,
+              occurredAt,
+              arrDeltaUsd,
+              reasonCategory: outcome === "expanded" ? "scope_expanded" : null,
+            }),
+          ).status,
+        ).toBe("recorded");
+      };
+
+      const selfServe = routed();
+      selfServe.id = "D-policy-rec-self-serve";
+      selfServe.company = "Policy Rec Self Serve";
+      selfServe.dealUSD = 18_000;
+      selfServe.route = {
+        kind: "self_serve",
+        queue: "sales_self_serve",
+        slaHours: 24,
+      };
+      closeDeal(selfServe, "33333333-3333-4333-8333-333333333351");
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444451",
+        "deployment_started",
+        "2026-05-22T10:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444452",
+        "deployed",
+        "2026-05-22T11:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444453",
+        "landed",
+        "2026-05-22T12:00:00.000Z",
+      );
+      writeOutcome(
+        selfServe.id,
+        "44444444-4444-4444-8444-444444444454",
+        "expanded",
+        "2026-05-22T13:00:00.000Z",
+        25_000,
+      );
+
+      const stalled = routed();
+      stalled.id = "D-policy-rec-stalled";
+      stalled.company = "Policy Rec Stalled";
+      stalled.dealUSD = 90_000;
+      closeDeal(stalled, "33333333-3333-4333-8333-333333333352");
+
+      const result = store.recordPolicyEvaluationRecommendations({
+        createdBy: "policy-agent",
+        evaluatedAt: "2026-05-23T13:00:00.000Z",
+        limit: 5,
+      });
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          evaluatedAt: "2026-05-23T13:00:00.000Z",
+          attempted: 2,
+          recorded: 2,
+          duplicate: 0,
+          idempotencyConflict: 0,
+          skipped: 0,
+          statusCounts: expect.objectContaining({
+            recorded: 2,
+            duplicate: 0,
+            idempotency_conflict: 0,
+            not_found: 0,
+            not_routed: 0,
+          }),
+        }),
+      );
+      expect(result.results.map((item) => item.signal)).toEqual([
+        "human_assisted_stalled",
+        "self_serve_expanded",
+      ]);
+      expect(result.results[0]?.sourceEventId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+
+      const suggestions = store.agentSuggestions(10);
+      expect(suggestions).toHaveLength(2);
+      expect(suggestions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            dealId: stalled.id,
+            kind: "policy_change_recommendation",
+            status: "proposed",
+            createdBy: "policy-agent",
+            occurredAt: "2026-05-22T12:00:00.000Z",
+          }),
+          expect.objectContaining({
+            dealId: selfServe.id,
+            kind: "policy_change_recommendation",
+            status: "proposed",
+            createdBy: "policy-agent",
+            occurredAt: "2026-05-22T13:00:00.000Z",
+          }),
+        ]),
+      );
+
+      const replay = store.recordPolicyEvaluationRecommendations({
+        createdBy: "policy-agent",
+        evaluatedAt: "2026-05-23T13:00:00.000Z",
+        limit: 5,
+      });
+      expect(replay).toEqual(
+        expect.objectContaining({
+          attempted: 2,
+          recorded: 0,
+          duplicate: 2,
+          idempotencyConflict: 0,
+          skipped: 0,
+          statusCounts: expect.objectContaining({
+            recorded: 0,
+            duplicate: 2,
+          }),
+        }),
+      );
+      const policyRuns = store.policyRecommendationRuns(10);
+      expect(policyRuns.map((run) => run.status)).toEqual([
+        "duplicate",
+        "recorded",
+      ]);
+      expect(policyRuns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: expect.stringMatching(/^PRR-/),
+            status: "recorded",
+            createdBy: "policy-agent",
+            evaluatedAt: "2026-05-23T13:00:00.000Z",
+            limit: 5,
+            attempted: 2,
+            recorded: 2,
+            duplicate: 0,
+            results: expect.arrayContaining([
+              expect.objectContaining({
+                signal: "human_assisted_stalled",
+                status: "recorded",
+              }),
+            ]),
+          }),
+          expect.objectContaining({
+            id: expect.stringMatching(/^PRR-/),
+            status: "duplicate",
+            attempted: 2,
+            recorded: 0,
+            duplicate: 2,
+          }),
+        ]),
+      );
+    });
+  });
+
+  it("records no-signal policy recommendation runs for auditability", () => {
+    withTempStore((store) => {
+      const result = store.recordPolicyEvaluationRecommendations({
+        createdBy: "policy-agent",
+        evaluatedAt: "2026-05-23T13:00:00.000Z",
+      });
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: "no_signals",
+          limit: 10,
+          attempted: 0,
+          recorded: 0,
+          duplicate: 0,
+          skipped: 0,
+        }),
+      );
+      expect(store.policyRecommendationRuns()).toEqual([
+        expect.objectContaining({
+          id: result.id,
+          status: "no_signals",
+          createdBy: "policy-agent",
+          evaluatedAt: "2026-05-23T13:00:00.000Z",
+          limit: 10,
+          attempted: 0,
+          results: [],
+        }),
+      ]);
+    });
+  });
+
+  it("marks policy recommendation runs all_skipped when candidates are not writable", () => {
+    withTempStore((store) => {
+      const originalPolicyEvaluation = store.policyEvaluation.bind(store);
+      store.policyEvaluation = (() => ({
+        candidateRouted: 1,
+        candidateLimit: 1,
+        signalBackfillRouted: 0,
+        signalBackfillLimitPerSignal: 0,
+        selfServeExpanded: [
+          {
+            dealId: "D-missing-policy-candidate",
+            company: "Missing Policy Candidate",
+            amount: 42_000,
+            routeKind: "self_serve",
+            sourceChannel: "inbound_form",
+            salesOwner: null,
+            signal: "self_serve_expanded",
+            signalObservedAt: "2026-05-23T12:00:00.000Z",
+            reason: "synthetic stale candidate",
+            lastOutcomeAt: null,
+            arrDeltaUsd: 5_000,
+          },
+        ],
+        humanAssistedRisk: [],
+        sourceChannels: [],
+        flags: [],
+      })) as Store["policyEvaluation"];
+      try {
+        const result = store.recordPolicyEvaluationRecommendations({
+          createdBy: "policy-agent",
+          evaluatedAt: "2026-05-23T13:00:00.000Z",
+          limit: 1,
+        });
+
+        expect(result).toEqual(
+          expect.objectContaining({
+            status: "all_skipped",
+            attempted: 1,
+            recorded: 0,
+            skipped: 1,
+            statusCounts: expect.objectContaining({
+              not_found: 1,
+              not_routed: 0,
+            }),
+          }),
+        );
+        expect(store.policyRecommendationRuns()).toEqual([
+          expect.objectContaining({
+            status: "all_skipped",
+            skipped: 1,
+          }),
+        ]);
+      } finally {
+        store.policyEvaluation =
+          originalPolicyEvaluation as Store["policyEvaluation"];
+      }
+    });
+  });
+
+  it("prefetches policy signals before applying recommendation priority", () => {
+    withTempStore((store) => {
+      const closeDeal = (deal: RoutedDeal, sourceEventId: string): void => {
+        store.recordRouted(deal, 0, { mode: "dry_run", status: "dry_run" });
+        store.recordLocalCommercialState({
+          dealId: deal.id,
+          commercialState: "closed_won",
+          sourceEventId,
+          occurredAt: "2026-05-21T12:00:00.000Z",
+          reason: null,
+          expectedRedPath: false,
+        });
+      };
+
+      const stalled = routed();
+      stalled.id = "D-policy-prefetch-stalled";
+      stalled.company = "Large Stalled";
+      stalled.dealUSD = 250_000;
+      closeDeal(stalled, "33333333-3333-4333-8333-333333333353");
+
+      const churned = routed();
+      churned.id = "D-policy-prefetch-churned";
+      churned.company = "Smaller Churned";
+      churned.dealUSD = 25_000;
+      closeDeal(churned, "33333333-3333-4333-8333-333333333354");
+      expect(
+        store.recordLocalOutcome(
+          outcomeInput({
+            dealId: churned.id,
+            sourceEventId: "44444444-4444-4444-8444-444444444455",
+            outcome: "deployment_started",
+            occurredAt: "2026-05-22T10:00:00.000Z",
+          }),
+        ).status,
+      ).toBe("recorded");
+      expect(
+        store.recordLocalOutcome(
+          outcomeInput({
+            dealId: churned.id,
+            sourceEventId: "44444444-4444-4444-8444-444444444456",
+            outcome: "churned",
+            occurredAt: "2026-05-22T14:00:00.000Z",
+          }),
+        ).status,
+      ).toBe("recorded");
+
+      const result = store.recordPolicyEvaluationRecommendations({
+        createdBy: "policy-agent",
+        evaluatedAt: "2026-05-23T13:00:00.000Z",
+        limit: 1,
+      });
+
+      expect(result.results).toEqual([
+        expect.objectContaining({
+          dealId: churned.id,
+          signal: "human_assisted_churned",
+          status: "recorded",
+        }),
+      ]);
+    });
+  });
+
+  it("does not flag fresh closed-won deals as stalled before the policy SLA", () => {
+    withTempStore((store) => {
+      const fresh = routed();
+      fresh.id = "D-fresh-closed-won";
+      fresh.company = "Fresh Closed Won";
+      store.recordRouted(fresh, 0, { mode: "dry_run", status: "dry_run" });
+      store.recordLocalCommercialState({
+        dealId: fresh.id,
+        commercialState: "closed_won",
+        sourceEventId: "33333333-3333-4333-8333-333333333340",
+        occurredAt: "2026-05-23T11:30:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+
+      expect(
+        store.policyEvaluation(50, undefined, "2026-05-23T12:00:00.000Z")
+          .humanAssistedRisk,
+      ).toEqual([]);
+    });
+  });
+
+  it("backfills older policy signals outside the recent routed candidate set", () => {
+    withTempStore((store, dbPath) => {
+      const oldSignal = routed();
+      oldSignal.id = "D-old-policy-signal";
+      oldSignal.company = "Old Self Serve Expansion";
+      oldSignal.route = {
+        kind: "self_serve",
+        queue: "sales_self_serve",
+        slaHours: 24,
+      };
+      store.recordRouted(oldSignal, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      store.recordLocalCommercialState({
+        dealId: oldSignal.id,
+        commercialState: "closed_won",
+        sourceEventId: "33333333-3333-4333-8333-333333333341",
+        occurredAt: "2026-05-21T12:00:00.000Z",
+        reason: null,
+        expectedRedPath: false,
+      });
+      for (const input of [
+        outcomeInput({
+          dealId: oldSignal.id,
+          sourceEventId: "44444444-4444-4444-8444-444444444411",
+          occurredAt: "2026-05-22T10:00:00.000Z",
+        }),
+        outcomeInput({
+          dealId: oldSignal.id,
+          sourceEventId: "44444444-4444-4444-8444-444444444412",
+          outcome: "deployed",
+          occurredAt: "2026-05-22T11:00:00.000Z",
+        }),
+        outcomeInput({
+          dealId: oldSignal.id,
+          sourceEventId: "44444444-4444-4444-8444-444444444413",
+          outcome: "landed",
+          occurredAt: "2026-05-22T12:00:00.000Z",
+        }),
+        outcomeInput({
+          dealId: oldSignal.id,
+          sourceEventId: "44444444-4444-4444-8444-444444444414",
+          outcome: "expanded",
+          occurredAt: "2026-05-22T13:00:00.000Z",
+          arrDeltaUsd: 30_000,
+          reasonCategory: "scope_expanded",
+        }),
+      ]) {
+        expect(store.recordLocalOutcome(input).status).toBe("recorded");
+      }
+      const db = new DatabaseSync(dbPath);
+      try {
+        db
+          .prepare("UPDATE deals SET updated_at = ? WHERE id = ?")
+          .run("2026-05-20T00:00:00.000Z", oldSignal.id);
+      } finally {
+        db.close();
+      }
+
+      for (let i = 0; i < 101; i += 1) {
+        const filler = routed();
+        filler.id = `D-policy-fill-${String(i).padStart(3, "0")}`;
+        filler.company = `Policy Filler ${i}`;
+        store.recordRouted(filler, 0, {
+          mode: "dry_run",
+          status: "dry_run",
+        });
+      }
+
+      const report = store.policyEvaluation(
+        1,
+        undefined,
+        "2026-05-23T12:00:00.000Z",
+      );
+
+      expect(report.signalBackfillRouted).toBeGreaterThanOrEqual(1);
+      expect(report.selfServeExpanded).toEqual([
+        expect.objectContaining({
+          dealId: oldSignal.id,
+          arrDeltaUsd: 30_000,
+        }),
+      ]);
+    });
+  });
+
   it("exposes persisted readiness state with fact freshness for the dashboard", () => {
     withTempStore((store, dbPath) => {
       const acceptedAt = new Date().toISOString();
@@ -2818,8 +4755,8 @@ describe("Store readiness derivation", () => {
   });
 });
 
-describe("Store Phase 2 migrations", () => {
-  it("migrates idempotency violations to admit outcome scope without losing rows", () => {
+describe("Store idempotency migration", () => {
+  it("migrates idempotency violations to admit newer scopes without losing rows", () => {
     const dir = join(tmpdir(), `gtm-router-outcome-migration-${process.pid}-${Date.now()}`);
     mkdirSync(dir);
     const dbPath = join(dir, "router.db");
@@ -2872,6 +4809,8 @@ describe("Store Phase 2 migrations", () => {
           .get() as { sql: string } | undefined;
         migratedTableSql = row?.sql ?? "";
         expect(migratedTableSql).toContain("'outcome'");
+        expect(migratedTableSql).toContain("'agent_suggestion'");
+        expect(migratedTableSql).toContain("'agent_suggestion_decision'");
       } finally {
         sqlAfterFirstOpen.close();
       }
@@ -2922,6 +4861,30 @@ describe("Store Phase 2 migrations", () => {
              VALUES ('outcome-violation', 'local', 'evt-outcome', 'outcome', 'a', 'b', 'outcome replay', ?)`,
           )
           .run("2026-05-21T00:00:00.000Z");
+        migrated
+          .prepare(
+            `INSERT INTO idempotency_violations (
+               id, source, source_event_id, scope, existing_payload_hash,
+               incoming_payload_hash, reason, created_at
+             )
+             VALUES (
+               'agent-violation', 'local_agent', 'evt-agent',
+               'agent_suggestion', 'a', 'b', 'agent replay', ?
+             )`,
+          )
+          .run("2026-05-21T00:00:00.000Z");
+        migrated
+          .prepare(
+            `INSERT INTO idempotency_violations (
+               id, source, source_event_id, scope, existing_payload_hash,
+               incoming_payload_hash, reason, created_at
+             )
+             VALUES (
+               'agent-decision-violation', 'local_agent', 'evt-agent-decision',
+               'agent_suggestion_decision', 'a', 'b', 'agent decision replay', ?
+             )`,
+          )
+          .run("2026-05-21T00:00:00.000Z");
 
         expect(() =>
           migrated
@@ -2944,6 +4907,41 @@ describe("Store Phase 2 migrations", () => {
 });
 
 describe("Store Phase 2 outcome writes", () => {
+  it("requires canonical UTC ISO timestamps at the store boundary", () => {
+    withTempStore((store) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      expect(() =>
+        store.recordLocalCommercialState({
+          dealId: "D-lease",
+          commercialState: "closed_won",
+          sourceEventId: "22222222-2222-4222-8222-222222222221",
+          occurredAt: "2026-05-21T12:00:00+02:00",
+          reason: null,
+          expectedRedPath: false,
+        }),
+      ).toThrow(/canonical UTC ISO/);
+      expect(() =>
+        store.recordLocalDeploymentFacts({
+          dealId: "D-lease",
+          sourceEventId: "22222222-2222-4222-8222-222222222222",
+          useCaseClear: true,
+          integrationsKnown: true,
+          dataReady: true,
+          operator: "DS",
+          occurredAt: "2026-05-22T12:00:00+02:00",
+        }),
+      ).toThrow(/canonical UTC ISO/);
+      expect(() =>
+        store.recordLocalOutcome(
+          outcomeInput({
+            sourceEventId: "22222222-2222-4222-8222-222222222223",
+            occurredAt: "2026-05-22T12:00:00+02:00",
+          }),
+        ),
+      ).toThrow(/canonical UTC ISO/);
+    });
+  });
+
   it("rejects unknown or not-closed-won deals before claiming an outcome event", () => {
     withTempStore((store, dbPath) => {
       const missing = store.recordLocalOutcome(
@@ -3022,6 +5020,7 @@ describe("Store Phase 2 outcome writes", () => {
         }),
       );
       expect(store.outcomeEvents("D-lease")).toHaveLength(1);
+      expect(store.outcomeEventCount()).toBe(1);
       expect(store.events("D-lease").at(-1)).toEqual(
         expect.objectContaining({
           from: "routed",
@@ -3068,7 +5067,7 @@ describe("Store Phase 2 outcome writes", () => {
         expect.objectContaining({
           status: "idempotency_conflict",
           accepted: false,
-          event: expect.objectContaining({ sourceEventId: input.sourceEventId }),
+          event: null,
           rejection: null,
         }),
       );
@@ -3096,10 +5095,52 @@ describe("Store Phase 2 outcome writes", () => {
     });
   });
 
+  it("surfaces the prior accepted outcome when replayed after commercial correction", () => {
+    withTempStore((store, dbPath) => {
+      closedWonRoutedDeal(store);
+      const input = outcomeInput({
+        sourceEventId: "22222222-2222-4222-8222-222222222233",
+      });
+      expect(store.recordLocalOutcome(input).status).toBe("recorded");
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        db
+          .prepare(
+            `UPDATE commercial_states
+             SET commercial_state = 'closed_lost'
+             WHERE deal_id = ?`,
+          )
+          .run(input.dealId);
+      } finally {
+        db.close();
+      }
+
+      const replay = store.recordLocalOutcome(input);
+      expect(replay).toEqual(
+        expect.objectContaining({
+          status: "not_closed_won",
+          accepted: false,
+          event: expect.objectContaining({
+            sourceEventId: input.sourceEventId,
+            outcome: "deployment_started",
+          }),
+          rejection: null,
+        }),
+      );
+    });
+  });
+
   it("records semantic outcome rejections after claiming the source event", () => {
     withTempStore((store, dbPath) => {
       closedWonRoutedDeal(store);
       const missingPrior = store.recordLocalOutcome(
+        outcomeInput({
+          sourceEventId: "22222222-2222-4222-8222-222222222227",
+          outcome: "deployed",
+        }),
+      );
+      const duplicateMissingPrior = store.recordLocalOutcome(
         outcomeInput({
           sourceEventId: "22222222-2222-4222-8222-222222222227",
           outcome: "deployed",
@@ -3138,6 +5179,17 @@ describe("Store Phase 2 outcome writes", () => {
       );
 
       expect(missingPrior.status).toBe("missing_prior_outcome");
+      expect(duplicateMissingPrior).toEqual(
+        expect.objectContaining({
+          status: "duplicate",
+          accepted: false,
+          event: null,
+          rejection: expect.objectContaining({
+            sourceEventId: "22222222-2222-4222-8222-222222222227",
+            rejectionKind: "missing_prior_outcome",
+          }),
+        }),
+      );
       expect(invalidArr.status).toBe("invalid_arr_delta");
       expect(started.status).toBe("recorded");
       expect(duplicateSemantic.status).toBe("duplicate_semantic_outcome");
@@ -3243,6 +5295,27 @@ describe("Store Phase 2 outcome writes", () => {
              WHERE deal_id = ?`,
           )
           .run("2026-05-26T12:00:00.000Z", "D-lease");
+        db
+          .prepare(
+            `INSERT INTO events (deal_id, ts, from_st, to_st, detail, meta)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            "D-lease",
+            "2026-05-20T12:00:00.000Z",
+            "routed",
+            "routed",
+            "commercial state changed: closed_won",
+            JSON.stringify({
+              kind: "commercial_state",
+              source: "local",
+              eventKey: "manual-earlier-projected-close",
+              sourceEventId: "22222222-2222-4222-8222-222222222299",
+              commercialState: "closed_won",
+              occurredAt: "2026-05-20T14:00:00+02:00",
+              projected: true,
+            }),
+          );
       } finally {
         db.close();
       }
@@ -3283,7 +5356,7 @@ describe("Store Phase 2 outcome writes", () => {
           outcomeChurnBeforeDeploy: 0,
           outcomeCommercialStateConflicts: 0,
           outcomeInvalidHistories: 0,
-          medianTimeClosedWonToDeployedHours: 48,
+          medianTimeClosedWonToDeployedHours: 72,
           medianTimeDeployedToLandedHours: 12,
         }),
       );
@@ -3389,10 +5462,429 @@ describe("Store Phase 2 outcome writes", () => {
           outcomeChurnBeforeDeploy: 1,
           outcomeCommercialStateConflicts: 1,
           outcomeInvalidHistories: 4,
-          medianTimeClosedWonToDeployedHours: 0,
-          medianTimeDeployedToLandedHours: 0,
+          medianTimeClosedWonToDeployedHours: null,
+          medianTimeDeployedToLandedHours: null,
         }),
       );
+    });
+  });
+});
+
+describe("Store Phase 5 agent suggestion ledger", () => {
+  it("separates missing and non-routed deals before claiming suggestion source events", () => {
+    withTempStore((store, dbPath) => {
+      const missing = store.recordLocalAgentSuggestion(
+        agentSuggestionInput({
+          dealId: "missing",
+          sourceEventId: "33333333-3333-4333-8333-333333333334",
+        }),
+      );
+      store.recordQuarantine(
+        {
+          dealId: "D-quarantined",
+          stage: "enriched",
+          code: "insufficient_data",
+          reason: "not enough data to route",
+          at: "2026-05-22T12:00:00.000Z",
+        },
+        0,
+        "enriched",
+        "insufficient data",
+      );
+      const nonRouted = store.recordLocalAgentSuggestion(
+        agentSuggestionInput({
+          dealId: "D-quarantined",
+          sourceEventId: "33333333-3333-4333-8333-333333333337",
+        }),
+      );
+
+      expect(missing).toEqual(
+        expect.objectContaining({
+          status: "not_found",
+          suggestion: null,
+        }),
+      );
+      expect(nonRouted).toEqual(
+        expect.objectContaining({
+          status: "not_routed",
+          suggestion: null,
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionEventKey("33333333-3333-4333-8333-333333333334"),
+        ),
+      ).toBeUndefined();
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionEventKey("33333333-3333-4333-8333-333333333337"),
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  it("records proposed suggestions, replays, conflicts, and human decisions", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const input = agentSuggestionInput({
+        sourceEventId: "33333333-3333-4333-8333-333333333335",
+      });
+
+      const proposed = store.recordLocalAgentSuggestion(input);
+
+      expect(proposed).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          eventKey: agentSuggestionEventKey(input.sourceEventId),
+          suggestion: expect.objectContaining({
+            dealId: "D-lease",
+            kind: "handoff_summary",
+            status: "proposed",
+            title: "Draft AE handoff",
+            source: "local_agent",
+            sourceEventId: input.sourceEventId,
+            decidedAt: null,
+            decidedBy: null,
+          }),
+        }),
+      );
+      const suggestionId = proposed.suggestion?.id ?? "";
+      expect(suggestionId).not.toBe("");
+      expect(readExternalEventKey(dbPath, agentSuggestionEventKey(input.sourceEventId))).toEqual(
+        expect.objectContaining({
+          notify_status: "ok",
+          scope: "source_event",
+        }),
+      );
+      expect(store.agentSuggestions()).toEqual([
+        expect.objectContaining({
+          id: suggestionId,
+          status: "proposed",
+        }),
+      ]);
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "agent_suggestion_proposed",
+          meta: expect.objectContaining({
+            kind: "agent_suggestion_proposed",
+            source: "local_agent",
+            suggestionId,
+          }),
+        }),
+      );
+
+      const duplicate = store.recordLocalAgentSuggestion(input);
+      expect(duplicate).toEqual(
+        expect.objectContaining({
+          status: "duplicate",
+          suggestion: expect.objectContaining({ id: suggestionId }),
+        }),
+      );
+      store.recordQuarantine(
+        {
+          dealId: "D-lease",
+          stage: "routed",
+          code: "sink_terminal",
+          reason: "simulate a later non-routed terminal state",
+          at: "2026-05-22T13:01:00.000Z",
+        },
+        0,
+        "routed",
+        "simulate stage exit after suggestion",
+      );
+      const duplicateAfterStageChange = store.recordLocalAgentSuggestion(input);
+      expect(duplicateAfterStageChange).toEqual(
+        expect.objectContaining({
+          status: "duplicate",
+          suggestion: expect.objectContaining({ id: suggestionId }),
+        }),
+      );
+
+      const conflict = store.recordLocalAgentSuggestion({
+        ...input,
+        title: "Different suggestion under same source event",
+      });
+      expect(conflict).toEqual(
+        expect.objectContaining({
+          status: "idempotency_conflict",
+          suggestion: null,
+        }),
+      );
+
+      const decisionInput = agentSuggestionDecisionInput(suggestionId, {
+        sourceEventId: "44444444-4444-4444-8444-444444444445",
+      });
+      const accepted = store.recordLocalAgentSuggestionDecision(decisionInput);
+      expect(accepted).toEqual(
+        expect.objectContaining({
+          status: "recorded",
+          eventKey: agentSuggestionDecisionEventKey(decisionInput.sourceEventId),
+          suggestion: expect.objectContaining({
+            id: suggestionId,
+            status: "accepted",
+            decidedAt: "2026-05-22T13:05:00.000Z",
+            decidedBy: "ops@example.com",
+            decisionSourceEventId: decisionInput.sourceEventId,
+            decisionReason: "Handoff is accurate and ready for the AE.",
+          }),
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionDecisionEventKey(decisionInput.sourceEventId),
+        ),
+      ).toEqual(expect.objectContaining({ scope: "source_event" }));
+      expect(store.events("D-lease").at(-1)).toEqual(
+        expect.objectContaining({
+          detail: "agent_suggestion_decided",
+          meta: expect.objectContaining({
+            kind: "agent_suggestion_decided",
+            source: "local_agent",
+            suggestionId,
+            decision: "accepted",
+            humanPrincipal: "ops@example.com",
+          }),
+        }),
+      );
+
+      const duplicateDecision =
+        store.recordLocalAgentSuggestionDecision(decisionInput);
+      expect(duplicateDecision).toEqual(
+        expect.objectContaining({
+          status: "duplicate",
+          suggestion: expect.objectContaining({
+            id: suggestionId,
+            status: "accepted",
+          }),
+        }),
+      );
+      const laterDecision = store.recordLocalAgentSuggestionDecision(
+        agentSuggestionDecisionInput(suggestionId, {
+          sourceEventId: "44444444-4444-4444-8444-444444444446",
+          decision: "rejected",
+          reason: "Changed mind after acceptance.",
+        }),
+      );
+      expect(laterDecision).toEqual(
+        expect.objectContaining({
+          status: "already_decided",
+          suggestion: expect.objectContaining({
+            id: suggestionId,
+            status: "accepted",
+          }),
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionDecisionEventKey(
+            "44444444-4444-4444-8444-444444444446",
+          ),
+        ),
+      ).toBeUndefined();
+      const mutatedLaterDecision = store.recordLocalAgentSuggestionDecision(
+        agentSuggestionDecisionInput(suggestionId, {
+          sourceEventId: "44444444-4444-4444-8444-444444444446",
+          decision: "rejected",
+          reason: "Mutated replay after the suggestion was already decided.",
+        }),
+      );
+      expect(mutatedLaterDecision).toEqual(
+        expect.objectContaining({
+          status: "already_decided",
+          suggestion: expect.objectContaining({
+            id: suggestionId,
+            status: "accepted",
+          }),
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionDecisionEventKey(
+            "44444444-4444-4444-8444-444444444446",
+          ),
+        ),
+      ).toBeUndefined();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const violations = db
+          .prepare(
+            `SELECT scope, source
+             FROM idempotency_violations
+             ORDER BY created_at`,
+          )
+          .all() as Array<{ scope: string; source: string }>;
+        expect(violations).toEqual([
+          { scope: "agent_suggestion", source: "local_agent" },
+        ]);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  it("rejects decisions for missing suggestions before claiming the source event", () => {
+    withTempStore((store, dbPath) => {
+      const sourceEventId = "44444444-4444-4444-8444-444444444448";
+
+      const result = store.recordLocalAgentSuggestionDecision(
+        agentSuggestionDecisionInput("S-missing", { sourceEventId }),
+      );
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: "not_found",
+          suggestion: null,
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionDecisionEventKey(sourceEventId),
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  it("rejects decisions that predate proposals before claiming the source event", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const proposed = store.recordLocalAgentSuggestion(
+        agentSuggestionInput({
+          sourceEventId: "33333333-3333-4333-8333-333333333338",
+          occurredAt: "2026-05-22T13:00:00.000Z",
+        }),
+      );
+      const suggestionId = proposed.suggestion?.id ?? "";
+      const sourceEventId = "44444444-4444-4444-8444-444444444449";
+
+      const result = store.recordLocalAgentSuggestionDecision(
+        agentSuggestionDecisionInput(suggestionId, {
+          sourceEventId,
+          occurredAt: "2026-05-22T12:59:59.000Z",
+        }),
+      );
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: "decision_before_proposal",
+          suggestion: expect.objectContaining({
+            id: suggestionId,
+            status: "proposed",
+            decidedAt: null,
+          }),
+        }),
+      );
+      expect(
+        readExternalEventKey(
+          dbPath,
+          agentSuggestionDecisionEventKey(sourceEventId),
+        ),
+      ).toBeUndefined();
+      expect(store.agentSuggestions()).toEqual([
+        expect.objectContaining({
+          id: suggestionId,
+          status: "proposed",
+          decidedAt: null,
+        }),
+      ]);
+    });
+  });
+
+  it("keeps recently decided suggestions visible when proposals hit the cap", () => {
+    withTempStore((store) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const accepted = store.recordLocalAgentSuggestion(
+        agentSuggestionInput({
+          sourceEventId: "33333333-3333-4333-8333-333333333339",
+          title: "Accepted handoff",
+        }),
+      );
+      const acceptedId = accepted.suggestion?.id ?? "";
+      store.recordLocalAgentSuggestionDecision(
+        agentSuggestionDecisionInput(acceptedId, {
+          sourceEventId: "44444444-4444-4444-8444-444444444450",
+        }),
+      );
+
+      for (const sourceEventId of [
+        "33333333-3333-4333-8333-333333333340",
+        "33333333-3333-4333-8333-333333333341",
+        "33333333-3333-4333-8333-333333333342",
+      ]) {
+        store.recordLocalAgentSuggestion(
+          agentSuggestionInput({
+            sourceEventId,
+            title: `Proposal ${sourceEventId.slice(-3)}`,
+          }),
+        );
+      }
+
+      const rows = store.agentSuggestions(2);
+
+      expect(rows).toHaveLength(2);
+      expect(
+        rows.some((row) => row.id === acceptedId && row.status === "accepted"),
+      ).toBe(true);
+      expect(rows.some((row) => row.status === "proposed")).toBe(true);
+
+      expect(store.agentSuggestions(4).map((row) => row.status)).toEqual([
+        "proposed",
+        "proposed",
+        "proposed",
+        "accepted",
+      ]);
+    });
+  });
+
+  it("dedupes and conflicts decision source event replays before lifecycle checks", () => {
+    withTempStore((store, dbPath) => {
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const proposed = store.recordLocalAgentSuggestion(
+        agentSuggestionInput({
+          sourceEventId: "33333333-3333-4333-8333-333333333336",
+        }),
+      );
+      const suggestionId = proposed.suggestion?.id ?? "";
+      const decisionInput = agentSuggestionDecisionInput(suggestionId, {
+        sourceEventId: "44444444-4444-4444-8444-444444444447",
+      });
+      expect(store.recordLocalAgentSuggestionDecision(decisionInput).status).toBe(
+        "recorded",
+      );
+
+      const conflict = store.recordLocalAgentSuggestionDecision({
+        ...decisionInput,
+        reason: "Different decision reason under the same source event.",
+      });
+      expect(conflict).toEqual(
+        expect.objectContaining({
+          status: "idempotency_conflict",
+          suggestion: null,
+        }),
+      );
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const violation = db
+          .prepare(
+            `SELECT scope, source_event_id
+             FROM idempotency_violations
+             WHERE scope = 'agent_suggestion_decision'`,
+          )
+          .get() as { scope: string; source_event_id: string } | undefined;
+        expect(violation).toEqual({
+          scope: "agent_suggestion_decision",
+          source_event_id: decisionInput.sourceEventId,
+        });
+      } finally {
+        db.close();
+      }
     });
   });
 });

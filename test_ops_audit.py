@@ -168,6 +168,16 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(r.invariant_ok)
         self.assertFalse(r.ok)
 
+    def test_unknown_route_kind_breaks_invariant(self):
+        conn = make_db([
+            _routed("a", "unknown", 1000, 1),
+        ])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertNotIn("unknown", r.arr_by_route)
+        self.assertFalse(r.invariant_ok)
+        self.assertTrue(any("unknown_route_kind" in b for b in r.breaches))
+
     def test_latency_slo_breach_fails(self):
         conn = make_db([_routed("a", "self_serve", 1000, 9000)])
         r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
@@ -181,7 +191,7 @@ class AuditTest(unittest.TestCase):
                 _commercial("a", "closed_won", "2026-05-26T12:00:00.000Z")
             ],
             event_rows=[
-                _commercial_event("a", "2026-05-21T12:00:00.000Z")
+                _commercial_event("a", "2026-05-21T14:00:00+02:00")
             ],
             outcome_rows=[
                 _outcome("o1", "a", "deployment_started", "2026-05-22T12:00:00.000Z"),
@@ -236,8 +246,8 @@ class AuditTest(unittest.TestCase):
         r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
         self.assertFalse(r.ok)
         self.assertEqual(r.outcome_invalid_histories, 3)
-        self.assertEqual(r.median_time_closed_won_to_deployed_hours, 0)
-        self.assertEqual(r.median_time_deployed_to_landed_hours, 0)
+        self.assertIsNone(r.median_time_closed_won_to_deployed_hours)
+        self.assertIsNone(r.median_time_deployed_to_landed_hours)
         self.assertTrue(any("outcomeInvalidHistories" in b for b in r.breaches))
 
     def test_churn_before_deploy_is_warning_not_failure(self):
@@ -254,6 +264,16 @@ class AuditTest(unittest.TestCase):
         r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)
         self.assertTrue(r.ok)
         self.assertEqual(r.outcome_churn_before_deploy, 1)
+
+
+class RenderTest(unittest.TestCase):
+    def test_hours_match_dashboard_precision(self):
+        r = ops_audit.AuditReport()
+        r.median_time_closed_won_to_deployed_hours = 1.235
+        r.median_time_deployed_to_landed_hours = 0.005
+        rendered = ops_audit.render(r)
+        self.assertIn("won-to-deployed med 1.24h", rendered)
+        self.assertIn("deployed-to-landed  <0.01h", rendered)
 
 
 class MainExitCodeTest(unittest.TestCase):

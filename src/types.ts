@@ -386,6 +386,158 @@ export interface LocalOutcomeWriteResult {
   rejection: OutcomeRejectionRecord | null;
 }
 
+export const AGENT_SUGGESTION_KINDS = [
+  "handoff_summary",
+  "missing_field_question",
+  "stale_deal_nudge",
+  "policy_change_recommendation",
+] as const;
+export const AgentSuggestionKind = z.enum(AGENT_SUGGESTION_KINDS);
+export type AgentSuggestionKind = z.infer<typeof AgentSuggestionKind>;
+
+export const AGENT_SUGGESTION_STATUSES = [
+  "proposed",
+  "accepted",
+  "rejected",
+] as const;
+export const AgentSuggestionStatus = z.enum(AGENT_SUGGESTION_STATUSES);
+export type AgentSuggestionStatus = z.infer<typeof AgentSuggestionStatus>;
+
+export const AGENT_SUGGESTION_DECISIONS = [
+  "accepted",
+  "rejected",
+] as const satisfies readonly Exclude<AgentSuggestionStatus, "proposed">[];
+export const AgentSuggestionDecision = z.enum(AGENT_SUGGESTION_DECISIONS);
+export type AgentSuggestionDecision = z.infer<typeof AgentSuggestionDecision>;
+
+export type AgentSuggestionSource = "local_agent";
+
+export interface LocalAgentSuggestionInput {
+  dealId: string;
+  sourceEventId: string;
+  kind: AgentSuggestionKind;
+  title: string;
+  body: string;
+  rationale: string;
+  createdBy: string;
+  occurredAt: string;
+}
+
+export interface LocalAgentSuggestionDecisionInput {
+  suggestionId: string;
+  sourceEventId: string;
+  decision: AgentSuggestionDecision;
+  humanPrincipal: string;
+  reason: string;
+  occurredAt: string;
+}
+
+export interface AgentSuggestionRecord {
+  id: string;
+  dealId: string;
+  kind: AgentSuggestionKind;
+  status: AgentSuggestionStatus;
+  title: string;
+  body: string;
+  rationale: string;
+  source: AgentSuggestionSource;
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  createdBy: string;
+  occurredAt: string;
+  createdAt: string;
+  decidedAt: string | null;
+  decidedBy: string | null;
+  decisionSourceEventId: string | null;
+  decisionPayloadHash: string | null;
+  decisionReason: string | null;
+}
+
+export const LOCAL_AGENT_SUGGESTION_WRITE_STATUSES = [
+  "recorded",
+  "duplicate",
+  "idempotency_conflict",
+  "not_found",
+  "not_routed",
+] as const;
+export const LocalAgentSuggestionWriteStatus = z.enum(
+  LOCAL_AGENT_SUGGESTION_WRITE_STATUSES,
+);
+export type LocalAgentSuggestionWriteStatus = z.infer<
+  typeof LocalAgentSuggestionWriteStatus
+>;
+
+export interface LocalAgentSuggestionWriteResult {
+  status: LocalAgentSuggestionWriteStatus;
+  eventKey: string;
+  suggestion: AgentSuggestionRecord | null;
+}
+
+export const AgentSuggestionWriteStatusCounts = z.object(
+  Object.fromEntries(
+    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [
+      status,
+      z.number().int().nonnegative().optional().default(0),
+    ]),
+  ) as Record<
+    LocalAgentSuggestionWriteStatus,
+    z.ZodDefault<z.ZodOptional<z.ZodNumber>>
+  >,
+);
+export type AgentSuggestionWriteStatusCounts = z.infer<
+  typeof AgentSuggestionWriteStatusCounts
+>;
+
+export type LocalAgentSuggestionDecisionStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "already_decided"
+  | "decision_before_proposal";
+
+export interface LocalAgentSuggestionDecisionResult {
+  status: LocalAgentSuggestionDecisionStatus;
+  eventKey: string;
+  suggestion: AgentSuggestionRecord | null;
+}
+
+export interface PolicyRecommendationRunInput {
+  createdBy: string;
+  evaluatedAt: string;
+  limit?: number;
+}
+
+export const AGENT_SUGGESTION_RUN_STATUSES = [
+  "recorded",
+  "duplicate",
+  "idempotency_conflict",
+  "all_skipped",
+  "no_signals",
+] as const;
+// Stored in policy_recommendation_runs.status; values are stable across the
+// policy-specific to agent-wide naming change.
+export const AgentSuggestionRunStatus = z.enum(AGENT_SUGGESTION_RUN_STATUSES);
+export type AgentSuggestionRunStatus = z.infer<typeof AgentSuggestionRunStatus>;
+
+export interface PolicyRecommendationRunResult {
+  id: string;
+  status: AgentSuggestionRunStatus;
+  createdBy: string;
+  limit: number;
+  evaluatedAt: string;
+  createdAt: string;
+  attempted: number;
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+  statusCounts: AgentSuggestionWriteStatusCounts;
+  results: PolicyRecommendationDraftResult[];
+}
+
+export type PolicyRecommendationRunRecord = PolicyRecommendationRunResult;
+
 export type Stage =
   | "intake"
   | "enriched"
@@ -443,6 +595,93 @@ export interface Enrichment {
 }
 export type EnrichedDeal = Deal & { enrichment: Enrichment };
 
+// -- Provider evidence ------------------------------------------------------
+export const PROVIDER_OBSERVATION_SUBJECT_TYPES = [
+  "company",
+] as const;
+export const ProviderObservationSubjectType = z.enum(
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+);
+export type ProviderObservationSubjectType = z.infer<
+  typeof ProviderObservationSubjectType
+>;
+
+export const PROVIDER_OBSERVATION_PROVIDERS = [
+  "fixture",
+  "manual",
+  "website",
+  "hubspot",
+  "apollo",
+  "clearbit",
+  "clay",
+  "warehouse",
+  "csv",
+  "agent",
+] as const;
+export const ProviderObservationProvider = z.enum(
+  PROVIDER_OBSERVATION_PROVIDERS,
+);
+export type ProviderObservationProvider = z.infer<
+  typeof ProviderObservationProvider
+>;
+
+export const ENRICHED_FACT_FRESHNESS_STATUSES = ["fresh", "stale"] as const;
+export const EnrichedFactFreshnessStatus = z.enum(
+  ENRICHED_FACT_FRESHNESS_STATUSES,
+);
+export type EnrichedFactFreshnessStatus = z.infer<
+  typeof EnrichedFactFreshnessStatus
+>;
+
+export interface ProviderObservationInput {
+  subjectType: ProviderObservationSubjectType;
+  subjectKey: string;
+  provider: ProviderObservationProvider;
+  sourceEventId: string;
+  observedAt: string;
+  expiresAt: string | null;
+  confidence: number;
+  /** Provider-native payload when available; generated fixture observations use the normalized fixture payload. */
+  rawPayload: unknown;
+  normalizedPayload: Enrichment;
+  /**
+   * Content-addressed generated observations can use duplicates as fresh
+   * provider reconfirmations. Provider-supplied upstream event ids should leave
+   * this false so replay does not mutate the original observed_at.
+   */
+  refreshOnDuplicate?: boolean;
+}
+
+export interface ProviderObservationRecord extends ProviderObservationInput {
+  id: string;
+  sourcePayloadHash: string;
+  createdAt: string;
+}
+
+export type ProviderObservationWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "refreshed"
+  | "idempotency_conflict";
+
+export interface ProviderObservationWriteResult {
+  status: ProviderObservationWriteStatus;
+  observation: ProviderObservationRecord | null;
+  facts: EnrichedSubjectFacts | null;
+}
+
+/** Current projection is intentionally company-only; contact/deal observations stay ledger-only for now. */
+export interface EnrichedSubjectFacts extends Enrichment {
+  subjectType: "company";
+  subjectKey: string;
+  sourceProvider: ProviderObservationProvider;
+  sourceObservationId: string;
+  observedAt: string;
+  expiresAt: string | null;
+  freshnessStatus: EnrichedFactFreshnessStatus;
+  updatedAt: string;
+}
+
 // ── Scoring: deterministic and auditable (a reviewer can recompute it) ───────
 export interface ScoreBreakdown {
   icpFit: number; // 0..1
@@ -465,6 +704,232 @@ export type Route =
       legalFlag: "regulated_review" | null;
       slaHours: number;
     };
+
+export const ROLE_QUEUE_KINDS = [
+  "ae_attention",
+  "finance_review",
+  "legal_review",
+  "deployment_readiness",
+  "growth_attribution",
+] as const;
+export type RoleQueueKind = (typeof ROLE_QUEUE_KINDS)[number];
+// Action queues currently use high/medium; low is reserved for passive
+// attribution views such as growth_attribution.
+export type RoleQueuePriority = "high" | "medium" | "low";
+export type RoleQueueStatus =
+  | CommercialState
+  | DeploymentReadiness
+  | "no_commercial_state";
+
+export interface RoleQueueItem {
+  queue: RoleQueueKind;
+  dealId: string;
+  company: string;
+  amount: number;
+  routeKind: Route["kind"];
+  sourceChannel: SourceChannel;
+  salesOwner: string | null;
+  priority: RoleQueuePriority;
+  reason: string;
+  status: RoleQueueStatus;
+  updatedAt: string;
+}
+
+export type RoleQueues = Record<RoleQueueKind, RoleQueueItem[]>;
+
+export const WORK_ITEM_STATUSES = [
+  "assigned",
+  "resolved",
+  "waived",
+] as const;
+export const WorkItemStatus = z.enum(WORK_ITEM_STATUSES);
+export type WorkItemStatus = z.infer<typeof WorkItemStatus>;
+
+export const WORK_ITEM_ACTIONS = ["assign", "resolve", "waive"] as const;
+export const WorkItemAction = z.enum(WORK_ITEM_ACTIONS);
+export type WorkItemAction = z.infer<typeof WorkItemAction>;
+
+export type WorkItemSourceKind = "role_queue";
+
+export interface WorkItemRecord {
+  id: string;
+  sourceKind: WorkItemSourceKind;
+  sourceKey: string;
+  dealId: string;
+  queue: RoleQueueKind;
+  status: WorkItemStatus;
+  /** Opening-time queue priority; not live queue priority. */
+  priority: RoleQueuePriority;
+  owner: string;
+  title: string;
+  /** Opening-time queue context for operator display; not live queue state. */
+  description: string;
+  dueAt: string | null;
+  /** Stable local-agent source id used to dedupe one draft per work item. */
+  agentSuggestionSourceEventId: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  resolutionReason: string | null;
+}
+
+export interface LocalWorkItemInput {
+  dealId: string;
+  queue: RoleQueueKind;
+  sourceEventId: string;
+  owner: string;
+  createdBy: string;
+  occurredAt: string;
+  dueAt?: string;
+  reason?: string;
+}
+
+export interface LocalWorkItemActionInput {
+  workItemId: string;
+  sourceEventId: string;
+  action: WorkItemAction;
+  humanPrincipal: string;
+  occurredAt: string;
+  owner?: string;
+  reason: string;
+}
+
+export type LocalWorkItemWriteStatus =
+  | "recorded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "already_exists";
+
+export interface LocalWorkItemWriteResult {
+  status: LocalWorkItemWriteStatus;
+  eventKey: string;
+  workItem: WorkItemRecord | null;
+}
+
+export type LocalWorkItemActionStatus =
+  | "recorded"
+  | "superseded"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "not_found"
+  | "already_closed"
+  | "invalid_action";
+
+export interface LocalWorkItemActionResult {
+  status: LocalWorkItemActionStatus;
+  eventKey: string;
+  workItem: WorkItemRecord | null;
+}
+
+export interface WorkItemSuggestionRunInput {
+  createdBy: string;
+  evaluatedAt: string;
+  limit?: number;
+}
+
+export const WorkItemSuggestionDraftResult = z.object({
+  workItemId: z.string(),
+  dealId: z.string(),
+  queue: z.enum(ROLE_QUEUE_KINDS),
+  sourceEventId: z.string(),
+  status: LocalAgentSuggestionWriteStatus,
+  suggestionId: z.string().nullable(),
+  title: z.string(),
+});
+export type WorkItemSuggestionDraftResult = z.infer<
+  typeof WorkItemSuggestionDraftResult
+>;
+
+// Work-item draft runs are intentionally ephemeral; the audit trail is the
+// proposed agent_suggestions rows keyed back to stable work item source ids.
+export interface WorkItemSuggestionRunResult {
+  status: AgentSuggestionRunStatus;
+  createdBy: string;
+  limit: number;
+  evaluatedAt: string;
+  attempted: number;
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+  statusCounts: AgentSuggestionWriteStatusCounts;
+  results: WorkItemSuggestionDraftResult[];
+}
+
+export const POLICY_EVALUATION_SIGNALS = [
+  "self_serve_expanded",
+  "human_assisted_churned",
+  "human_assisted_stalled",
+  "human_assisted_ready_not_started",
+] as const;
+export const PolicyEvaluationSignal = z.enum(POLICY_EVALUATION_SIGNALS);
+export type PolicyEvaluationSignal = z.infer<typeof PolicyEvaluationSignal>;
+
+export const PolicyRecommendationDraftResult = z.object({
+  dealId: z.string(),
+  signal: PolicyEvaluationSignal,
+  sourceEventId: z.string(),
+  status: LocalAgentSuggestionWriteStatus,
+  suggestionId: z.string().nullable(),
+  title: z.string(),
+});
+export type PolicyRecommendationDraftResult = z.infer<
+  typeof PolicyRecommendationDraftResult
+>;
+
+export interface PolicyEvaluationDeal {
+  dealId: string;
+  company: string;
+  amount: number;
+  routeKind: Route["kind"];
+  sourceChannel: SourceChannel;
+  salesOwner: string | null;
+  signal: PolicyEvaluationSignal;
+  signalObservedAt: string;
+  reason: string;
+  lastOutcomeAt: string | null;
+  arrDeltaUsd: number | null;
+}
+
+export interface SourceChannelPolicySummary {
+  sourceChannel: SourceChannel;
+  routed: number;
+  closedWon: number;
+  deploymentStarted: number;
+  deployed: number;
+  landed: number;
+  expanded: number;
+  churned: number;
+  expandedArrDeltaUsd: number;
+}
+
+export type PolicyFlag = "pricing_approval" | "regulated_review";
+
+export interface FlagPolicySummary {
+  flag: PolicyFlag;
+  routed: number;
+  closedWon: number;
+  deploymentStarted: number;
+  deployed: number;
+  landed: number;
+  expanded: number;
+  churned: number;
+  expandedArrDeltaUsd: number;
+}
+
+export interface PolicyEvaluationReports {
+  candidateRouted: number;
+  candidateLimit: number;
+  signalBackfillRouted: number;
+  signalBackfillLimitPerSignal: number;
+  selfServeExpanded: PolicyEvaluationDeal[];
+  humanAssistedRisk: PolicyEvaluationDeal[];
+  sourceChannels: SourceChannelPolicySummary[];
+  flags: FlagPolicySummary[];
+}
+
 export type RoutedDeal = ScoredDeal & { route: Route };
 
 // ── Failure is typed, never silent ──────────────────────────────────────────
@@ -655,6 +1120,27 @@ export type PipelineEventMeta =
         }
     ))
   | {
+      kind: "agent_suggestion_proposed";
+      source: AgentSuggestionSource;
+      eventKey: string;
+      sourceEventId: string;
+      suggestionId: string;
+      suggestionKind: AgentSuggestionKind;
+      createdBy: string;
+      occurredAt: string;
+    }
+  | {
+      kind: "agent_suggestion_decided";
+      source: AgentSuggestionSource;
+      eventKey: string;
+      sourceEventId: string;
+      suggestionId: string;
+      decision: AgentSuggestionDecision;
+      humanPrincipal: string;
+      occurredAt: string;
+      reason: string;
+    }
+  | {
       kind: "deployment_handoff_failed";
       mode: "dry_run" | "live";
       fingerprint: string;
@@ -722,7 +1208,9 @@ export interface Metrics {
   churnedDeals: number;
   outcomeChurnBeforeDeploy: number;
   outcomeCommercialStateConflicts: number;
+  // Invalid accepted outcome rows; UI surfaces this as "Invalid Events".
   outcomeInvalidHistories: number;
-  medianTimeClosedWonToDeployedHours: number;
-  medianTimeDeployedToLandedHours: number;
+  // Null means there is no valid sample yet; callers should render "n/a".
+  medianTimeClosedWonToDeployedHours: number | null;
+  medianTimeDeployedToLandedHours: number | null;
 }

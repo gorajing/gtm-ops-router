@@ -16,6 +16,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync as DatabaseSyncT } from "node:sqlite";
 import {
   DEPLOYMENT_FACT_MAX_AGE_DAYS,
+  ENRICHMENT_FACT_MAX_AGE_DAYS,
+  ENRICHMENT_FACT_MIN_CONFIDENCE,
   FALLBACK_NOTIFICATION_MAX_ATTEMPTS,
   FALLBACK_NOTIFICATION_LEASE_MS,
   READINESS_NOTIFICATION_MAX_ATTEMPTS,
@@ -26,9 +28,29 @@ import {
   TERMINAL_DRIFT_NOTIFICATION_MAX_ATTEMPTS,
   TERMINAL_TIE_WINDOW_MS,
 } from "./constants.js";
+import { enrichmentSubjectKey } from "./enrich.js";
 import type { IntegrationConfigBundle } from "./integrations.js";
 import {
+  AGENT_SUGGESTION_KINDS,
+  AGENT_SUGGESTION_STATUSES,
+  LOCAL_AGENT_SUGGESTION_WRITE_STATUSES,
+  AgentSuggestionKind,
+  AgentSuggestionStatus,
   DEPLOYMENT_BLOCKERS,
+  ROLE_QUEUE_KINDS,
+  WorkItemStatus,
+  PROVIDER_OBSERVATION_PROVIDERS,
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+  ProviderObservationProvider,
+  ProviderObservationSubjectType,
+  SOURCE_CHANNELS,
+  type Deal,
+  type Enrichment,
+  type EnrichedSubjectFacts,
+  type AgentSuggestionDecision,
+  type AgentSuggestionRecord,
+  type AgentSuggestionRunStatus,
+  AgentSuggestionWriteStatusCounts,
   type CommercialTerminalDriftAlertClaim,
   type CommercialTerminalDriftAlertDeliveryResult,
   type CommercialTerminalDriftAlertRetryCandidate,
@@ -45,6 +67,10 @@ import {
   type LocalCommercialStateWriteResult,
   type LocalDeploymentFactsInput,
   type LocalDeploymentFactsWriteResult,
+  type LocalAgentSuggestionDecisionInput,
+  type LocalAgentSuggestionDecisionResult,
+  type LocalAgentSuggestionInput,
+  type LocalAgentSuggestionWriteResult,
   type LocalOutcomeInput,
   type LocalOutcomeWriteResult,
   type Metrics,
@@ -54,6 +80,19 @@ import {
   type OutcomeState,
   type PipelineEvent,
   type PipelineEventMeta,
+  type PolicyEvaluationDeal,
+  type PolicyEvaluationReports,
+  type PolicyFlag,
+  PolicyRecommendationDraftResult as PolicyRecommendationDraftResultSchema,
+  type PolicyRecommendationRunRecord,
+  type PolicyRecommendationRunInput,
+  type PolicyRecommendationRunResult,
+  AgentSuggestionRunStatus as AgentSuggestionRunStatusSchema,
+  type ProviderObservationInput,
+  type ProviderObservationRecord,
+  type ProviderObservationWriteResult,
+  type SourceChannelPolicySummary,
+  type FlagPolicySummary,
   type PreviousDeploymentReadiness,
   type Quarantine,
   type QuarantineCode,
@@ -63,8 +102,21 @@ import {
   type ReadinessNotificationClaim,
   type ReadinessNotificationDeliveryResult,
   type ReadinessNotificationRecordStatus,
+  type LocalWorkItemActionInput,
+  type LocalWorkItemActionResult,
+  type LocalWorkItemInput,
+  type LocalWorkItemWriteResult,
+  type RoleQueueItem,
+  type RoleQueueKind,
+  type RoleQueuePriority,
+  type RoleQueues,
+  type RoleQueueStatus,
   type RoutedDeal,
   type Stage,
+  type WorkItemRecord,
+  type WorkItemSuggestionRunInput,
+  type WorkItemSuggestionRunResult,
+  type WorkItemStatus as WorkItemStatusType,
 } from "./types.js";
 
 // Load the experimental built-in SQLite via createRequire. `node:sqlite`
@@ -84,6 +136,13 @@ const QUARANTINE_CODES: QuarantineCode[] = [
   "sink_terminal",
   "sink_exhausted",
 ];
+const PIPELINE_STAGES = [
+  "intake",
+  "enriched",
+  "scored",
+  "routed",
+  "quarantined",
+] as const satisfies readonly Stage[];
 
 // Stage-change Slack posts are single-attempt and bounded by the shared webhook
 // fetch cap in constants.ts. notify_leases counts lease acquisitions, not only
@@ -94,8 +153,39 @@ const MAX_EVENT_TAIL = 1000;
 const LOCAL_COMMERCIAL_SOURCE = "local";
 const LOCAL_DEPLOYMENT_FACTS_SOURCE = "local";
 const LOCAL_OUTCOME_SOURCE = "local";
+const LOCAL_AGENT_SUGGESTION_SOURCE = "local_agent";
 const SELF_REPORTED_OPERATOR_SOURCE = "self_reported";
+const PROVIDER_OBSERVATION_ID_PREFIX = "PO";
 const DAY_MS = 86_400_000;
+const CANONICAL_ISO_UTC =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+// Stay below SQLite builds with the older 999-parameter ceiling.
+const SQL_PARAMETER_BUDGET = 900;
+// Dashboard/read-model backfills use the same conservative window so each
+// follow-up IN query remains within the SQL parameter budget.
+const ROLE_QUEUE_MAX_SCAN = SQL_PARAMETER_BUDGET;
+const ROLE_QUEUE_HIGH_PRIORITY_USD = 50_000;
+const POLICY_CLOSED_WON_STALLED_SLA_HOURS = READINESS_PENDING_SLA_HOURS;
+const POLICY_RECOMMENDATION_VERSION = 1;
+const DEFAULT_POLICY_RECOMMENDATION_LIMIT = 10;
+const MAX_POLICY_RECOMMENDATION_LIMIT = 25;
+const DEFAULT_WORK_ITEM_SUGGESTION_LIMIT = 10;
+const MAX_WORK_ITEM_SUGGESTION_LIMIT = 25;
+const DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 25;
+const MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT = 100;
+const POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER = 4;
+function sqlStringList(values: readonly string[]): string {
+  return values
+    .map((value) => `'${value.replaceAll("'", "''")}'`)
+    .join(", ");
+}
+const PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL = sqlStringList(
+  PROVIDER_OBSERVATION_SUBJECT_TYPES,
+);
+const PROVIDER_OBSERVATION_PROVIDER_SQL = sqlStringList(
+  PROVIDER_OBSERVATION_PROVIDERS,
+);
+const ROLE_QUEUE_KIND_SQL = sqlStringList(ROLE_QUEUE_KINDS);
 type NotifiableReadiness = Exclude<DeploymentReadiness, "not_required">;
 type OutcomeMetricRow = {
   id: string;
@@ -105,6 +195,121 @@ type OutcomeMetricRow = {
   createdAt: string;
   arrDeltaUsd: number | null;
 };
+type RoutedRecord = {
+  deal: RoutedDeal;
+  updatedAt: string;
+  sinkStatus: "synced" | "partial" | "dry_run" | "needs_review";
+  externalStage: ExternalStageState | null;
+};
+type QuarantinedRecord = {
+  quarantine: Quarantine;
+  deal: Deal | null;
+  routedDeal: RoutedDeal | null;
+  updatedAt: string;
+  externalStage: ExternalStageState | null;
+};
+type RoutedRecordRow = {
+  payload: string;
+  updated_at: string;
+  sink_status: string | null;
+  external_system: string | null;
+  external_id: string | null;
+  external_stage_id: string | null;
+  external_stage_label: string | null;
+  external_stage_updated_at: string | null;
+};
+
+type QuarantineReplayPayload = Omit<Deal, "contactName" | "contactEmail"> & {
+  payloadKind?: "deal" | "routed_deal";
+};
+type QuarantineRoutedReplayPayload = Omit<
+  RoutedDeal,
+  "contactName" | "contactEmail"
+> & {
+  payloadKind?: "routed_deal";
+};
+
+function quarantineReplayPayload(
+  deal: Deal | RoutedDeal,
+): QuarantineReplayPayload | QuarantineRoutedReplayPayload {
+  const base = {
+    id: deal.id,
+    company: deal.company,
+    domain: deal.domain,
+    dealUSD: deal.dealUSD,
+    region: deal.region,
+    sourceChannel: deal.sourceChannel,
+    statedNeed: deal.statedNeed,
+  };
+  return "enrichment" in deal
+    ? {
+        ...base,
+        payloadKind: "routed_deal",
+        enrichment: deal.enrichment,
+        score: deal.score,
+        route: deal.route,
+      }
+    : { ...base, payloadKind: "deal" };
+}
+
+function dealFromPayload(payload: string | null): Deal | null {
+  if (!payload) return null;
+  const parsed = JSON.parse(payload) as QuarantineReplayPayload;
+  return {
+    id: parsed.id,
+    company: parsed.company,
+    domain: parsed.domain,
+    dealUSD: parsed.dealUSD,
+    region: parsed.region,
+    sourceChannel: parsed.sourceChannel,
+    statedNeed: parsed.statedNeed,
+    contactName: "Redacted Contact",
+    contactEmail: "redacted@example.invalid",
+  };
+}
+
+function routedDealFromPayload(payload: string | null): RoutedDeal | null {
+  if (!payload) return null;
+  const parsed = JSON.parse(payload) as Partial<
+    Omit<RoutedDeal, "contactName" | "contactEmail">
+  > & { payloadKind?: "deal" | "routed_deal" };
+  if (parsed.payloadKind === "deal") return null;
+  if (
+    parsed.payloadKind !== undefined &&
+    parsed.payloadKind !== "routed_deal"
+  ) {
+    return null;
+  }
+  if (
+    typeof parsed.id !== "string" ||
+    typeof parsed.company !== "string" ||
+    typeof parsed.domain !== "string" ||
+    typeof parsed.dealUSD !== "number" ||
+    typeof parsed.region !== "string" ||
+    typeof parsed.sourceChannel !== "string" ||
+    typeof parsed.statedNeed !== "string" ||
+    !parsed.enrichment ||
+    !parsed.score ||
+    !parsed.route
+  ) {
+    return null;
+  }
+  const routedPayload = parsed as QuarantineRoutedReplayPayload;
+  return {
+    id: routedPayload.id,
+    company: routedPayload.company,
+    domain: routedPayload.domain,
+    dealUSD: routedPayload.dealUSD,
+    region: routedPayload.region,
+    sourceChannel: routedPayload.sourceChannel,
+    statedNeed: routedPayload.statedNeed,
+    enrichment: routedPayload.enrichment,
+    score: routedPayload.score,
+    route: routedPayload.route,
+    contactName: "Redacted Contact",
+    contactEmail: "redacted@example.invalid",
+  };
+}
 
 const COMMERCIAL_STATE_RANK: Record<CommercialState, number> = {
   open: 0,
@@ -113,6 +318,337 @@ const COMMERCIAL_STATE_RANK: Record<CommercialState, number> = {
   closed_won: 3,
   closed_lost: 4,
 };
+
+const ROLE_QUEUE_PRIORITY_RANK: Record<RoleQueuePriority, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
+
+function emptyRoleQueues(): RoleQueues {
+  return {
+    ae_attention: [],
+    finance_review: [],
+    legal_review: [],
+    deployment_readiness: [],
+    growth_attribution: [],
+  };
+}
+
+function newestTimestamp(
+  requiredTimestamp: string,
+  values: Array<string | null | undefined>,
+): string {
+  if (requiredTimestamp.length === 0) {
+    throw new Error("newestTimestamp requires a non-empty base timestamp");
+  }
+  return [requiredTimestamp, ...values]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort()
+    .at(-1)!;
+}
+
+function humanOwner(deal: RoutedDeal): string | null {
+  return deal.route.kind === "human_assisted" ? deal.route.salesOwner : null;
+}
+
+function enrichmentObservationSourceEventId(
+  provider: ProviderObservationProvider,
+  subjectKey: string,
+  enrichment: Enrichment,
+): string {
+  return stableUuidV4(
+    canonicalJson({
+      kind: "provider_observation",
+      provider,
+      subjectKey,
+      enrichment,
+    }),
+  );
+}
+
+function enrichmentFactExpiresAt(observedAt: string): string {
+  return new Date(
+    Date.parse(observedAt) + ENRICHMENT_FACT_MAX_AGE_DAYS * DAY_MS,
+  ).toISOString();
+}
+
+function actionRolePriority(deal: RoutedDeal): RoleQueuePriority {
+  if (
+    deal.dealUSD >= ROLE_QUEUE_HIGH_PRIORITY_USD ||
+    (deal.route.kind === "human_assisted" &&
+      (deal.route.financeFlag !== null || deal.route.legalFlag !== null))
+  ) {
+    return "high";
+  }
+  return "medium";
+}
+
+function assertSqlParameterBudget(count: number, context: string): void {
+  if (count > SQL_PARAMETER_BUDGET) {
+    throw new Error(
+      `${context} needs ${count} SQL parameters; max supported budget is ${SQL_PARAMETER_BUDGET}`,
+    );
+  }
+}
+
+function sortRoleQueue(items: RoleQueueItem[]): RoleQueueItem[] {
+  return [...items].sort((a, b) => {
+    const priority =
+      ROLE_QUEUE_PRIORITY_RANK[a.priority] - ROLE_QUEUE_PRIORITY_RANK[b.priority];
+    if (priority !== 0) return priority;
+    const amount = b.amount - a.amount;
+    if (amount !== 0) return amount;
+    const updatedAt = b.updatedAt.localeCompare(a.updatedAt);
+    if (updatedAt !== 0) return updatedAt;
+    return a.dealId.localeCompare(b.dealId);
+  });
+}
+
+function sortPolicyDeals(items: PolicyEvaluationDeal[]): PolicyEvaluationDeal[] {
+  return [...items].sort((a, b) => {
+    const amount = b.amount - a.amount;
+    if (amount !== 0) return amount;
+    const observed = b.signalObservedAt.localeCompare(a.signalObservedAt);
+    if (observed !== 0) return observed;
+    return a.dealId.localeCompare(b.dealId);
+  });
+}
+
+function policyRecommendationPriority(signal: PolicyEvaluationDeal["signal"]): number {
+  switch (signal) {
+    case "human_assisted_churned":
+      return 0;
+    case "human_assisted_stalled":
+    case "human_assisted_ready_not_started":
+      return 1;
+    case "self_serve_expanded":
+      return 2;
+  }
+  const exhaustive: never = signal;
+  return exhaustive;
+}
+
+function sortPolicyRecommendationCandidates(
+  items: PolicyEvaluationDeal[],
+): PolicyEvaluationDeal[] {
+  return [...items].sort((a, b) => {
+    const priority = policyRecommendationPriority(a.signal) - policyRecommendationPriority(b.signal);
+    if (priority !== 0) return priority;
+    const amount = b.amount - a.amount;
+    if (amount !== 0) return amount;
+    const observed = b.signalObservedAt.localeCompare(a.signalObservedAt);
+    if (observed !== 0) return observed;
+    return a.dealId.localeCompare(b.dealId);
+  });
+}
+
+function policyRecommendationSourceEventId(item: PolicyEvaluationDeal): string {
+  return stableUuidV4(
+    canonicalJson({
+      kind: "policy_recommendation",
+      version: POLICY_RECOMMENDATION_VERSION,
+      dealId: item.dealId,
+      signal: item.signal,
+      signalObservedAt: item.signalObservedAt,
+    }),
+  );
+}
+
+function policyRecommendationTitle(item: PolicyEvaluationDeal): string {
+  switch (item.signal) {
+    case "self_serve_expanded":
+      return truncateField(`Review self-serve expansion: ${item.company}`, 160);
+    case "human_assisted_churned":
+      return truncateField(`Review human-assisted churn: ${item.company}`, 160);
+    case "human_assisted_stalled":
+      return truncateField(`Unblock stalled deployment: ${item.company}`, 160);
+    case "human_assisted_ready_not_started":
+      return truncateField(`Close deployment-start gap: ${item.company}`, 160);
+  }
+  const exhaustive: never = item.signal;
+  return exhaustive;
+}
+
+function policyRecommendationBody(item: PolicyEvaluationDeal): string {
+  const amount = formatUsd(item.amount);
+  switch (item.signal) {
+    case "self_serve_expanded":
+      return [
+        `${item.company} routed self-serve at ${amount} and later expanded by ${formatUsd(item.arrDeltaUsd ?? 0)}.`,
+        "Review whether similar source-channel and ARR patterns should remain self-serve, get earlier expansion enablement, or move to human-assisted review.",
+      ].join(" ");
+    case "human_assisted_churned":
+      return [
+        `${item.company} was human-assisted at ${amount} and later recorded churn.`,
+        "Review whether the routing score, qualification notes, deployment readiness, or handoff expectations missed an early risk signal.",
+      ].join(" ");
+    case "human_assisted_ready_not_started":
+      return [
+        `${item.company} is marked deployment-ready at ${amount}, but no deployment_start outcome has been recorded.`,
+        "Review whether the deployment-start handoff needs a clearer owner, SLA, or automatic follow-up.",
+      ].join(" ");
+    case "human_assisted_stalled":
+      return [
+        `${item.company} closed won at ${amount}, but deployment has not started after the readiness SLA.`,
+        "Review whether the human-assisted route needs stronger pre-close readiness requirements or a deployment blocker escalation.",
+      ].join(" ");
+  }
+  const exhaustive: never = item.signal;
+  return exhaustive;
+}
+
+function policyRecommendationRationale(item: PolicyEvaluationDeal): string {
+  return truncateField(
+    `Policy signal ${item.signal} observed at ${item.signalObservedAt}: ${item.reason}`,
+    1000,
+  );
+}
+
+// One assigned work item gets one draft suggestion. Assignment churn should not
+// fork agent work. Reopening a closed role-queue item creates a fresh work item
+// row, so reopened work receives a fresh draft through the new id. The derived
+// id is stored on the row at creation/backfill time so future formula changes
+// do not rewrite existing open work.
+function workItemSuggestionSourceEventId(
+  item: Pick<WorkItemRecord, "id">,
+): string {
+  return stableUuidV4(
+    canonicalJson({
+      kind: "work_item_suggestion",
+      workItemId: item.id,
+    }),
+  );
+}
+
+function workItemSuggestionKind(item: WorkItemRecord): AgentSuggestionKind {
+  switch (item.queue) {
+    case "ae_attention":
+    case "deployment_readiness":
+      return "handoff_summary";
+    case "finance_review":
+    case "legal_review":
+    case "growth_attribution":
+      return "missing_field_question";
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function workItemSuggestionTitle(item: WorkItemRecord): string {
+  switch (item.queue) {
+    case "ae_attention":
+      return truncateField(`Draft AE next step: ${item.title}`, 160);
+    case "finance_review":
+      return truncateField(`Draft finance review request: ${item.title}`, 160);
+    case "legal_review":
+      return truncateField(`Draft legal review request: ${item.title}`, 160);
+    case "deployment_readiness":
+      return truncateField(`Draft deployment handoff: ${item.title}`, 160);
+    case "growth_attribution":
+      return truncateField(`Draft growth follow-up: ${item.title}`, 160);
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function formatWorkItemDueAt(dueAt: string): string | null {
+  const date = new Date(dueAt);
+  if (Number.isNaN(date.getTime()) || date.toISOString() !== dueAt) {
+    return null;
+  }
+  const iso = date.toISOString();
+  // Display-only copy rounded to minutes for operators; the canonical dueAt
+  // remains on the work item.
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+function workItemSuggestionBody(item: WorkItemRecord): string {
+  const formattedDue = item.dueAt ? formatWorkItemDueAt(item.dueAt) : null;
+  const due = formattedDue ? ` Due ${formattedDue}.` : "";
+  switch (item.queue) {
+    case "ae_attention":
+      return truncateField(
+        `Prepare a concise owner follow-up. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "finance_review":
+      return truncateField(
+        `Ask finance to review pricing approval before close. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "legal_review":
+      return truncateField(
+        `Ask legal to review regulated-deal risk and required contract/privacy steps. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "deployment_readiness":
+      return truncateField(
+        `Summarize the deployment readiness gap and the next deployment-ops action. Context: ${item.description}.${due}`,
+        4000,
+      );
+    case "growth_attribution":
+      return truncateField(
+        `Summarize the growth attribution follow-up for this routed deal. Context: ${item.description}.${due}`,
+        4000,
+      );
+  }
+  const exhaustive: never = item.queue;
+  throw new Error(`unhandled work item queue: ${String(exhaustive)}`);
+}
+
+function workItemSuggestionRationale(item: WorkItemRecord): string {
+  return truncateField(
+    `Assigned work item ${item.id} (${item.queue}) is still open; draft evidence uses the work-item opening snapshot and no workflow action is executed automatically.`,
+    1000,
+  );
+}
+
+function parseAgentSuggestionSource(value: unknown): "local_agent" {
+  if (value !== LOCAL_AGENT_SUGGESTION_SOURCE) {
+    throw new Error(`stored agent suggestion has invalid source: ${String(value)}`);
+  }
+  return value;
+}
+
+function expandedArrDelta(outcomes: OutcomeEventRecord[]): number {
+  return outcomes.reduce(
+    (sum, outcome) =>
+      outcome.outcome === "expanded" ? sum + outcome.arrDeltaUsd : sum,
+    0,
+  );
+}
+
+function lastOutcomeAt(outcomes: OutcomeEventRecord[]): string | null {
+  return outcomes.reduce<string | null>(
+    (latest, outcome) =>
+      latest === null || outcome.occurredAt > latest ? outcome.occurredAt : latest,
+    null,
+  );
+}
+
+function roleQueueItem(
+  deal: RoutedDeal,
+  queue: RoleQueueItem["queue"],
+  priority: RoleQueuePriority,
+  reason: string,
+  status: RoleQueueStatus,
+  updatedAt: string,
+): RoleQueueItem {
+  return {
+    queue,
+    dealId: deal.id,
+    company: deal.company,
+    amount: deal.dealUSD,
+    routeKind: deal.route.kind,
+    sourceChannel: deal.sourceChannel,
+    salesOwner: humanOwner(deal),
+    priority,
+    reason,
+    status,
+    updatedAt,
+  };
+}
 
 function isNotifiableReadiness(
   readiness: DeploymentReadiness,
@@ -421,6 +957,185 @@ const SCHEMA: string[] = [
        )
      )
    )`,
+  `CREATE TABLE IF NOT EXISTS provider_observations (
+     id TEXT PRIMARY KEY,
+     subject_type TEXT NOT NULL,
+     subject_key TEXT NOT NULL,
+     provider TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     source_payload_hash TEXT NOT NULL,
+     observed_at TEXT NOT NULL,
+     expires_at TEXT,
+     confidence REAL NOT NULL,
+     raw_payload_json TEXT NOT NULL,
+     normalized_payload_json TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     UNIQUE (provider, source_event_id),
+     CHECK (subject_type IN (${PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL})),
+     CHECK (provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+     CHECK (confidence >= 0 AND confidence <= 1)
+   )`,
+  // Projection is company-only for now. Contact/deal observations remain in
+  // provider_observations until their fact schemas are explicit.
+  `CREATE TABLE IF NOT EXISTS enriched_subject_facts (
+     subject_type TEXT NOT NULL,
+     subject_key TEXT NOT NULL,
+     employees INTEGER NOT NULL,
+     industry TEXT NOT NULL,
+     tech_signals_json TEXT NOT NULL,
+     regulated INTEGER NOT NULL,
+     confidence REAL NOT NULL,
+     source_provider TEXT NOT NULL,
+     source_observation_id TEXT NOT NULL,
+     observed_at TEXT NOT NULL,
+     expires_at TEXT,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (subject_type, subject_key),
+     CHECK (subject_type IN ('company')),
+     CHECK (source_provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+     CHECK (employees >= 0),
+     CHECK (regulated IN (0, 1)),
+     CHECK (confidence >= 0 AND confidence <= 1),
+     CHECK (json_valid(tech_signals_json))
+   )`,
+  `CREATE TABLE IF NOT EXISTS agent_suggestions (
+     id TEXT PRIMARY KEY,
+     deal_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'proposed',
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     rationale TEXT NOT NULL,
+     source TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     source_payload_hash TEXT NOT NULL,
+     created_by TEXT NOT NULL,
+     occurred_at TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     decided_at TEXT,
+     decided_by TEXT,
+     decision_source_event_id TEXT,
+     decision_payload_hash TEXT,
+     decision_reason TEXT,
+     UNIQUE (source, source_event_id),
+     UNIQUE (source, decision_source_event_id),
+     CHECK (
+       kind IN (
+         'handoff_summary',
+         'missing_field_question',
+         'stale_deal_nudge',
+         'policy_change_recommendation'
+       )
+     ),
+     CHECK (status IN ('proposed', 'accepted', 'rejected')),
+     CHECK (source IN ('local_agent')),
+     CHECK (
+       status = 'proposed' OR
+       (
+         decided_at IS NOT NULL AND
+         decided_by IS NOT NULL AND
+         decision_source_event_id IS NOT NULL AND
+         decision_payload_hash IS NOT NULL AND
+         decision_reason IS NOT NULL
+       )
+     ),
+     CHECK (
+       status != 'proposed' OR
+       (
+         decided_at IS NULL AND
+         decided_by IS NULL AND
+         decision_source_event_id IS NULL AND
+         decision_payload_hash IS NULL AND
+         decision_reason IS NULL
+       )
+     ),
+     CHECK (decided_at IS NULL OR decided_at >= occurred_at)
+   )`,
+  `CREATE TABLE IF NOT EXISTS work_items (
+     id TEXT PRIMARY KEY,
+     source_kind TEXT NOT NULL,
+     source_key TEXT NOT NULL,
+     deal_id TEXT NOT NULL,
+     queue TEXT NOT NULL,
+     status TEXT NOT NULL,
+     priority TEXT NOT NULL,
+     owner TEXT NOT NULL,
+     title TEXT NOT NULL,
+     description TEXT NOT NULL,
+     due_at TEXT,
+     agent_suggestion_source_event_id TEXT,
+     created_by TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     resolved_at TEXT,
+     resolved_by TEXT,
+     resolution_reason TEXT,
+     CHECK (source_kind IN ('role_queue')),
+     CHECK (queue IN (${ROLE_QUEUE_KIND_SQL})),
+     CHECK (status IN ('assigned', 'resolved', 'waived')),
+     CHECK (priority IN ('high', 'medium', 'low')),
+     CHECK (
+       status = 'assigned' OR
+       (
+         resolved_at IS NOT NULL AND
+         resolved_by IS NOT NULL AND
+         resolution_reason IS NOT NULL
+       )
+     ),
+     CHECK (
+       status != 'assigned' OR
+       (
+         resolved_at IS NULL AND
+         resolved_by IS NULL AND
+         resolution_reason IS NULL
+       )
+     )
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_assigned_source
+     ON work_items(source_key)
+     WHERE status = 'assigned'`,
+  `CREATE TABLE IF NOT EXISTS work_item_events (
+     id TEXT PRIMARY KEY,
+     work_item_id TEXT NOT NULL,
+     action TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     event_key TEXT NOT NULL UNIQUE,
+     source_payload_hash TEXT NOT NULL,
+     actor TEXT NOT NULL,
+     owner TEXT,
+     reason TEXT NOT NULL,
+     occurred_at TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     CHECK (action IN ('opened', 'open_attempted', 'assign', 'resolve', 'waive', 'already_closed', 'superseded', 'invalid_action'))
+   )`,
+  `CREATE TABLE IF NOT EXISTS policy_recommendation_runs (
+     id TEXT PRIMARY KEY,
+     status TEXT NOT NULL,
+     created_by TEXT NOT NULL,
+     evaluated_at TEXT NOT NULL,
+     limit_count INTEGER NOT NULL,
+     attempted INTEGER NOT NULL,
+     recorded INTEGER NOT NULL,
+     duplicate INTEGER NOT NULL,
+     idempotency_conflict INTEGER NOT NULL,
+     skipped INTEGER NOT NULL,
+     status_counts_json TEXT NOT NULL,
+     results_json TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     CHECK (status IN (
+       'recorded',
+       'duplicate',
+       'idempotency_conflict',
+       'all_skipped',
+       'no_signals'
+     )),
+     CHECK (limit_count >= 1),
+     CHECK (attempted >= 0),
+     CHECK (recorded >= 0),
+     CHECK (duplicate >= 0),
+     CHECK (idempotency_conflict >= 0),
+     CHECK (skipped >= 0)
+   )`,
   `CREATE TABLE IF NOT EXISTS deployment_readiness (
      deal_id TEXT PRIMARY KEY,
      readiness TEXT NOT NULL,
@@ -526,12 +1241,36 @@ const SCHEMA: string[] = [
      created_at TEXT NOT NULL,
      UNIQUE (source, source_event_id, scope),
      CHECK (
-       scope IN ('commercial_state', 'deployment_facts', 'outcome') OR
+       scope IN (
+         'commercial_state',
+         'deployment_facts',
+         'outcome',
+         'provider_observation',
+         'agent_suggestion',
+         'agent_suggestion_decision'
+       ) OR
        scope LIKE 'external_event_observation:%'
      )
    )`,
   "CREATE INDEX IF NOT EXISTS idx_events_deal ON events(deal_id)",
   "CREATE INDEX IF NOT EXISTS idx_events_deal_id ON events(deal_id, id DESC)",
+  `CREATE INDEX IF NOT EXISTS idx_events_commercial_state_projection
+   ON events (
+     json_extract(meta, '$.kind'),
+     json_extract(meta, '$.commercialState'),
+     json_extract(meta, '$.projected'),
+     ts,
+     id
+   )
+   WHERE meta IS NOT NULL AND json_valid(meta)`,
+  `CREATE INDEX IF NOT EXISTS idx_events_commercial_state_guard
+   ON events (
+     deal_id,
+     json_extract(meta, '$.kind'),
+     json_extract(meta, '$.source'),
+     json_extract(meta, '$.projected')
+   )
+   WHERE meta IS NOT NULL AND json_valid(meta)`,
   "CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage)",
   "CREATE INDEX IF NOT EXISTS idx_commercial_states_state ON commercial_states(commercial_state)",
   "CREATE INDEX IF NOT EXISTS idx_deployment_readiness_status ON deployment_readiness(readiness)",
@@ -541,6 +1280,11 @@ const SCHEMA: string[] = [
   "CREATE INDEX IF NOT EXISTS idx_outcome_events_outcome ON outcome_events(outcome, occurred_at)",
   "CREATE INDEX IF NOT EXISTS idx_outcome_rejections_kind ON outcome_rejections(rejection_kind, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_outcome_rejections_deal ON outcome_rejections(deal_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_provider_observations_subject ON provider_observations(subject_type, subject_key, observed_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_provider_observations_provider ON provider_observations(provider, observed_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_status ON agent_suggestions(status, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_deal ON agent_suggestions(deal_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
 ];
 
 function percentile(sorted: number[], p: number): number {
@@ -552,12 +1296,12 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, idx)] ?? 0;
 }
 
-function median(values: number[]): number {
-  if (values.length === 0) return 0;
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 1) return sorted[mid] ?? 0;
-  return ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+  if (sorted.length % 2 === 1) return sorted[mid]!;
+  return (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
 function hoursBetween(startIso: string, endIso: string): number | null {
@@ -567,6 +1311,27 @@ function hoursBetween(startIso: string, endIso: string): number | null {
     return null;
   }
   return Math.round(((end - start) / 3_600_000) * 100) / 100;
+}
+
+function assertCanonicalIsoUtc(value: string, field: string): void {
+  if (!CANONICAL_ISO_UTC.test(value)) {
+    throw new Error(`${field} must be canonical UTC ISO timestamp`);
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== value) {
+    throw new Error(`${field} must be canonical UTC ISO timestamp`);
+  }
+}
+
+function nonEmptyLabel(value: string, field: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    throw new Error(`${field} must be non-empty`);
+  }
+  if (trimmed !== value) {
+    throw new Error(`${field} must not have surrounding whitespace`);
+  }
+  return value;
 }
 
 function canonicalJson(value: unknown): string {
@@ -585,6 +1350,88 @@ function canonicalJson(value: unknown): string {
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function stableUuidV4(seed: string): string {
+  const chars = sha256Hex(seed).slice(0, 32).split("");
+  chars[12] = "4";
+  chars[16] = ((Number.parseInt(chars[16] ?? "0", 16) & 0x3) | 0x8).toString(
+    16,
+  );
+  const hex = chars.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
+    12,
+    16,
+  )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function pipelineStage(value: string): Stage | null {
+  return (PIPELINE_STAGES as readonly string[]).includes(value)
+    ? (value as Stage)
+    : null;
+}
+
+function agentSuggestionRunStatus(counts: {
+  recorded: number;
+  duplicate: number;
+  idempotencyConflict: number;
+  skipped: number;
+}): AgentSuggestionRunStatus {
+  // Idempotency conflicts are correctness incidents, so they dominate even
+  // when the same run also recorded useful suggestions; callers still receive
+  // the full count breakdown for operator triage.
+  if (counts.idempotencyConflict > 0) return "idempotency_conflict";
+  if (counts.recorded > 0) return "recorded";
+  if (counts.duplicate > 0) return "duplicate";
+  if (counts.skipped > 0) return "all_skipped";
+  return "no_signals";
+}
+
+function emptyAgentSuggestionWriteStatusCounts(): AgentSuggestionWriteStatusCounts {
+  return Object.fromEntries(
+    LOCAL_AGENT_SUGGESTION_WRITE_STATUSES.map((status) => [status, 0]),
+  ) as AgentSuggestionWriteStatusCounts;
+}
+
+function policyRecommendationLimit(value: number | undefined): number {
+  const raw = value ?? DEFAULT_POLICY_RECOMMENDATION_LIMIT;
+  if (!Number.isFinite(raw)) {
+    throw new Error("policy recommendation limit must be finite");
+  }
+  return Math.max(
+    1,
+    Math.min(Math.trunc(raw), MAX_POLICY_RECOMMENDATION_LIMIT),
+  );
+}
+
+function workItemSuggestionLimit(value: number | undefined): number {
+  const raw = value ?? DEFAULT_WORK_ITEM_SUGGESTION_LIMIT;
+  if (!Number.isFinite(raw)) {
+    throw new Error("work item suggestion limit must be finite");
+  }
+  return Math.max(
+    1,
+    Math.min(Math.trunc(raw), MAX_WORK_ITEM_SUGGESTION_LIMIT),
+  );
+}
+
+function policyRecommendationRunPageLimit(value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new Error("policy recommendation run page limit must be finite");
+  }
+  return Math.max(
+    0,
+    Math.min(Math.trunc(value), MAX_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT),
+  );
+}
+
+function truncateField(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return value.slice(0, Math.max(0, maxLength - 3)).trimEnd() + "...";
+}
+
+function formatUsd(value: number): string {
+  return "$" + Math.round(value).toLocaleString("en-US");
 }
 
 const DEFAULT_INTEGRATION_CONFIG_HASH = sha256Hex("integration_config:unrecorded");
@@ -608,6 +1455,122 @@ function parseSecondaryBlockerCodes(
     throw new Error("stored secondary blocker codes must be a non-empty array");
   }
   return parsed.map(deploymentBlockerFromValue);
+}
+
+function parseEnrichmentPayload(value: unknown): Enrichment {
+  if (!value || typeof value !== "object") {
+    throw new Error("enrichment payload must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const employees = record.employees;
+  const industry = record.industry;
+  const techSignals = record.techSignals;
+  const regulated = record.regulated;
+  const confidence = record.confidence;
+  if (
+    typeof employees !== "number" ||
+    !Number.isInteger(employees) ||
+    employees < 0
+  ) {
+    throw new Error("enrichment employees must be a non-negative integer");
+  }
+  if (typeof industry !== "string" || industry.trim().length === 0) {
+    throw new Error("enrichment industry must be non-empty");
+  }
+  if (
+    !Array.isArray(techSignals) ||
+    !techSignals.every(
+      (signal) => typeof signal === "string" && signal.trim().length > 0,
+    )
+  ) {
+    throw new Error("enrichment techSignals must be non-empty strings");
+  }
+  if (typeof regulated !== "boolean") {
+    throw new Error("enrichment regulated must be boolean");
+  }
+  if (
+    typeof confidence !== "number" ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    throw new Error("enrichment confidence must be between 0 and 1");
+  }
+  return {
+    employees,
+    industry,
+    techSignals: [...techSignals].sort(),
+    regulated,
+    confidence,
+  };
+}
+
+function providerObservationId(
+  provider: ProviderObservationProvider,
+  sourceEventId: string,
+): string {
+  return `${PROVIDER_OBSERVATION_ID_PREFIX}-${sha256Hex(
+    canonicalJson(["provider_observation", provider, sourceEventId]),
+  ).slice(0, 32)}`;
+}
+
+function assertJsonPayload(value: unknown, field: string): string {
+  const json = canonicalJson(value);
+  if (json === undefined) {
+    throw new Error(`${field} must be JSON-serializable`);
+  }
+  return json;
+}
+
+function providerObservationPayloadHash(input: ProviderObservationInput): string {
+  return sha256Hex(
+    canonicalJson({
+      subjectType: input.subjectType,
+      subjectKey: input.subjectKey,
+      provider: input.provider,
+      sourceEventId: input.sourceEventId,
+      confidence: input.confidence,
+      rawPayload: input.rawPayload,
+      normalizedPayload: input.normalizedPayload,
+    }),
+  );
+}
+
+function companyProviderObservationInput(
+  input: ProviderObservationInput,
+): ProviderObservationInput & { subjectType: "company" } {
+  if (input.subjectType !== "company") {
+    throw new Error("only company provider observations can project enrichment facts");
+  }
+  return {
+    ...input,
+    subjectType: input.subjectType,
+  };
+}
+
+function enrichmentFactFreshnessStatus(
+  expiresAt: string | null,
+  now: string,
+): "fresh" | "stale" {
+  if (expiresAt === null) return "fresh";
+  const expiresAtMs = Date.parse(expiresAt);
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs)) {
+    throw new Error("enrichment fact freshness timestamps must be valid dates");
+  }
+  // Expiration is a closed boundary: at the exact expiry instant, callers should
+  // stop trusting the fact without a fresh observation.
+  return expiresAtMs <= nowMs ? "stale" : "fresh";
+}
+
+function expiryExtends(
+  incoming: string | null,
+  existing: string | null,
+): boolean {
+  if (incoming === existing) return false;
+  if (incoming === null) return true;
+  if (existing === null) return false;
+  return incoming > existing;
 }
 
 function factFreshness(
@@ -644,6 +1607,7 @@ function factFreshness(
 
 export class Store {
   private db: DatabaseSyncT;
+  private transactionDepth = 0;
 
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
@@ -684,14 +1648,18 @@ export class Store {
     );
     this.ensureColumn("external_event_keys", "payload_hash", "TEXT");
     this.ensureExternalEventKeyGuards();
-    this.ensureIdempotencyViolationOutcomeScope();
+    this.ensureColumn("work_items", "agent_suggestion_source_event_id", "TEXT");
+    this.backfillWorkItemSuggestionSourceEventIds();
+    this.ensureWorkItemSuggestionSourceIndex();
+    this.ensureIdempotencyViolationScopes();
+    this.ensurePolicyRecommendationRunStatuses();
     this.backfillExternalNotificationLeases();
     this.backfillDerivedColumns();
     this.backfillSinkColumns();
   }
 
   private ensureColumn(
-    table: "deals" | "events" | "external_event_keys",
+    table: "deals" | "events" | "external_event_keys" | "work_items",
     name: string,
     type: string,
   ): void {
@@ -706,6 +1674,63 @@ export class Store {
         if (!msg.includes("duplicate column name")) throw err;
       }
     }
+  }
+
+  private backfillWorkItemSuggestionSourceEventIds(): void {
+    this.transactionImmediate(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id
+           FROM work_items
+           WHERE agent_suggestion_source_event_id IS NULL`,
+        )
+        .all() as Array<{ id: string }>;
+      if (rows.length === 0) return;
+
+      const update = this.db.prepare(
+        `UPDATE work_items
+         SET agent_suggestion_source_event_id = ?
+         WHERE id = ?`,
+      );
+      for (const row of rows) {
+        update.run(
+          workItemSuggestionSourceEventId({ id: String(row.id) }),
+          row.id,
+        );
+      }
+    });
+  }
+
+  private ensureWorkItemSuggestionSourceIndex(): void {
+    // Clean up pre-release index names/shapes from earlier local builds; after
+    // the first open these drops are no-ops.
+    this.db.prepare("DROP INDEX IF EXISTS idx_work_items_suggestion_source").run();
+    this.db
+      .prepare("DROP INDEX IF EXISTS idx_work_items_assigned_suggestion_source")
+      .run();
+    this.db
+      .prepare(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_agent_suggestion_source_unique
+         ON work_items(agent_suggestion_source_event_id)
+         WHERE agent_suggestion_source_event_id IS NOT NULL`,
+      )
+      .run();
+    this.db
+      .prepare(
+        `CREATE INDEX IF NOT EXISTS idx_work_items_assigned_suggestion_fifo
+         ON work_items(
+           CASE priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           created_at,
+           id
+         )
+         WHERE status = 'assigned'`,
+      )
+      .run();
   }
 
   private ensureExternalEventKeyGuards(): void {
@@ -774,7 +1799,7 @@ export class Store {
       .run();
   }
 
-  private ensureIdempotencyViolationOutcomeScope(): void {
+  private ensureIdempotencyViolationScopes(): void {
     const row = this.db
       .prepare(
         `SELECT sql
@@ -783,7 +1808,17 @@ export class Store {
            AND name = 'idempotency_violations'`,
       )
       .get() as { sql: string | null } | undefined;
-    if (!row?.sql || row.sql.includes("'outcome'")) return;
+    if (
+      !row?.sql ||
+      this.idempotencyViolationsAllowScopes(row.sql, [
+        "outcome",
+        "provider_observation",
+        "agent_suggestion",
+        "agent_suggestion_decision",
+      ])
+    ) {
+      return;
+    }
 
     this.transaction(() => {
       this.db
@@ -799,7 +1834,14 @@ export class Store {
              created_at TEXT NOT NULL,
              UNIQUE (source, source_event_id, scope),
              CHECK (
-               scope IN ('commercial_state', 'deployment_facts', 'outcome') OR
+               scope IN (
+                 'commercial_state',
+                 'deployment_facts',
+                 'outcome',
+                 'provider_observation',
+                 'agent_suggestion',
+                 'agent_suggestion_decision'
+               ) OR
                scope LIKE 'external_event_observation:%'
              )
            )`,
@@ -826,8 +1868,108 @@ export class Store {
     });
   }
 
+  private idempotencyViolationsAllowScopes(
+    tableSql: string,
+    scopes: readonly string[],
+  ): boolean {
+    return scopes.every((scope) => {
+      const escaped = scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`scope\\s+IN\\s*\\([^)]*'${escaped}'[^)]*\\)`, "i").test(
+        tableSql,
+      );
+    });
+  }
+
+  private ensurePolicyRecommendationRunStatuses(): void {
+    const row = this.db
+      .prepare(
+        `SELECT sql
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name = 'policy_recommendation_runs'`,
+      )
+      .get() as { sql: string | null } | undefined;
+    const expectedStatuses = [
+      "'recorded'",
+      "'duplicate'",
+      "'idempotency_conflict'",
+      "'all_skipped'",
+      "'no_signals'",
+    ];
+    const tableSql = row?.sql;
+    if (
+      !tableSql ||
+      expectedStatuses.every((status) => tableSql.includes(status))
+    ) {
+      return;
+    }
+
+    // Recreate if an earlier local branch created the CHECK before the final
+    // run-status vocabulary was settled.
+    this.transactionImmediate(() => {
+      this.db
+        .prepare(
+          `CREATE TABLE policy_recommendation_runs_next (
+             id TEXT PRIMARY KEY,
+             status TEXT NOT NULL,
+             created_by TEXT NOT NULL,
+             evaluated_at TEXT NOT NULL,
+             limit_count INTEGER NOT NULL,
+             attempted INTEGER NOT NULL,
+             recorded INTEGER NOT NULL,
+             duplicate INTEGER NOT NULL,
+             idempotency_conflict INTEGER NOT NULL,
+             skipped INTEGER NOT NULL,
+             status_counts_json TEXT NOT NULL,
+             results_json TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             CHECK (status IN (
+               'recorded',
+               'duplicate',
+               'idempotency_conflict',
+               'all_skipped',
+               'no_signals'
+             )),
+             CHECK (limit_count >= 1),
+             CHECK (attempted >= 0),
+             CHECK (recorded >= 0),
+             CHECK (duplicate >= 0),
+             CHECK (idempotency_conflict >= 0),
+             CHECK (skipped >= 0)
+           )`,
+        )
+        .run();
+      this.db
+        .prepare(
+          `INSERT INTO policy_recommendation_runs_next (
+             id, status, created_by, evaluated_at, limit_count, attempted,
+             recorded, duplicate, idempotency_conflict, skipped,
+             status_counts_json, results_json, created_at
+           )
+           SELECT
+             id, status, created_by, evaluated_at, limit_count, attempted,
+             recorded, duplicate, idempotency_conflict, skipped,
+             status_counts_json, results_json, created_at
+           FROM policy_recommendation_runs`,
+        )
+        .run();
+      this.db.prepare("DROP TABLE policy_recommendation_runs").run();
+      this.db
+        .prepare(
+          "ALTER TABLE policy_recommendation_runs_next RENAME TO policy_recommendation_runs",
+        )
+        .run();
+      this.db
+        .prepare(
+          "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
+        )
+        .run();
+    });
+  }
+
   private transaction<T>(fn: () => T): T {
     this.db.prepare("BEGIN").run();
+    this.transactionDepth += 1;
     try {
       const result = fn();
       if (result instanceof Promise) {
@@ -838,6 +1980,8 @@ export class Store {
     } catch (err) {
       this.db.prepare("ROLLBACK").run();
       throw err;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -1011,25 +2155,42 @@ export class Store {
     return existing ? "updated" : "inserted";
   }
 
-  upsertQuarantine(q: Quarantine, latencyMs: number): void {
+  upsertQuarantine(
+    q: Quarantine,
+    latencyMs: number,
+    deal?: Deal,
+    routedDeal?: RoutedDeal,
+  ): void {
     const now = new Date().toISOString();
     const sink = this.sinkStateFromEvents(q.dealId);
     this.db
       .prepare(
-        `INSERT INTO deals (
+         `INSERT INTO deals (
            id, stage, payload, quarantine, route_kind, finance_flag, legal_flag,
            deal_usd, quarantine_code, sink_mode, sink_status, latency_ms, created_at, updated_at
          )
-         VALUES (?, 'quarantined', NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+         VALUES (?, 'quarantined', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           stage='quarantined', payload=NULL, quarantine=excluded.quarantine,
-           route_kind=NULL, finance_flag=NULL, legal_flag=NULL, deal_usd=NULL,
+           stage='quarantined',
+           payload=CASE
+             WHEN excluded.payload IS NOT NULL THEN excluded.payload
+             WHEN deals.stage = 'quarantined' THEN deals.payload
+             ELSE NULL
+           END,
+           quarantine=excluded.quarantine,
+           route_kind=NULL, finance_flag=NULL, legal_flag=NULL,
+           deal_usd=NULL,
            quarantine_code=excluded.quarantine_code,
            sink_mode=excluded.sink_mode, sink_status=excluded.sink_status,
            latency_ms=excluded.latency_ms, updated_at=excluded.updated_at`,
       )
       .run(
         q.dealId,
+        routedDeal
+          ? JSON.stringify(quarantineReplayPayload(routedDeal))
+          : deal
+            ? JSON.stringify(quarantineReplayPayload(deal))
+            : null,
         JSON.stringify(q),
         q.code,
         sink.mode,
@@ -1052,15 +2213,123 @@ export class Store {
     });
   }
 
+  recordQuarantineReplay(
+    deal: RoutedDeal,
+    latencyMs: number,
+    sink: { mode: "dry_run" | "live"; status: "synced" | "partial" | "dry_run" },
+    replayDetail: string,
+    scoreDetail: string,
+    sinkDetail: string,
+    sinkMeta: PipelineEventMeta,
+    noteDetail?: string,
+  ): "inserted" | "updated" {
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(deal.id) as { stage: string } | undefined;
+      if (current?.stage !== "quarantined") {
+        throw new Error("quarantine replay requires a currently quarantined deal");
+      }
+      this.appendEvent(deal.id, "quarantined", "enriched", replayDetail);
+      if (noteDetail) {
+        this.appendEvent(deal.id, "enriched", "enriched", noteDetail);
+      }
+      this.appendEvent(deal.id, "enriched", "scored", scoreDetail);
+      this.appendEvent(deal.id, "scored", "scored", sinkDetail, sinkMeta);
+      // upsertRouted only mutates the deals row; recordRouted is the normal
+      // ingestion helper that appends its own routed event. Replay owns the
+      // virtual quarantine -> enriched -> scored -> routed audit chain here.
+      const result = this.upsertRouted(deal, latencyMs, sink);
+      this.appendEvent(deal.id, "scored", "routed", `route ${deal.route.kind}`);
+      return result;
+    });
+  }
+
+  recordQuarantineReplayFailureOrStateRace(
+    dealId: string,
+    quarantineDetail: string,
+    stateRaceDetail: string,
+  ): { auditRecorded: boolean; stateChanged: boolean; auditUnavailable: boolean } {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(dealId) as { stage: string } | undefined;
+      if (!current) {
+        return {
+          auditRecorded: false,
+          stateChanged: false,
+          auditUnavailable: true,
+        };
+      }
+      const stage = pipelineStage(current.stage);
+      if (!stage) {
+        return {
+          auditRecorded: false,
+          stateChanged: false,
+          auditUnavailable: true,
+        };
+      }
+      if (stage === "quarantined") {
+        this.appendEvent(dealId, "quarantined", "quarantined", quarantineDetail);
+        this.db
+          .prepare(
+            `UPDATE deals
+             SET updated_at = ?
+             WHERE id = ?
+               AND stage = 'quarantined'`,
+          )
+          .run(now, dealId);
+        return {
+          auditRecorded: true,
+          stateChanged: false,
+          auditUnavailable: false,
+        };
+      }
+      this.appendEvent(dealId, stage, stage, stateRaceDetail);
+      this.db
+        .prepare("UPDATE deals SET updated_at = ? WHERE id = ?")
+        .run(now, dealId);
+      return {
+        auditRecorded: true,
+        stateChanged: true,
+        auditUnavailable: false,
+      };
+    });
+  }
+
+  recordQuarantineReplayStateRace(
+    dealId: string,
+    detail: string,
+    meta?: PipelineEventMeta,
+  ): boolean {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const current = this.db
+        .prepare("SELECT stage FROM deals WHERE id = ?")
+        .get(dealId) as { stage: string } | undefined;
+      if (!current) return false;
+      const stage = pipelineStage(current.stage);
+      if (!stage) return false;
+      this.appendEvent(dealId, stage, stage, detail, meta);
+      this.db
+        .prepare("UPDATE deals SET updated_at = ? WHERE id = ?")
+        .run(now, dealId);
+      return true;
+    });
+  }
+
   recordQuarantine(
     q: Quarantine,
     latencyMs: number,
     from: Stage | "-",
     detail: string,
+    deal?: Deal,
+    routedDeal?: RoutedDeal,
   ): void {
     this.transaction(() => {
       this.appendEvent(q.dealId, from, "quarantined", detail);
-      this.upsertQuarantine(q, latencyMs);
+      this.upsertQuarantine(q, latencyMs, deal, routedDeal);
     });
   }
 
@@ -1370,6 +2639,7 @@ export class Store {
   recordLocalCommercialState(
     input: LocalCommercialStateInput,
   ): LocalCommercialStateWriteResult {
+    assertCanonicalIsoUtc(input.occurredAt, "commercial occurredAt");
     const eventKey = JSON.stringify([
       "commercial_state",
       LOCAL_COMMERCIAL_SOURCE,
@@ -1563,6 +2833,7 @@ export class Store {
 
   private transactionImmediate<T>(fn: () => T): T {
     this.db.prepare("BEGIN IMMEDIATE").run();
+    this.transactionDepth += 1;
     try {
       const result = fn();
       if (result instanceof Promise) {
@@ -1573,6 +2844,8 @@ export class Store {
     } catch (err) {
       this.db.prepare("ROLLBACK").run();
       throw err;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -1669,6 +2942,7 @@ export class Store {
     existingPayloadHash: string,
     incomingPayloadHash: string,
     reason: string,
+    source = LOCAL_COMMERCIAL_SOURCE,
   ): void {
     this.db
       .prepare(
@@ -1680,7 +2954,7 @@ export class Store {
       )
       .run(
         randomUUID(),
-        LOCAL_COMMERCIAL_SOURCE,
+        source,
         sourceEventId,
         scope,
         existingPayloadHash,
@@ -1688,6 +2962,455 @@ export class Store {
         reason,
         new Date().toISOString(),
       );
+  }
+
+  recordEnrichmentObservation(
+    deal: Deal,
+    provider: ProviderObservationProvider,
+    enrichment: Enrichment,
+  ): ProviderObservationWriteResult {
+    const observedAt = new Date().toISOString();
+    const normalizedPayload = parseEnrichmentPayload(enrichment);
+    const subjectKey = enrichmentSubjectKey(deal);
+    return this.recordProviderObservation({
+      subjectType: "company",
+      subjectKey,
+      provider,
+      sourceEventId: enrichmentObservationSourceEventId(
+        provider,
+        subjectKey,
+        normalizedPayload,
+      ),
+      observedAt,
+      expiresAt: enrichmentFactExpiresAt(observedAt),
+      confidence: normalizedPayload.confidence,
+      rawPayload: {
+        provider,
+        subjectKey,
+        enrichment: normalizedPayload,
+      },
+      normalizedPayload,
+      refreshOnDuplicate: true,
+    });
+  }
+
+  recordProviderObservation(
+    input: ProviderObservationInput,
+  ): ProviderObservationWriteResult {
+    ProviderObservationSubjectType.parse(input.subjectType);
+    ProviderObservationProvider.parse(input.provider);
+    if (input.subjectKey.trim().length === 0) {
+      throw new Error("provider observation subjectKey must be non-empty");
+    }
+    if (input.sourceEventId.trim().length === 0) {
+      throw new Error("provider observation sourceEventId must be non-empty");
+    }
+    assertCanonicalIsoUtc(input.observedAt, "provider observation observedAt");
+    if (input.expiresAt !== null) {
+      assertCanonicalIsoUtc(input.expiresAt, "provider observation expiresAt");
+    }
+    if (
+      !Number.isFinite(input.confidence) ||
+      input.confidence < 0 ||
+      input.confidence > 1
+    ) {
+      throw new Error("provider observation confidence must be between 0 and 1");
+    }
+    const normalizedPayload = parseEnrichmentPayload(input.normalizedPayload);
+    if (input.confidence !== normalizedPayload.confidence) {
+      throw new Error(
+        "provider observation confidence must match normalizedPayload.confidence",
+      );
+    }
+    const normalizedInput = { ...input, normalizedPayload };
+    const rawPayloadJson = assertJsonPayload(
+      input.rawPayload,
+      "provider observation rawPayload",
+    );
+    const normalizedPayloadJson = assertJsonPayload(
+      normalizedPayload,
+      "provider observation normalizedPayload",
+    );
+    const payloadHash = providerObservationPayloadHash(normalizedInput);
+
+    return this.transactionImmediate(() => {
+      const now = new Date().toISOString();
+      const existing = this.providerObservationBySourceEvent(
+        input.provider,
+        input.sourceEventId,
+      );
+      if (existing) {
+        if (existing.sourcePayloadHash === payloadHash) {
+          // Duplicate refreshes are liveness extensions, not TTL corrections:
+          // shorter-lived upstream corrections should arrive as new observations.
+          const refreshExtendsExpiry = expiryExtends(
+            input.expiresAt,
+            existing.expiresAt,
+          );
+          const expiryNotShrunk =
+            input.expiresAt === existing.expiresAt || refreshExtendsExpiry;
+          const duplicateAdvanced =
+            input.observedAt > existing.observedAt || refreshExtendsExpiry;
+          const shouldRefreshDuplicate =
+            input.refreshOnDuplicate === true &&
+            input.observedAt >= existing.observedAt &&
+            expiryNotShrunk &&
+            duplicateAdvanced;
+          if (shouldRefreshDuplicate) {
+            this.db
+              .prepare(
+                `UPDATE provider_observations
+                 SET observed_at = ?,
+                     expires_at = ?
+                 WHERE id = ?`,
+              )
+              .run(input.observedAt, input.expiresAt, existing.id);
+            const refreshed = this.providerObservationById(existing.id);
+            if (!refreshed) {
+              throw new Error("provider observation refresh did not return a stored row");
+            }
+            const currentFacts = this.enrichedFactsForObservationSubject(
+              input.subjectType,
+              input.subjectKey,
+            );
+            const companyInput = companyProviderObservationInput(normalizedInput);
+            const facts =
+              currentFacts === null || currentFacts.sourceObservationId === refreshed.id
+                ? this.projectEnrichedSubjectFacts(
+                    companyInput,
+                    refreshed,
+                    now,
+                    normalizedPayload,
+                  )
+                : currentFacts;
+            return {
+              status: "refreshed",
+              observation: refreshed,
+              facts,
+            };
+          }
+          return {
+            status: "duplicate",
+            observation: existing,
+            facts: this.enrichedFactsForObservationSubject(
+              input.subjectType,
+              input.subjectKey,
+            ),
+          };
+        }
+        this.recordIdempotencyViolation(
+          input.sourceEventId,
+          "provider_observation",
+          existing.sourcePayloadHash,
+          payloadHash,
+          "provider observation source event id replayed with a different payload",
+          input.provider,
+        );
+        return {
+          status: "idempotency_conflict",
+          observation: null,
+          facts: this.enrichedFactsForObservationSubject(
+            input.subjectType,
+            input.subjectKey,
+          ),
+        };
+      }
+
+      const id = providerObservationId(input.provider, input.sourceEventId);
+      this.db
+        .prepare(
+          `INSERT INTO provider_observations (
+             id, subject_type, subject_key, provider, source_event_id,
+             source_payload_hash, observed_at, expires_at, confidence,
+             raw_payload_json, normalized_payload_json, created_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.subjectType,
+          input.subjectKey,
+          input.provider,
+          input.sourceEventId,
+          payloadHash,
+          input.observedAt,
+          input.expiresAt,
+          input.confidence,
+          rawPayloadJson,
+          normalizedPayloadJson,
+          now,
+        );
+
+      const observation = this.providerObservationById(id);
+      if (!observation) {
+        throw new Error("provider observation insert did not return a stored row");
+      }
+      const companyInput = companyProviderObservationInput(input);
+      const facts =
+        input.subjectType === "company"
+          ? this.projectEnrichedSubjectFacts(
+              companyInput,
+              observation,
+              now,
+              normalizedPayload,
+            )
+          : null;
+      return { status: "recorded", observation, facts };
+    });
+  }
+
+  providerObservations(
+    subjectType?: ProviderObservationSubjectType,
+    subjectKey?: string,
+    limit = 50,
+  ): ProviderObservationRecord[] {
+    const cappedLimit = Math.max(1, Math.min(Math.trunc(limit), 250));
+    if (subjectType !== undefined) ProviderObservationSubjectType.parse(subjectType);
+    if (subjectKey !== undefined && subjectKey.trim().length === 0) {
+      throw new Error("provider observation subjectKey must be non-empty");
+    }
+
+    const where: string[] = [];
+    const params: string[] = [];
+    if (subjectType !== undefined) {
+      where.push("subject_type = ?");
+      params.push(subjectType);
+    }
+    if (subjectKey !== undefined) {
+      where.push("subject_key = ?");
+      params.push(subjectKey);
+    }
+    const sql = [
+      "SELECT * FROM provider_observations",
+      where.length ? `WHERE ${where.join(" AND ")}` : "",
+      "ORDER BY observed_at DESC, id DESC",
+      "LIMIT ?",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const rows = this.db
+      .prepare(sql)
+      .all(...params, cappedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.providerObservationFromRow(row));
+  }
+
+  enrichedSubjectFacts(
+    subjectType: "company",
+    subjectKey: string,
+    now = new Date().toISOString(),
+  ): EnrichedSubjectFacts | null {
+    if (subjectType !== "company") {
+      throw new Error("only company enrichment facts are supported");
+    }
+    if (subjectKey.trim().length === 0) {
+      throw new Error("enrichment facts subjectKey must be non-empty");
+    }
+    assertCanonicalIsoUtc(now, "enrichment facts reference time");
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM enriched_subject_facts
+         WHERE subject_type = ?
+           AND subject_key = ?`,
+      )
+      .get(subjectType, subjectKey) as Record<string, unknown> | undefined;
+    return row ? this.enrichedSubjectFactsFromRow(row, now) : null;
+  }
+
+  /**
+   * Returns only currently projected company facts. Missing keys may mean no
+   * observation ever existed, or that observations exist only below the
+   * projection confidence threshold; callers that need that distinction should
+   * read providerObservations().
+   */
+  enrichedSubjectFactsForKeys(
+    subjectType: "company",
+    subjectKeys: readonly string[],
+    now = new Date().toISOString(),
+  ): Map<string, EnrichedSubjectFacts> {
+    if (subjectType !== "company") {
+      throw new Error("only company enrichment facts are supported");
+    }
+    assertCanonicalIsoUtc(now, "enrichment facts reference time");
+    const uniqueKeys = [...new Set(subjectKeys.filter((key) => key.trim().length > 0))];
+    const facts = new Map<string, EnrichedSubjectFacts>();
+    for (let i = 0; i < uniqueKeys.length; i += SQL_PARAMETER_BUDGET - 1) {
+      const chunk = uniqueKeys.slice(i, i + SQL_PARAMETER_BUDGET - 1);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT *
+           FROM enriched_subject_facts
+           WHERE subject_type = ?
+             AND subject_key IN (${placeholders})`,
+        )
+        .all(subjectType, ...chunk) as Record<string, unknown>[];
+      for (const row of rows) {
+        const parsed = this.enrichedSubjectFactsFromRow(row, now);
+        facts.set(parsed.subjectKey, parsed);
+      }
+    }
+    return facts;
+  }
+
+  private providerObservationById(id: string): ProviderObservationRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM provider_observations WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.providerObservationFromRow(row) : null;
+  }
+
+  private providerObservationBySourceEvent(
+    provider: ProviderObservationProvider,
+    sourceEventId: string,
+  ): ProviderObservationRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM provider_observations
+         WHERE provider = ?
+           AND source_event_id = ?`,
+      )
+      .get(provider, sourceEventId) as Record<string, unknown> | undefined;
+    return row ? this.providerObservationFromRow(row) : null;
+  }
+
+  private providerObservationFromRow(
+    row: Record<string, unknown>,
+  ): ProviderObservationRecord {
+    const normalizedPayload = parseEnrichmentPayload(
+      JSON.parse(String(row.normalized_payload_json)),
+    );
+    return {
+      id: String(row.id),
+      subjectType: ProviderObservationSubjectType.parse(row.subject_type),
+      subjectKey: String(row.subject_key),
+      provider: ProviderObservationProvider.parse(row.provider),
+      sourceEventId: String(row.source_event_id),
+      sourcePayloadHash: String(row.source_payload_hash),
+      observedAt: String(row.observed_at),
+      expiresAt: typeof row.expires_at === "string" ? row.expires_at : null,
+      confidence: Number(row.confidence),
+      rawPayload: JSON.parse(String(row.raw_payload_json)) as unknown,
+      normalizedPayload,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  private projectEnrichedSubjectFacts(
+    input: ProviderObservationInput & { subjectType: "company" },
+    observation: ProviderObservationRecord,
+    now: string,
+    enrichment: Enrichment,
+  ): EnrichedSubjectFacts | null {
+    if (enrichment.confidence < ENRICHMENT_FACT_MIN_CONFIDENCE) {
+      return this.enrichedSubjectFacts(input.subjectType, input.subjectKey, now);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO enriched_subject_facts (
+           subject_type, subject_key, employees, industry, tech_signals_json,
+           regulated, confidence, source_provider, source_observation_id,
+           observed_at, expires_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(subject_type, subject_key) DO UPDATE SET
+           employees=excluded.employees,
+           industry=excluded.industry,
+           tech_signals_json=excluded.tech_signals_json,
+           regulated=excluded.regulated,
+           confidence=excluded.confidence,
+           source_provider=excluded.source_provider,
+           source_observation_id=excluded.source_observation_id,
+           observed_at=excluded.observed_at,
+           expires_at=excluded.expires_at,
+           updated_at=excluded.updated_at
+         WHERE
+           excluded.confidence > enriched_subject_facts.confidence OR
+           (
+             enriched_subject_facts.expires_at IS NOT NULL AND
+             enriched_subject_facts.expires_at <= ? AND
+             (
+               excluded.expires_at IS NULL OR
+               excluded.expires_at > ?
+             )
+           ) OR
+           (
+             excluded.source_observation_id =
+               enriched_subject_facts.source_observation_id AND
+             excluded.observed_at >= enriched_subject_facts.observed_at AND
+             (
+               excluded.expires_at IS enriched_subject_facts.expires_at OR
+               excluded.expires_at IS NULL OR
+               (
+                 enriched_subject_facts.expires_at IS NOT NULL AND
+                 excluded.expires_at > enriched_subject_facts.expires_at
+               )
+             )
+           ) OR
+           (
+             excluded.confidence = enriched_subject_facts.confidence AND
+             excluded.observed_at > enriched_subject_facts.observed_at
+           )`,
+      )
+      .run(
+        input.subjectType,
+        input.subjectKey,
+        enrichment.employees,
+        enrichment.industry,
+        canonicalJson(enrichment.techSignals),
+        enrichment.regulated ? 1 : 0,
+        enrichment.confidence,
+        observation.provider,
+        observation.id,
+        observation.observedAt,
+        observation.expiresAt,
+        now,
+        now,
+        now,
+      );
+    return this.enrichedSubjectFacts(input.subjectType, input.subjectKey, now);
+  }
+
+  private enrichedFactsForObservationSubject(
+    subjectType: ProviderObservationSubjectType,
+    subjectKey: string,
+  ): EnrichedSubjectFacts | null {
+    return subjectType === "company"
+      ? this.enrichedSubjectFacts("company", subjectKey)
+      : null;
+  }
+
+  private enrichedSubjectFactsFromRow(
+    row: Record<string, unknown>,
+    now: string,
+  ): EnrichedSubjectFacts {
+    const techSignals = JSON.parse(String(row.tech_signals_json)) as unknown;
+    if (
+      !Array.isArray(techSignals) ||
+      !techSignals.every((signal) => typeof signal === "string")
+    ) {
+      throw new Error("stored enrichment techSignals must be a string array");
+    }
+    return {
+      subjectType: "company",
+      subjectKey: String(row.subject_key),
+      employees: Number(row.employees),
+      industry: String(row.industry),
+      techSignals,
+      regulated: Number(row.regulated) === 1,
+      confidence: Number(row.confidence),
+      sourceProvider: ProviderObservationProvider.parse(row.source_provider),
+      sourceObservationId: String(row.source_observation_id),
+      observedAt: String(row.observed_at),
+      expiresAt: typeof row.expires_at === "string" ? row.expires_at : null,
+      freshnessStatus: enrichmentFactFreshnessStatus(
+        typeof row.expires_at === "string" ? row.expires_at : null,
+        now,
+      ),
+      updatedAt: String(row.updated_at),
+    };
   }
 
   private recordEqualTimestampCommercialState(
@@ -2007,6 +3730,7 @@ export class Store {
   recordLocalDeploymentFacts(
     input: LocalDeploymentFactsInput,
   ): LocalDeploymentFactsWriteResult {
+    assertCanonicalIsoUtc(input.occurredAt, "deployment facts occurredAt");
     const eventKey = JSON.stringify([
       "deployment_facts",
       LOCAL_DEPLOYMENT_FACTS_SOURCE,
@@ -2361,7 +4085,197 @@ export class Store {
     return rows.map((row) => this.outcomeRejectionFromRow(row));
   }
 
+  outcomeEventCount(): number {
+    return (this.db.prepare("SELECT COUNT(*) n FROM outcome_events").get() as {
+      n: number;
+    }).n;
+  }
+
+  agentSuggestions(limit = 50): AgentSuggestionRecord[] {
+    const boundedLimit = Math.max(0, Math.min(Math.trunc(limit), 250));
+    if (boundedLimit === 0) return [];
+
+    const proposedTarget = Math.ceil(boundedLimit / 2);
+    const decidedTarget = boundedLimit - proposedTarget;
+    const proposedRows = this.db
+      .prepare(
+        `SELECT *
+         FROM agent_suggestions
+         WHERE status = 'proposed'
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(proposedTarget) as Record<string, unknown>[];
+    const decidedRows =
+      decidedTarget > 0
+        ? (this.db
+            .prepare(
+              `SELECT *
+               FROM agent_suggestions
+               WHERE status != 'proposed'
+               ORDER BY decided_at DESC, id DESC
+               LIMIT ?`,
+            )
+            .all(decidedTarget) as Record<string, unknown>[])
+        : [];
+    const rows = [...proposedRows, ...decidedRows];
+
+    if (rows.length < boundedLimit) {
+      const ids = rows.map((row) => String(row.id));
+      const excluded = ids.length
+        ? `WHERE id NOT IN (${ids.map(() => "?").join(", ")})`
+        : "";
+      const backfill = this.db
+        .prepare(
+          `SELECT *
+           FROM agent_suggestions
+           ${excluded}
+           ORDER BY
+             CASE status
+               WHEN 'proposed' THEN 0
+               ELSE 1
+             END,
+             COALESCE(decided_at, created_at) DESC,
+             id DESC
+           LIMIT ?`,
+        )
+        .all(...ids, boundedLimit - rows.length) as Record<string, unknown>[];
+      rows.push(...backfill);
+    }
+
+    rows.sort((a, b) => {
+      const aStatus = String(a.status);
+      const bStatus = String(b.status);
+      const aRank = aStatus === "proposed" ? 0 : 1;
+      const bRank = bStatus === "proposed" ? 0 : 1;
+      if (aRank !== bRank) return aRank - bRank;
+      const aTime = String(
+        aStatus === "proposed"
+          ? a.created_at
+          : (a.decided_at ?? a.created_at),
+      );
+      const bTime = String(
+        bStatus === "proposed"
+          ? b.created_at
+          : (b.decided_at ?? b.created_at),
+      );
+      if (aTime !== bTime) return bTime.localeCompare(aTime);
+      return String(b.id).localeCompare(String(a.id));
+    });
+
+    return rows.map((row) => this.agentSuggestionFromRow(row));
+  }
+
+  policyRecommendationRuns(
+    limit = DEFAULT_POLICY_RECOMMENDATION_RUN_PAGE_LIMIT,
+  ): PolicyRecommendationRunRecord[] {
+    const boundedLimit = policyRecommendationRunPageLimit(limit);
+    if (boundedLimit === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM policy_recommendation_runs
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(boundedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.policyRecommendationRunFromRow(row));
+  }
+
+  nonDemoOutcomeEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number {
+    if (dealIds.length === 0) return 0;
+    assertSqlParameterBudget(
+      dealIds.length + demoSourceEventIds.length,
+      "non-demo outcome fixture guard",
+    );
+    const dealPlaceholders = dealIds.map(() => "?").join(", ");
+    if (demoSourceEventIds.length === 0) {
+      return (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) n
+             FROM outcome_events
+             WHERE deal_id IN (${dealPlaceholders})`,
+          )
+          .get(...dealIds) as { n: number }
+      ).n;
+    }
+    const placeholders = demoSourceEventIds.map(() => "?").join(", ");
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) n
+           FROM outcome_events
+           WHERE deal_id IN (${dealPlaceholders})
+             AND source_event_id NOT IN (${placeholders})`,
+        )
+        .get(...dealIds, ...demoSourceEventIds) as { n: number }
+    ).n;
+  }
+
+  // Counts projected local commercial-state timeline events on demo fixture
+  // deals. Observe-only stale/same-state rows live in
+  // external_event_observations and do not block deterministic fixture replay.
+  nonDemoProjectedCommercialStateEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number {
+    if (dealIds.length === 0) return 0;
+    assertSqlParameterBudget(
+      dealIds.length + demoSourceEventIds.length,
+      "non-demo projected commercial-state fixture guard",
+    );
+    const dealPlaceholders = dealIds.map(() => "?").join(", ");
+    if (demoSourceEventIds.length === 0) {
+      return (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) n
+             FROM events
+             WHERE deal_id IN (${dealPlaceholders})
+               AND meta IS NOT NULL
+               AND json_valid(meta)
+               AND json_extract(meta, '$.kind') = 'commercial_state'
+               AND json_extract(meta, '$.source') = 'local'
+               AND json_extract(meta, '$.projected') = 1
+               AND json_extract(meta, '$.sourceEventId') IS NOT NULL`,
+          )
+          .get(...dealIds) as { n: number }
+      ).n;
+    }
+    const sourcePlaceholders = demoSourceEventIds.map(() => "?").join(", ");
+    // Demo classification requires both the deterministic source id and the
+    // demo reason prefix. A real local correction that somehow collides on the
+    // source UUID still blocks persistent fixture overlay.
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) n
+           FROM events
+           WHERE deal_id IN (${dealPlaceholders})
+             AND meta IS NOT NULL
+             AND json_valid(meta)
+             AND json_extract(meta, '$.kind') = 'commercial_state'
+             AND json_extract(meta, '$.source') = 'local'
+             AND json_extract(meta, '$.projected') = 1
+             AND json_extract(meta, '$.sourceEventId') IS NOT NULL
+             AND NOT (
+               json_extract(meta, '$.sourceEventId') IN (${sourcePlaceholders})
+               AND COALESCE(
+                 json_extract(meta, '$.reason') LIKE 'demo outcome loop:%',
+                 0
+               )
+             )`,
+        )
+        .get(...dealIds, ...demoSourceEventIds) as { n: number }
+    ).n;
+  }
+
   recordLocalOutcome(input: LocalOutcomeInput): LocalOutcomeWriteResult {
+    assertCanonicalIsoUtc(input.occurredAt, "outcome occurredAt");
     const eventKey = JSON.stringify([
       "outcome",
       LOCAL_OUTCOME_SOURCE,
@@ -2423,14 +4337,21 @@ export class Store {
     input: LocalOutcomeInput,
     accepted: boolean,
   ): LocalOutcomeWriteResult {
+    // Conflict rows belong to the first payload under the idempotency key; the
+    // violation table is the diagnostic source for the mismatched replay.
+    const loadPriorOutcome = status !== "idempotency_conflict";
     return {
       status,
       eventKey,
       dealId: input.dealId,
       sourceEventId: input.sourceEventId,
       accepted,
-      event: this.outcomeEventBySourceEvent(input.sourceEventId),
-      rejection: this.outcomeRejectionBySourceEvent(input.sourceEventId),
+      event: loadPriorOutcome
+        ? this.outcomeEventBySourceEvent(input.sourceEventId)
+        : null,
+      rejection: loadPriorOutcome
+        ? this.outcomeRejectionBySourceEvent(input.sourceEventId)
+        : null,
     };
   }
 
@@ -2648,6 +4569,975 @@ export class Store {
       arrDeltaUsd: null,
       reasonCategory: input.reasonCategory,
     });
+  }
+
+  recordLocalAgentSuggestion(
+    input: LocalAgentSuggestionInput,
+  ): LocalAgentSuggestionWriteResult {
+    return this.transactionImmediate(() =>
+      this.recordLocalAgentSuggestionInTransaction(input),
+    );
+  }
+
+  private recordLocalAgentSuggestionInTransaction(
+    input: LocalAgentSuggestionInput,
+  ): LocalAgentSuggestionWriteResult {
+    // Precondition: caller owns the transaction. This lets batch operations
+    // atomically record suggestions and their parent audit row.
+    if (this.transactionDepth === 0) {
+      throw new Error(
+        "recordLocalAgentSuggestionInTransaction requires an active transaction",
+      );
+    }
+    assertCanonicalIsoUtc(input.occurredAt, "agent suggestion occurredAt");
+    const eventKey = JSON.stringify([
+      "agent_suggestion",
+      LOCAL_AGENT_SUGGESTION_SOURCE,
+      input.sourceEventId,
+    ]);
+    const payloadHash = sha256Hex(canonicalJson(input));
+    const existingKey = this.db
+      .prepare("SELECT payload_hash FROM external_event_keys WHERE key = ?")
+      .get(eventKey) as { payload_hash: string | null } | undefined;
+    if (existingKey) {
+      if (existingKey.payload_hash === payloadHash) {
+        const suggestion = this.agentSuggestionBySourceEvent(input.sourceEventId);
+        if (!suggestion) {
+          throw new Error(
+            "agent suggestion source event was claimed without a suggestion row",
+          );
+        }
+        return this.localAgentSuggestionResult(
+          "duplicate",
+          eventKey,
+          suggestion,
+        );
+      }
+      this.recordIdempotencyViolation(
+        input.sourceEventId,
+        "agent_suggestion",
+        existingKey.payload_hash ?? "[legacy-null]",
+        payloadHash,
+        "source event id replayed with a different agent suggestion payload",
+        LOCAL_AGENT_SUGGESTION_SOURCE,
+      );
+      return this.localAgentSuggestionResult(
+        "idempotency_conflict",
+        eventKey,
+        null,
+      );
+    }
+
+    const deal = this.db
+      .prepare("SELECT id, stage FROM deals WHERE id = ?")
+      .get(input.dealId) as { id: string; stage: Stage } | undefined;
+    if (!deal) {
+      return this.localAgentSuggestionResult("not_found", eventKey, null);
+    }
+    if (deal.stage !== "routed") {
+      return this.localAgentSuggestionResult("not_routed", eventKey, null);
+    }
+
+    const now = new Date().toISOString();
+    const suggestionId = `S-${sha256Hex(eventKey).slice(0, 20)}`;
+    this.claimLocalAgentSuggestionEvent(eventKey, payloadHash, now);
+    this.db
+      .prepare(
+        `INSERT INTO agent_suggestions (
+           id, deal_id, kind, status, title, body, rationale, source,
+           source_event_id, source_payload_hash, created_by, occurred_at,
+           created_at
+         )
+         VALUES (?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        suggestionId,
+        input.dealId,
+        input.kind,
+        input.title,
+        input.body,
+        input.rationale,
+        LOCAL_AGENT_SUGGESTION_SOURCE,
+        input.sourceEventId,
+        payloadHash,
+        input.createdBy,
+        input.occurredAt,
+        now,
+      );
+    this.appendEvent(
+      input.dealId,
+      "routed",
+      "routed",
+      "agent_suggestion_proposed",
+      {
+        kind: "agent_suggestion_proposed",
+        source: LOCAL_AGENT_SUGGESTION_SOURCE,
+        eventKey,
+        sourceEventId: input.sourceEventId,
+        suggestionId,
+        suggestionKind: input.kind,
+        createdBy: input.createdBy,
+        occurredAt: input.occurredAt,
+      },
+    );
+    return this.localAgentSuggestionResult(
+      "recorded",
+      eventKey,
+      this.agentSuggestionById(suggestionId),
+    );
+  }
+
+  recordLocalAgentSuggestionDecision(
+    input: LocalAgentSuggestionDecisionInput,
+  ): LocalAgentSuggestionDecisionResult {
+    assertCanonicalIsoUtc(
+      input.occurredAt,
+      "agent suggestion decision occurredAt",
+    );
+    const eventKey = JSON.stringify([
+      "agent_suggestion_decision",
+      LOCAL_AGENT_SUGGESTION_SOURCE,
+      input.sourceEventId,
+    ]);
+    const payloadHash = sha256Hex(canonicalJson(input));
+    return this.transactionImmediate(() => {
+      const existingKey = this.db
+        .prepare("SELECT payload_hash FROM external_event_keys WHERE key = ?")
+        .get(eventKey) as { payload_hash: string | null } | undefined;
+      if (existingKey) {
+        if (existingKey.payload_hash === payloadHash) {
+          const suggestion = this.agentSuggestionByDecisionSourceEvent(
+            input.sourceEventId,
+          );
+          if (!suggestion) {
+            throw new Error(
+              "agent suggestion decision event was claimed without a decided suggestion row",
+            );
+          }
+          return this.localAgentSuggestionDecisionResult(
+            "duplicate",
+            eventKey,
+            suggestion,
+          );
+        }
+        this.recordIdempotencyViolation(
+          input.sourceEventId,
+          "agent_suggestion_decision",
+          existingKey.payload_hash ?? "[legacy-null]",
+          payloadHash,
+          "source event id replayed with a different agent suggestion decision payload",
+          LOCAL_AGENT_SUGGESTION_SOURCE,
+        );
+        return this.localAgentSuggestionDecisionResult(
+          "idempotency_conflict",
+          eventKey,
+          null,
+        );
+      }
+
+      const suggestion = this.agentSuggestionById(input.suggestionId);
+      if (!suggestion) {
+        return this.localAgentSuggestionDecisionResult("not_found", eventKey, null);
+      }
+      if (suggestion.status !== "proposed") {
+        return this.localAgentSuggestionDecisionResult(
+          "already_decided",
+          eventKey,
+          suggestion,
+        );
+      }
+      if (input.occurredAt < suggestion.occurredAt) {
+        return this.localAgentSuggestionDecisionResult(
+          "decision_before_proposal",
+          eventKey,
+          suggestion,
+        );
+      }
+
+      const now = new Date().toISOString();
+      this.claimLocalAgentSuggestionEvent(eventKey, payloadHash, now);
+      this.db
+        .prepare(
+          `UPDATE agent_suggestions
+           SET status = ?,
+               decided_at = ?,
+               decided_by = ?,
+               decision_source_event_id = ?,
+               decision_payload_hash = ?,
+               decision_reason = ?
+           WHERE id = ?
+             AND status = 'proposed'`,
+        )
+        .run(
+          input.decision,
+          input.occurredAt,
+          input.humanPrincipal,
+          input.sourceEventId,
+          payloadHash,
+          input.reason,
+          input.suggestionId,
+        );
+      const decided = this.agentSuggestionById(input.suggestionId);
+      this.appendEvent(
+        suggestion.dealId,
+        "routed",
+        "routed",
+        "agent_suggestion_decided",
+        {
+          kind: "agent_suggestion_decided",
+          source: LOCAL_AGENT_SUGGESTION_SOURCE,
+          eventKey,
+          sourceEventId: input.sourceEventId,
+          suggestionId: input.suggestionId,
+          decision: input.decision,
+          humanPrincipal: input.humanPrincipal,
+          occurredAt: input.occurredAt,
+          reason: input.reason,
+        },
+      );
+      return this.localAgentSuggestionDecisionResult(
+        "recorded",
+        eventKey,
+        decided,
+      );
+    });
+  }
+
+  private localAgentSuggestionResult(
+    status: LocalAgentSuggestionWriteResult["status"],
+    eventKey: string,
+    suggestion: AgentSuggestionRecord | null,
+  ): LocalAgentSuggestionWriteResult {
+    return { status, eventKey, suggestion };
+  }
+
+  private localAgentSuggestionDecisionResult(
+    status: LocalAgentSuggestionDecisionResult["status"],
+    eventKey: string,
+    suggestion: AgentSuggestionRecord | null,
+  ): LocalAgentSuggestionDecisionResult {
+    return { status, eventKey, suggestion };
+  }
+
+  private claimLocalAgentSuggestionEvent(
+    eventKey: string,
+    payloadHash: string,
+    recordedAt: string,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO external_event_keys (
+           key, system, recorded_at, notify_status, scope, payload_hash
+         )
+         VALUES (?, ?, ?, 'ok', 'source_event', ?)`,
+      )
+      .run(eventKey, LOCAL_AGENT_SUGGESTION_SOURCE, recordedAt, payloadHash);
+  }
+
+  private agentSuggestionById(id: string): AgentSuggestionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM agent_suggestions WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.agentSuggestionFromRow(row) : null;
+  }
+
+  private agentSuggestionBySourceEvent(
+    sourceEventId: string,
+  ): AgentSuggestionRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM agent_suggestions
+         WHERE source = ?
+           AND source_event_id = ?`,
+      )
+      .get(LOCAL_AGENT_SUGGESTION_SOURCE, sourceEventId) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.agentSuggestionFromRow(row) : null;
+  }
+
+  private agentSuggestionByDecisionSourceEvent(
+    sourceEventId: string,
+  ): AgentSuggestionRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM agent_suggestions
+         WHERE source = ?
+           AND decision_source_event_id = ?`,
+      )
+      .get(LOCAL_AGENT_SUGGESTION_SOURCE, sourceEventId) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.agentSuggestionFromRow(row) : null;
+  }
+
+  private agentSuggestionFromRow(row: Record<string, unknown>): AgentSuggestionRecord {
+    return {
+      id: String(row.id),
+      dealId: String(row.deal_id),
+      kind: AgentSuggestionKind.parse(row.kind),
+      status: AgentSuggestionStatus.parse(row.status),
+      title: String(row.title),
+      body: String(row.body),
+      rationale: String(row.rationale),
+      source: parseAgentSuggestionSource(row.source),
+      sourceEventId: String(row.source_event_id),
+      sourcePayloadHash: String(row.source_payload_hash),
+      createdBy: String(row.created_by),
+      occurredAt: String(row.occurred_at),
+      createdAt: String(row.created_at),
+      decidedAt:
+        typeof row.decided_at === "string" ? String(row.decided_at) : null,
+      decidedBy:
+        typeof row.decided_by === "string" ? String(row.decided_by) : null,
+      decisionSourceEventId:
+        typeof row.decision_source_event_id === "string"
+          ? String(row.decision_source_event_id)
+          : null,
+      decisionPayloadHash:
+        typeof row.decision_payload_hash === "string"
+          ? String(row.decision_payload_hash)
+          : null,
+      decisionReason:
+        typeof row.decision_reason === "string"
+          ? String(row.decision_reason)
+          : null,
+    };
+  }
+
+  workItems(limit = 50): WorkItemRecord[] {
+    const normalizedLimit = Number.isFinite(limit) ? limit : 50;
+    const cappedLimit = Math.max(1, Math.min(250, normalizedLimit));
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM work_items
+         ORDER BY
+           CASE status
+             WHEN 'assigned' THEN 0
+             WHEN 'resolved' THEN 1
+             WHEN 'waived' THEN 2
+             ELSE 3
+           END,
+           CASE priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           updated_at DESC,
+           id
+         LIMIT ?`,
+      )
+      .all(cappedLimit) as Record<string, unknown>[];
+    return rows.map((row) => this.workItemFromRow(row));
+  }
+
+  recordWorkItemSuggestions(
+    input: WorkItemSuggestionRunInput,
+  ): WorkItemSuggestionRunResult {
+    assertCanonicalIsoUtc(input.evaluatedAt, "work item suggestion evaluatedAt");
+    const createdBy = nonEmptyLabel(
+      input.createdBy,
+      "work item suggestion createdBy",
+    );
+    const limit = workItemSuggestionLimit(input.limit);
+
+    return this.transactionImmediate(() => {
+      const candidates = this.assignedWorkItemsForSuggestions(limit);
+      const results: WorkItemSuggestionRunResult["results"] = candidates.map(
+        (candidate) => {
+          const suggestionInput: LocalAgentSuggestionInput = {
+            dealId: candidate.dealId,
+            sourceEventId: candidate.agentSuggestionSourceEventId,
+            kind: workItemSuggestionKind(candidate),
+            title: workItemSuggestionTitle(candidate),
+            body: workItemSuggestionBody(candidate),
+            rationale: workItemSuggestionRationale(candidate),
+            createdBy,
+            // occurredAt is the source work-item signal time, not the run time.
+            // Keeping it stable prevents replayed runs from turning the same
+            // source event into an idempotency conflict.
+            occurredAt: candidate.createdAt,
+          };
+          const result =
+            this.recordLocalAgentSuggestionInTransaction(suggestionInput);
+          return {
+            workItemId: candidate.id,
+            dealId: candidate.dealId,
+            queue: candidate.queue,
+            sourceEventId: suggestionInput.sourceEventId,
+            status: result.status,
+            suggestionId: result.suggestion?.id ?? null,
+            title: suggestionInput.title,
+          };
+        },
+      );
+
+      const statusCounts = emptyAgentSuggestionWriteStatusCounts();
+      for (const result of results) {
+        statusCounts[result.status] += 1;
+      }
+      const recorded = statusCounts.recorded;
+      const duplicate = statusCounts.duplicate;
+      const idempotencyConflict = statusCounts.idempotency_conflict;
+      const skipped = statusCounts.not_found + statusCounts.not_routed;
+      if (skipped > 0) {
+        throw new Error(
+          "work item suggestion candidates must reference routed deals",
+        );
+      }
+
+      return {
+        status: agentSuggestionRunStatus({
+          recorded,
+          duplicate,
+          idempotencyConflict,
+          skipped,
+        }),
+        createdBy,
+        limit,
+        evaluatedAt: input.evaluatedAt,
+        attempted: results.length,
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+        statusCounts,
+        results,
+      };
+    });
+  }
+
+  recordLocalWorkItem(
+    input: LocalWorkItemInput,
+    signal: RoleQueueItem,
+  ): LocalWorkItemWriteResult {
+    // Caller must resolve this from roleQueues immediately before writing; the
+    // store checks identity but does not re-run the full queue projection.
+    assertCanonicalIsoUtc(input.occurredAt, "work item occurredAt");
+    if (input.dueAt) assertCanonicalIsoUtc(input.dueAt, "work item dueAt");
+    if (input.dealId !== signal.dealId || input.queue !== signal.queue) {
+      throw new Error("work item input does not match role queue signal");
+    }
+    const sourceKey = this.workItemSourceKey(input.queue, input.dealId);
+    const eventKey = JSON.stringify([
+      "work_item",
+      "role_queue",
+      sourceKey,
+      input.sourceEventId,
+    ]);
+    const { occurredAt: _occurredAt, reason: _reason, ...stableInput } = input;
+    // Open notes are operator context, not the identity of the open command.
+    // Signal detail is likewise a point-in-time snapshot used to describe the
+    // work item, so retries do not fail when queue priority/reason text evolves.
+    const payloadHash = sha256Hex(
+      canonicalJson({
+        input: stableInput,
+        sourceKey,
+      }),
+    );
+
+    return this.transactionImmediate(() => {
+      const replay = this.workItemReplayResult(
+        eventKey,
+        payloadHash,
+      );
+      if (replay) return replay;
+
+      const existing = this.assignedWorkItemBySourceKey(sourceKey);
+      if (existing) {
+        this.insertWorkItemEvent({
+          workItemId: existing.id,
+          action: "open_attempted",
+          sourceEventId: input.sourceEventId,
+          eventKey,
+          payloadHash,
+          actor: input.createdBy,
+          owner: input.owner,
+          reason:
+            input.reason ??
+            "Open requested while an assigned work item already existed.",
+          occurredAt: input.occurredAt,
+          createdAt: new Date().toISOString(),
+        });
+        return this.localWorkItemResult("already_exists", eventKey, existing);
+      }
+
+      const now = new Date().toISOString();
+      const workItemId = `WI-${sha256Hex(`${sourceKey}:${input.sourceEventId}`).slice(0, 20)}`;
+      const agentSuggestionSourceEventId = workItemSuggestionSourceEventId({
+        id: workItemId,
+      });
+      const arrDescription = Number.isFinite(signal.amount)
+        ? `$${Math.round(signal.amount).toLocaleString("en-US")}`
+        : "unknown";
+      const title = `${this.roleQueueLabel(signal.queue)}: ${signal.company}`;
+      const description = [
+        signal.reason,
+        `Status: ${signal.status}`,
+        `ARR: ${arrDescription}`,
+        input.reason ? `Operator note: ${input.reason}` : "",
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      this.db
+        .prepare(
+          `INSERT INTO work_items (
+             id, source_kind, source_key, deal_id, queue, status, priority,
+             owner, title, description, due_at, agent_suggestion_source_event_id,
+             created_by, created_at, updated_at
+           )
+           VALUES (?, 'role_queue', ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          workItemId,
+          sourceKey,
+          input.dealId,
+          input.queue,
+          signal.priority,
+          input.owner,
+          title,
+          description,
+          input.dueAt ?? null,
+          agentSuggestionSourceEventId,
+          input.createdBy,
+          input.occurredAt,
+          input.occurredAt,
+        );
+      this.insertWorkItemEvent({
+        workItemId,
+        action: "opened",
+        sourceEventId: input.sourceEventId,
+        eventKey,
+        payloadHash,
+        actor: input.createdBy,
+        owner: input.owner,
+        reason: input.reason ?? "Opened from role queue.",
+        occurredAt: input.occurredAt,
+        createdAt: now,
+      });
+      this.appendEvent(
+        input.dealId,
+        "routed",
+        "routed",
+        `work_item_opened: ${workItemId} ${input.queue} owner ${input.owner}`,
+      );
+      return this.localWorkItemResult(
+        "recorded",
+        eventKey,
+        this.workItemById(workItemId),
+      );
+    });
+  }
+
+  recordLocalWorkItemAction(
+    input: LocalWorkItemActionInput,
+  ): LocalWorkItemActionResult {
+    assertCanonicalIsoUtc(input.occurredAt, "work item action occurredAt");
+    const eventKey = JSON.stringify([
+      "work_item_action",
+      input.workItemId,
+      input.action,
+      input.sourceEventId,
+    ]);
+    const { occurredAt: _occurredAt, ...stableInput } = input;
+    // Action reasons are persisted as resolution evidence, so changing them
+    // under the same event key is an idempotency conflict rather than a retry.
+    const payloadHash = sha256Hex(canonicalJson(stableInput));
+
+    return this.transactionImmediate(() => {
+      const replay = this.workItemActionReplayResult(
+        eventKey,
+        payloadHash,
+      );
+      if (replay) return replay;
+
+      const current = this.workItemById(input.workItemId);
+      if (!current) {
+        return this.localWorkItemActionResult("not_found", eventKey, null);
+      }
+      if (current.status !== "assigned") {
+        this.insertWorkItemEvent({
+          workItemId: input.workItemId,
+          action: "already_closed",
+          sourceEventId: input.sourceEventId,
+          eventKey,
+          payloadHash,
+          actor: input.humanPrincipal,
+          owner: input.owner ?? null,
+          reason: input.reason,
+          occurredAt: input.occurredAt,
+          createdAt: new Date().toISOString(),
+        });
+        this.appendEvent(
+          current.dealId,
+          "routed",
+          "routed",
+          `work_item_${input.action}_already_closed_noop: ${input.workItemId} by ${input.humanPrincipal}`,
+        );
+        return this.localWorkItemActionResult("already_closed", eventKey, current);
+      }
+      const now = new Date().toISOString();
+      // Recency is a projection rule, not an audit rule: older actions,
+      // including terminal attempts, are logged as superseded no-ops so an old
+      // backfill cannot close or reassign newer operator work. If these local
+      // commands ever become distributed writes, replace client occurredAt as
+      // the ordering key with a server-assigned monotonic sequence.
+      const actionStatus: LocalWorkItemActionResult["status"] =
+        input.occurredAt < current.updatedAt ? "superseded" : "recorded";
+      const nextUpdatedAt =
+        input.occurredAt > current.updatedAt ? input.occurredAt : current.updatedAt;
+      if (input.action === "assign") {
+        const nextOwner = input.owner;
+        if (!nextOwner) {
+          this.insertWorkItemEvent({
+            workItemId: input.workItemId,
+            action: "invalid_action",
+            sourceEventId: input.sourceEventId,
+            eventKey,
+            payloadHash,
+            actor: input.humanPrincipal,
+            owner: null,
+            reason: input.reason,
+            occurredAt: input.occurredAt,
+            createdAt: new Date().toISOString(),
+          });
+          this.appendEvent(
+            current.dealId,
+            "routed",
+            "routed",
+            `work_item_assign_invalid_action_noop: ${input.workItemId} by ${input.humanPrincipal} missing owner`,
+          );
+          return this.localWorkItemActionResult("invalid_action", eventKey, current);
+        }
+        if (actionStatus === "recorded") {
+          this.db
+            .prepare(
+              `UPDATE work_items
+               SET owner = ?, updated_at = ?
+               WHERE id = ?
+                 AND status = 'assigned'`,
+            )
+            .run(nextOwner, nextUpdatedAt, input.workItemId);
+        }
+      } else {
+        const nextStatus: Exclude<WorkItemStatusType, "assigned"> =
+          input.action === "resolve" ? "resolved" : "waived";
+        if (actionStatus === "recorded") {
+          this.db
+            .prepare(
+              `UPDATE work_items
+               SET status = ?,
+                   updated_at = ?,
+                   resolved_at = ?,
+                   resolved_by = ?,
+                   resolution_reason = ?
+               WHERE id = ?
+                 AND status = 'assigned'`,
+            )
+            .run(
+              nextStatus,
+              nextUpdatedAt,
+              input.occurredAt,
+              input.humanPrincipal,
+              input.reason,
+              input.workItemId,
+            );
+        }
+      }
+      this.insertWorkItemEvent({
+        workItemId: input.workItemId,
+        action: actionStatus === "superseded" ? "superseded" : input.action,
+        sourceEventId: input.sourceEventId,
+        eventKey,
+        payloadHash,
+        actor: input.humanPrincipal,
+        owner: input.owner ?? null,
+        reason: input.reason,
+        occurredAt: input.occurredAt,
+        createdAt: now,
+      });
+      const updated = this.workItemById(input.workItemId);
+      if (!updated) {
+        throw new Error("work item disappeared during action write");
+      }
+      this.appendEvent(
+        updated.dealId,
+        "routed",
+        "routed",
+        actionStatus === "superseded"
+          ? `work_item_${input.action}_superseded_noop: ${input.workItemId} by ${input.humanPrincipal} older than current projection`
+          : `work_item_${input.action}: ${input.workItemId} by ${input.humanPrincipal}`,
+      );
+      return this.localWorkItemActionResult(actionStatus, eventKey, updated);
+    });
+  }
+
+  private workItemReplayResult(
+    eventKey: string,
+    payloadHash: string,
+  ): LocalWorkItemWriteResult | null {
+    const event = this.workItemEventByEventKey(eventKey);
+    if (!event) return null;
+    const item = this.workItemById(event.workItemId);
+    if (!item) {
+      throw new Error("work item event was claimed without a work item row");
+    }
+    if (event.sourcePayloadHash !== payloadHash) {
+      return this.localWorkItemResult("idempotency_conflict", eventKey, item);
+    }
+    if (event.action === "open_attempted") {
+      // "Already exists" should describe the current active blocker, not a
+      // historical blocker that may have closed since the no-op was logged.
+      const activeItem =
+        item.status === "assigned"
+          ? item
+          : this.assignedWorkItemBySourceKey(item.sourceKey);
+      return this.localWorkItemResult(
+        activeItem ? "already_exists" : "duplicate",
+        eventKey,
+        activeItem ?? item,
+      );
+    }
+    return this.localWorkItemResult(
+      "duplicate",
+      eventKey,
+      item,
+    );
+  }
+
+  private workItemActionReplayResult(
+    eventKey: string,
+    payloadHash: string,
+  ): LocalWorkItemActionResult | null {
+    const event = this.workItemEventByEventKey(eventKey);
+    if (!event) return null;
+    const item = this.workItemById(event.workItemId);
+    if (!item) {
+      throw new Error("work item event was claimed without a work item row");
+    }
+    if (event.sourcePayloadHash !== payloadHash) {
+      return this.localWorkItemActionResult(
+        "idempotency_conflict",
+        eventKey,
+        item,
+      );
+    }
+    return this.localWorkItemActionResult(
+      event.action === "already_closed"
+        ? "already_closed"
+        : event.action === "superseded"
+          ? "superseded"
+          : event.action === "invalid_action"
+            ? "invalid_action"
+            : "duplicate",
+      eventKey,
+      item,
+    );
+  }
+
+  private insertWorkItemEvent(event: {
+    workItemId: string;
+    action:
+      | "opened"
+      | "open_attempted"
+      | "already_closed"
+      | "superseded"
+      | "invalid_action"
+      | LocalWorkItemActionInput["action"];
+    sourceEventId: string;
+    eventKey: string;
+    payloadHash: string;
+    actor: string;
+    owner: string | null;
+    reason: string;
+    occurredAt: string;
+    createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO work_item_events (
+           id, work_item_id, action, source_event_id, event_key, source_payload_hash,
+           actor, owner, reason, occurred_at, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        `WIE-${sha256Hex(`${event.eventKey}:${event.payloadHash}`).slice(0, 20)}`,
+        event.workItemId,
+        event.action,
+        event.sourceEventId,
+        event.eventKey,
+        event.payloadHash,
+        event.actor,
+        event.owner,
+        event.reason,
+        event.occurredAt,
+        event.createdAt,
+      );
+  }
+
+  private workItemEventByEventKey(
+    eventKey: string,
+  ): {
+    workItemId: string;
+    action: string;
+    sourcePayloadHash: string;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT work_item_id, action, source_payload_hash
+         FROM work_item_events
+         WHERE event_key = ?`,
+      )
+      .get(eventKey) as
+      | { work_item_id: string; action: string; source_payload_hash: string }
+      | undefined;
+    return row
+      ? {
+          workItemId: row.work_item_id,
+          action: row.action,
+          sourcePayloadHash: row.source_payload_hash,
+        }
+      : null;
+  }
+
+  private workItemById(id: string): WorkItemRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM work_items WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.workItemFromRow(row) : null;
+  }
+
+  private assignedWorkItemBySourceKey(sourceKey: string): WorkItemRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT *
+         FROM work_items
+         WHERE source_key = ?
+           AND status = 'assigned'
+         LIMIT 1`,
+      )
+      .get(sourceKey) as Record<string, unknown> | undefined;
+    return row ? this.workItemFromRow(row) : null;
+  }
+
+  private assignedWorkItemsForSuggestions(limit: number): WorkItemRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT work_items.*
+         FROM work_items
+         JOIN deals
+           ON deals.id = work_items.deal_id
+          -- deals.stage is the pipeline storage state. Commercial closed-won
+          -- and post-sale outcomes live in their own tables, so those items
+          -- remain draftable while the routed deal row stays in this stage.
+          AND deals.stage = 'routed'
+         WHERE work_items.status = 'assigned'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM agent_suggestions
+             WHERE agent_suggestions.source = ?
+               AND agent_suggestions.source_event_id =
+                 work_items.agent_suggestion_source_event_id
+           )
+         ORDER BY
+           CASE work_items.priority
+             WHEN 'high' THEN 0
+             WHEN 'medium' THEN 1
+             WHEN 'low' THEN 2
+             ELSE 3
+           END,
+           work_items.created_at ASC,
+           work_items.id
+         LIMIT ?`,
+      )
+      .all(LOCAL_AGENT_SUGGESTION_SOURCE, limit) as Record<string, unknown>[];
+    return rows.map((row) => this.workItemFromRow(row));
+  }
+
+  private workItemFromRow(row: Record<string, unknown>): WorkItemRecord {
+    const id = String(row.id);
+    const queue = this.parseRoleQueueKind(row.queue);
+    if (typeof row.agent_suggestion_source_event_id !== "string") {
+      throw new Error(`work item ${id} is missing agent suggestion source id`);
+    }
+    return {
+      id,
+      sourceKind: "role_queue",
+      sourceKey: String(row.source_key),
+      dealId: String(row.deal_id),
+      queue,
+      status: WorkItemStatus.parse(row.status),
+      priority: this.parseRoleQueuePriority(row.priority),
+      owner: String(row.owner),
+      title: String(row.title),
+      description: String(row.description),
+      dueAt: typeof row.due_at === "string" ? String(row.due_at) : null,
+      agentSuggestionSourceEventId: String(row.agent_suggestion_source_event_id),
+      createdBy: String(row.created_by),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      resolvedAt:
+        typeof row.resolved_at === "string" ? String(row.resolved_at) : null,
+      resolvedBy:
+        typeof row.resolved_by === "string" ? String(row.resolved_by) : null,
+      resolutionReason:
+        typeof row.resolution_reason === "string"
+          ? String(row.resolution_reason)
+          : null,
+    };
+  }
+
+  private localWorkItemResult(
+    status: LocalWorkItemWriteResult["status"],
+    eventKey: string,
+    workItem: WorkItemRecord | null,
+  ): LocalWorkItemWriteResult {
+    return { status, eventKey, workItem };
+  }
+
+  private localWorkItemActionResult(
+    status: LocalWorkItemActionResult["status"],
+    eventKey: string,
+    workItem: WorkItemRecord | null,
+  ): LocalWorkItemActionResult {
+    return { status, eventKey, workItem };
+  }
+
+  private workItemSourceKey(queue: RoleQueueKind, dealId: string): string {
+    return `role_queue:${queue}:${dealId}`;
+  }
+
+  private roleQueueLabel(queue: RoleQueueKind): string {
+    const labels: Record<RoleQueueKind, string> = {
+      ae_attention: "AE attention",
+      finance_review: "Finance review",
+      legal_review: "Legal review",
+      deployment_readiness: "Deployment readiness",
+      growth_attribution: "Growth attribution",
+    };
+    return labels[queue];
+  }
+
+  private parseRoleQueueKind(value: unknown): RoleQueueKind {
+    if (
+      typeof value === "string" &&
+      ROLE_QUEUE_KINDS.includes(value as RoleQueueKind)
+    ) {
+      return value as RoleQueueKind;
+    }
+    throw new Error(`invalid role queue kind: ${String(value)}`);
+  }
+
+  private parseRoleQueuePriority(value: unknown): RoleQueuePriority {
+    if (value === "high" || value === "medium" || value === "low") {
+      return value;
+    }
+    throw new Error(`invalid role queue priority: ${String(value)}`);
   }
 
   private deriveDeploymentReadiness(
@@ -3913,16 +6803,16 @@ export class Store {
     return this.routedRecords(limit).map((record) => record.deal);
   }
 
+  routedByIds(dealIds: readonly string[]): RoutedDeal[] {
+    return this.routedRecordsByIds(dealIds).map((record) => record.deal);
+  }
+
   routedRecords(
     limit?: number,
-  ): Array<{
-    deal: RoutedDeal;
-    updatedAt: string;
-    sinkStatus: "synced" | "partial" | "dry_run" | "needs_review";
-    externalStage: ExternalStageState | null;
-  }> {
+  ): RoutedRecord[] {
     const cappedLimit =
       limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
+    // id is only a deterministic tie-breaker for equal-millisecond updates.
     const rows =
       cappedLimit === undefined
         ? (this.db
@@ -3932,18 +6822,9 @@ export class Store {
                       external_stage_updated_at
                FROM deals
                WHERE stage='routed'
-               ORDER BY updated_at DESC`,
+               ORDER BY updated_at DESC, id DESC`,
             )
-            .all() as Array<{
-            payload: string;
-            updated_at: string;
-            sink_status: string | null;
-            external_system: string | null;
-            external_id: string | null;
-            external_stage_id: string | null;
-            external_stage_label: string | null;
-            external_stage_updated_at: string | null;
-          }>)
+            .all() as RoutedRecordRow[])
         : (this.db
             .prepare(
               `SELECT payload, updated_at, sink_status, external_system,
@@ -3951,20 +6832,15 @@ export class Store {
                       external_stage_updated_at
                FROM deals
                WHERE stage='routed'
-               ORDER BY updated_at DESC
+               ORDER BY updated_at DESC, id DESC
                LIMIT ?`,
             )
-            .all(cappedLimit) as Array<{
-            payload: string;
-            updated_at: string;
-            sink_status: string | null;
-            external_system: string | null;
-            external_id: string | null;
-            external_stage_id: string | null;
-            external_stage_label: string | null;
-            external_stage_updated_at: string | null;
-          }>);
-    return rows.map((r) => ({
+            .all(cappedLimit) as RoutedRecordRow[]);
+    return rows.map((r) => this.routedRecordFromRow(r));
+  }
+
+  private routedRecordFromRow(r: RoutedRecordRow): RoutedRecord {
+    return {
       deal: JSON.parse(r.payload) as RoutedDeal,
       updatedAt: r.updated_at,
       sinkStatus:
@@ -3974,7 +6850,28 @@ export class Store {
           ? r.sink_status
           : "needs_review",
       externalStage: this.externalStageFromRow(r),
-    }));
+    };
+  }
+
+  private routedRecordsByIds(dealIds: readonly string[]): RoutedRecord[] {
+    if (dealIds.length === 0) return [];
+    const records: RoutedRecord[] = [];
+    for (let i = 0; i < dealIds.length; i += ROLE_QUEUE_MAX_SCAN) {
+      const chunk = dealIds.slice(i, i + ROLE_QUEUE_MAX_SCAN);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT payload, updated_at, sink_status, external_system,
+                  external_id, external_stage_id, external_stage_label,
+                  external_stage_updated_at
+           FROM deals
+           WHERE stage='routed'
+             AND id IN (${placeholders})`,
+        )
+        .all(...chunk) as RoutedRecordRow[];
+      records.push(...rows.map((row) => this.routedRecordFromRow(row)));
+    }
+    return records;
   }
 
   private externalStageFromRow(r: {
@@ -4004,11 +6901,7 @@ export class Store {
 
   quarantinedRecords(
     limit?: number,
-  ): Array<{
-    quarantine: Quarantine;
-    updatedAt: string;
-    externalStage: ExternalStageState | null;
-  }> {
+  ): QuarantinedRecord[] {
     const cappedLimit =
       limit === undefined ? undefined : Math.max(1, Math.min(1000, limit));
     const rows =
@@ -4017,11 +6910,12 @@ export class Store {
             .prepare(
               `SELECT quarantine, updated_at, external_system, external_id,
                       external_stage_id, external_stage_label,
-                      external_stage_updated_at
+                      external_stage_updated_at, payload
                FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC`,
             )
             .all() as Array<{
             quarantine: string;
+            payload: string | null;
             updated_at: string;
             external_system: string | null;
             external_id: string | null;
@@ -4033,11 +6927,12 @@ export class Store {
             .prepare(
               `SELECT quarantine, updated_at, external_system, external_id,
                       external_stage_id, external_stage_label,
-                      external_stage_updated_at
+                      external_stage_updated_at, payload
                FROM deals WHERE stage='quarantined' ORDER BY updated_at DESC LIMIT ?`,
             )
             .all(cappedLimit) as Array<{
             quarantine: string;
+            payload: string | null;
             updated_at: string;
             external_system: string | null;
             external_id: string | null;
@@ -4047,9 +6942,37 @@ export class Store {
           }>);
     return rows.map((r) => ({
       quarantine: JSON.parse(r.quarantine) as Quarantine,
+      deal: dealFromPayload(r.payload),
+      routedDeal: routedDealFromPayload(r.payload),
       updatedAt: r.updated_at,
       externalStage: this.externalStageFromRow(r),
     }));
+  }
+
+  quarantinedDeal(dealId: string): {
+    quarantine: Quarantine;
+    deal: Deal | null;
+    routedDeal: RoutedDeal | null;
+    updatedAt: string;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT quarantine, payload, updated_at
+         FROM deals
+         WHERE id = ?
+           AND stage = 'quarantined'`,
+      )
+      .get(dealId) as
+      | { quarantine: string; payload: string | null; updated_at: string }
+      | undefined;
+    return row
+      ? {
+          quarantine: JSON.parse(row.quarantine) as Quarantine,
+          deal: dealFromPayload(row.payload),
+          routedDeal: routedDealFromPayload(row.payload),
+          updatedAt: row.updated_at,
+        }
+      : null;
   }
 
   intakeLabels(dealIds: string[]): Map<string, string> {
@@ -4074,6 +6997,690 @@ export class Store {
       labels.set(row.deal_id, row.detail.slice("intake: ".length));
     }
     return labels;
+  }
+
+  roleQueues(
+    limit = 50,
+    readinessRecords?: DeploymentReadinessState[],
+  ): RoleQueues {
+    const perQueueLimit = Math.max(1, Math.min(250, limit));
+    const scanLimit = Math.min(
+      ROLE_QUEUE_MAX_SCAN,
+      Math.max(100, perQueueLimit * 6),
+    );
+    const queues = emptyRoleQueues();
+    const readinessRows = readinessRecords ?? this.deploymentReadinessRecords();
+    const recentRoutedRecords = this.routedRecords(scanLimit);
+    const recentRoutedDealIds = new Set(
+      recentRoutedRecords.map((record) => record.deal.id),
+    );
+    const missingReadinessDealIds = readinessRows
+      .filter(
+        (record) =>
+          (record.readiness === "pending" || record.readiness === "blocked") &&
+          !recentRoutedDealIds.has(record.dealId),
+      )
+      .slice(0, ROLE_QUEUE_MAX_SCAN)
+      .map((record) => record.dealId);
+    const openActionDealIds = (
+      this.db
+        .prepare(
+          `SELECT d.id
+           FROM deals d
+           LEFT JOIN commercial_states cs ON cs.deal_id = d.id
+           WHERE d.stage = 'routed'
+             AND d.route_kind = 'human_assisted'
+             AND (
+               cs.commercial_state IS NULL OR
+               cs.commercial_state NOT IN ('closed_won', 'closed_lost')
+             )
+           ORDER BY
+             CASE
+               WHEN d.deal_usd >= ?
+                 OR d.finance_flag IS NOT NULL
+                 OR d.legal_flag IS NOT NULL
+               THEN 0 ELSE 1
+             END,
+             d.deal_usd DESC,
+             d.updated_at DESC,
+             d.id
+           LIMIT ?`,
+        )
+        .all(ROLE_QUEUE_HIGH_PRIORITY_USD, ROLE_QUEUE_MAX_SCAN) as Array<{
+        id: string;
+      }>
+    )
+      .map((row) => row.id)
+      .filter((dealId) => !recentRoutedDealIds.has(dealId));
+    const backfillDealIds = Array.from(
+      new Set([...missingReadinessDealIds, ...openActionDealIds]),
+    );
+    const routedRecords = [
+      ...recentRoutedRecords,
+      ...this.routedRecordsByIds(backfillDealIds),
+    ];
+    const dealIds = routedRecords.map((record) => record.deal.id);
+    const routedById = new Map(
+      routedRecords.map((record) => [record.deal.id, record] as const),
+    );
+    const commercialRows: Record<string, unknown>[] = [];
+    for (let i = 0; i < dealIds.length; i += ROLE_QUEUE_MAX_SCAN) {
+      const chunk = dealIds.slice(i, i + ROLE_QUEUE_MAX_SCAN);
+      if (chunk.length === 0) continue;
+      commercialRows.push(
+        ...(this.db
+          .prepare(
+            `SELECT *
+             FROM commercial_states
+             WHERE deal_id IN (${chunk.map(() => "?").join(", ")})`,
+          )
+          .all(...chunk) as Record<string, unknown>[]),
+      );
+    }
+    const commercialByDeal = new Map(
+      commercialRows.map((row) => [
+        String(row.deal_id),
+        this.commercialStateFromRow(row),
+      ] as const),
+    );
+    const readinessByDeal = new Map(
+      readinessRows.map((record) => [record.dealId, record] as const),
+    );
+
+    for (const record of routedRecords) {
+      const deal = record.deal;
+      const commercial = commercialByDeal.get(deal.id) ?? null;
+      const commercialStatus = commercial?.commercialState ?? "no_commercial_state";
+      const readiness = readinessByDeal.get(deal.id);
+      const updatedAt = newestTimestamp(record.updatedAt, [
+        commercial?.updatedAt,
+        readiness?.updatedAt,
+      ]);
+
+      const terminal =
+        commercial !== null && isTerminalCommercialState(commercial.commercialState);
+      if (deal.route.kind === "human_assisted" && !terminal) {
+        const priority = actionRolePriority(deal);
+        queues.ae_attention.push(
+          roleQueueItem(
+            deal,
+            "ae_attention",
+            priority,
+            "human-assisted deal needs owner touch",
+            commercialStatus,
+            updatedAt,
+          ),
+        );
+
+        if (deal.route.financeFlag === "pricing_approval") {
+          queues.finance_review.push(
+            roleQueueItem(
+              deal,
+              "finance_review",
+              priority,
+              "pricing approval required before close",
+              commercialStatus,
+              updatedAt,
+            ),
+          );
+        }
+        if (deal.route.legalFlag === "regulated_review") {
+          queues.legal_review.push(
+            roleQueueItem(
+              deal,
+              "legal_review",
+              priority,
+              "regulated review required before close",
+              commercialStatus,
+              updatedAt,
+            ),
+          );
+        }
+      }
+
+      queues.growth_attribution.push(
+        roleQueueItem(
+          deal,
+          "growth_attribution",
+          "low",
+          `source ${deal.sourceChannel}; route ${deal.route.kind}`,
+          commercialStatus,
+          updatedAt,
+        ),
+      );
+    }
+
+    for (const readiness of readinessRows) {
+      if (
+        readiness.readiness === "not_required" ||
+        readiness.readiness === "ready"
+      ) {
+        continue;
+      }
+      const record = routedById.get(readiness.dealId);
+      if (!record) continue;
+      const priority =
+        readiness.readiness === "blocked" ? "high" : "medium";
+      queues.deployment_readiness.push(
+        roleQueueItem(
+          record.deal,
+          "deployment_readiness",
+          priority,
+          readiness.reason ?? readiness.blockerCode ?? readiness.readiness,
+          readiness.readiness,
+          newestTimestamp(record.updatedAt, [readiness.updatedAt]),
+        ),
+      );
+    }
+
+    return {
+      ae_attention: sortRoleQueue(queues.ae_attention).slice(0, perQueueLimit),
+      finance_review: sortRoleQueue(queues.finance_review).slice(0, perQueueLimit),
+      legal_review: sortRoleQueue(queues.legal_review).slice(0, perQueueLimit),
+      deployment_readiness: sortRoleQueue(queues.deployment_readiness).slice(
+        0,
+        perQueueLimit,
+      ),
+      growth_attribution: sortRoleQueue(queues.growth_attribution).slice(
+        0,
+        perQueueLimit,
+      ),
+    };
+  }
+
+  private policySignalBackfillDealIds(limit: number, now: string): string[] {
+    const cappedLimit = Math.max(1, Math.min(ROLE_QUEUE_MAX_SCAN, limit));
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) {
+      throw new Error(`invalid policy evaluation timestamp: ${now}`);
+    }
+    const stalledCutoff = new Date(
+      nowMs - POLICY_CLOSED_WON_STALLED_SLA_HOURS * 3_600_000,
+    ).toISOString();
+    const ids: string[] = [];
+    const collect = (rows: Array<{ id: string }>): void => {
+      for (const row of rows) ids.push(row.id);
+    };
+
+    // Each signal type gets its own budget so expansion-heavy data cannot
+    // crowd out churn or stalled-deployment signals.
+    collect(
+      this.db
+        .prepare(
+          `SELECT d.id
+           FROM deals d
+           WHERE d.stage='routed'
+             AND d.route_kind='self_serve'
+             AND EXISTS (
+               SELECT 1
+               FROM outcome_events oe
+               WHERE oe.deal_id = d.id
+                 AND oe.outcome = 'expanded'
+                 AND COALESCE(oe.arr_delta_usd, 0) > 0
+             )
+           ORDER BY d.deal_usd DESC, d.updated_at DESC, d.id
+           LIMIT ?`,
+        )
+        .all(cappedLimit) as Array<{ id: string }>,
+    );
+    collect(
+      this.db
+        .prepare(
+          `SELECT d.id
+           FROM deals d
+           WHERE d.stage='routed'
+             AND d.route_kind='human_assisted'
+             AND EXISTS (
+               SELECT 1
+               FROM outcome_events oe
+               WHERE oe.deal_id = d.id
+                 AND oe.outcome = 'churned'
+             )
+           ORDER BY d.deal_usd DESC, d.updated_at DESC, d.id
+           LIMIT ?`,
+        )
+        .all(cappedLimit) as Array<{ id: string }>,
+    );
+    collect(
+      this.db
+        .prepare(
+          `SELECT d.id
+           FROM deals d
+           JOIN commercial_states cs ON cs.deal_id = d.id
+           LEFT JOIN deployment_readiness dr ON dr.deal_id = d.id
+           WHERE d.stage='routed'
+             AND d.route_kind='human_assisted'
+             AND cs.commercial_state = 'closed_won'
+             AND cs.occurred_at <= ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM outcome_events oe
+               WHERE oe.deal_id = d.id
+                 AND oe.outcome = 'deployment_started'
+             )
+             AND (
+               dr.readiness IS NULL OR
+               dr.readiness IN ('pending', 'blocked', 'ready')
+             )
+           ORDER BY d.deal_usd DESC, d.updated_at DESC, d.id
+           LIMIT ?`,
+        )
+        .all(stalledCutoff, cappedLimit) as Array<{ id: string }>,
+    );
+
+    return Array.from(new Set(ids));
+  }
+
+  policyEvaluation(
+    limit = 50,
+    readinessRecords?: DeploymentReadinessState[],
+    now = new Date().toISOString(),
+  ): PolicyEvaluationReports {
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) {
+      throw new Error(`invalid policy evaluation timestamp: ${now}`);
+    }
+    const reportLimit = Math.max(1, Math.min(250, limit));
+    const candidateLimit = Math.min(
+      ROLE_QUEUE_MAX_SCAN,
+      Math.max(100, reportLimit * 10),
+    );
+    const recentRoutedRecords = this.routedRecords(candidateLimit);
+    const readinessRows = readinessRecords ?? this.deploymentReadinessRecords();
+    const recentRoutedDealIds = new Set(
+      recentRoutedRecords.map((record) => record.deal.id),
+    );
+    const signalBackfillDealIds = this.policySignalBackfillDealIds(
+      ROLE_QUEUE_MAX_SCAN,
+      now,
+    ).filter((dealId) => !recentRoutedDealIds.has(dealId));
+    const routedRecords = [
+      ...recentRoutedRecords,
+      ...this.routedRecordsByIds(signalBackfillDealIds),
+    ];
+    const dealIds = routedRecords.map((record) => record.deal.id);
+    const commercialRows: Record<string, unknown>[] = [];
+    const outcomeRows: Record<string, unknown>[] = [];
+    for (let i = 0; i < dealIds.length; i += ROLE_QUEUE_MAX_SCAN) {
+      const chunk = dealIds.slice(i, i + ROLE_QUEUE_MAX_SCAN);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(", ");
+      commercialRows.push(
+        ...(this.db
+          .prepare(
+            `SELECT *
+             FROM commercial_states
+             WHERE deal_id IN (${placeholders})`,
+          )
+          .all(...chunk) as Record<string, unknown>[]),
+      );
+      outcomeRows.push(
+        ...(this.db
+          .prepare(
+            `SELECT *
+             FROM outcome_events
+             WHERE deal_id IN (${placeholders})
+             ORDER BY deal_id, occurred_at, created_at, id`,
+          )
+          .all(...chunk) as Record<string, unknown>[]),
+      );
+    }
+    const commercialByDeal = new Map(
+      commercialRows.map((row) => [
+        String(row.deal_id),
+        this.commercialStateFromRow(row),
+      ] as const),
+    );
+    const readinessByDeal = new Map(
+      readinessRows.map((record) => [
+        record.dealId,
+        record,
+      ] as const),
+    );
+    const outcomesByDeal = new Map<string, OutcomeEventRecord[]>();
+    for (const row of outcomeRows) {
+      const outcome = this.outcomeEventFromRow(row);
+      const existing = outcomesByDeal.get(outcome.dealId) ?? [];
+      existing.push(outcome);
+      outcomesByDeal.set(outcome.dealId, existing);
+    }
+
+    const sourceSummaries = new Map(
+      SOURCE_CHANNELS.map((sourceChannel) => [
+        sourceChannel,
+        {
+          sourceChannel,
+          routed: 0,
+          closedWon: 0,
+          deploymentStarted: 0,
+          deployed: 0,
+          landed: 0,
+          expanded: 0,
+          churned: 0,
+          expandedArrDeltaUsd: 0,
+        } satisfies SourceChannelPolicySummary,
+      ] as const),
+    );
+    const getSourceSummary = (
+      sourceChannel: SourceChannelPolicySummary["sourceChannel"],
+    ): SourceChannelPolicySummary => {
+      const summary = sourceSummaries.get(sourceChannel);
+      if (!summary) {
+        throw new Error(`missing policy source summary for ${sourceChannel}`);
+      }
+      return summary;
+    };
+    const flagSummaries = new Map<PolicyFlag, FlagPolicySummary>(
+      (["pricing_approval", "regulated_review"] as const).map((flag) => [
+        flag,
+        {
+          flag,
+          routed: 0,
+          closedWon: 0,
+          deploymentStarted: 0,
+          deployed: 0,
+          landed: 0,
+          expanded: 0,
+          churned: 0,
+          expandedArrDeltaUsd: 0,
+        },
+      ]),
+    );
+    const getFlagSummary = (flag: PolicyFlag): FlagPolicySummary => {
+      const summary = flagSummaries.get(flag);
+      if (!summary) {
+        throw new Error(`missing policy flag summary for ${flag}`);
+      }
+      return summary;
+    };
+    const selfServeExpanded: PolicyEvaluationDeal[] = [];
+    const humanAssistedRisk: PolicyEvaluationDeal[] = [];
+    const policyStalledCutoffMs =
+      nowMs - POLICY_CLOSED_WON_STALLED_SLA_HOURS * 3_600_000;
+
+    const applyLifecycle = (
+      summary: SourceChannelPolicySummary | FlagPolicySummary,
+      commercial: CommercialStateRecord | null,
+      outcomes: OutcomeEventRecord[],
+    ): void => {
+      summary.routed += 1;
+      if (commercial?.commercialState === "closed_won") summary.closedWon += 1;
+      const outcomeKinds = new Set(outcomes.map((outcome) => outcome.outcome));
+      if (outcomeKinds.has("deployment_started")) summary.deploymentStarted += 1;
+      if (outcomeKinds.has("deployed")) summary.deployed += 1;
+      if (outcomeKinds.has("landed")) summary.landed += 1;
+      if (outcomeKinds.has("expanded")) summary.expanded += 1;
+      if (outcomeKinds.has("churned")) summary.churned += 1;
+      summary.expandedArrDeltaUsd += expandedArrDelta(outcomes);
+    };
+
+    for (const record of routedRecords) {
+      const deal = record.deal;
+      const commercial = commercialByDeal.get(deal.id) ?? null;
+      const readiness = readinessByDeal.get(deal.id) ?? null;
+      const outcomes = outcomesByDeal.get(deal.id) ?? [];
+      const expandedArrDeltaUsd = expandedArrDelta(outcomes);
+      const latestOutcomeAt = lastOutcomeAt(outcomes);
+      const latestExpandedAt = lastOutcomeAt(
+        outcomes.filter((outcome) => outcome.outcome === "expanded"),
+      );
+      const latestChurnedAt = lastOutcomeAt(
+        outcomes.filter((outcome) => outcome.outcome === "churned"),
+      );
+      const closedWonRiskObservedAt =
+        commercial?.commercialState === "closed_won"
+          ? new Date(
+              Date.parse(commercial.occurredAt) +
+                POLICY_CLOSED_WON_STALLED_SLA_HOURS * 3_600_000,
+            ).toISOString()
+          : null;
+      const sourceSummary = sourceSummaries.get(deal.sourceChannel);
+      if (sourceSummary) applyLifecycle(sourceSummary, commercial, outcomes);
+
+      if (deal.route.kind === "human_assisted") {
+        if (deal.route.financeFlag === "pricing_approval") {
+          applyLifecycle(
+            getFlagSummary("pricing_approval"),
+            commercial,
+            outcomes,
+          );
+        }
+        if (deal.route.legalFlag === "regulated_review") {
+          applyLifecycle(
+            getFlagSummary("regulated_review"),
+            commercial,
+            outcomes,
+          );
+        }
+      }
+
+      if (deal.route.kind === "self_serve" && expandedArrDeltaUsd > 0) {
+        selfServeExpanded.push({
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: null,
+          signal: "self_serve_expanded",
+          signalObservedAt: latestExpandedAt ?? latestOutcomeAt ?? now,
+          reason: `self-serve deal later expanded by $${expandedArrDeltaUsd.toLocaleString("en-US")}`,
+          lastOutcomeAt: latestOutcomeAt,
+          arrDeltaUsd: expandedArrDeltaUsd,
+        });
+      }
+
+      if (deal.route.kind !== "human_assisted") continue;
+      const churned = outcomes.some((outcome) => outcome.outcome === "churned");
+      if (churned) {
+        humanAssistedRisk.push({
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: deal.route.salesOwner,
+          signal: "human_assisted_churned",
+          signalObservedAt: latestChurnedAt ?? latestOutcomeAt ?? now,
+          reason: "human-assisted deal recorded churn",
+          lastOutcomeAt: latestOutcomeAt,
+          arrDeltaUsd: null,
+        });
+        // Churn is the terminal signal for this read-only risk list; do not
+        // also emit a stalled row for the same deal.
+        continue;
+      }
+
+      const deployedStarted = outcomes.some(
+        (outcome) => outcome.outcome === "deployment_started",
+      );
+      const closedWonOldEnoughForRisk =
+        commercial?.commercialState === "closed_won" &&
+        Date.parse(commercial.occurredAt) <= policyStalledCutoffMs;
+      if (
+        closedWonOldEnoughForRisk &&
+        !deployedStarted &&
+        (readiness === null || readiness.readiness !== "not_required")
+      ) {
+        const signal =
+          readiness?.readiness === "ready"
+            ? "human_assisted_ready_not_started"
+            : "human_assisted_stalled";
+        const readinessReason =
+          readiness?.reason ??
+          readiness?.blockerCode ??
+          (readiness?.readiness === "ready"
+            ? "deployment ready but no deployment start recorded"
+            : "closed won but deployment has not started");
+        humanAssistedRisk.push({
+          dealId: deal.id,
+          company: deal.company,
+          amount: deal.dealUSD,
+          routeKind: deal.route.kind,
+          sourceChannel: deal.sourceChannel,
+          salesOwner: deal.route.salesOwner,
+          signal,
+          signalObservedAt: closedWonRiskObservedAt ?? now,
+          reason: readinessReason,
+          lastOutcomeAt: latestOutcomeAt,
+          arrDeltaUsd: null,
+        });
+      }
+    }
+
+    return {
+      candidateRouted: routedRecords.length,
+      candidateLimit,
+      signalBackfillRouted: signalBackfillDealIds.length,
+      signalBackfillLimitPerSignal: ROLE_QUEUE_MAX_SCAN,
+      selfServeExpanded: sortPolicyDeals(selfServeExpanded).slice(
+        0,
+        reportLimit,
+      ),
+      humanAssistedRisk: sortPolicyDeals(humanAssistedRisk).slice(
+        0,
+        reportLimit,
+      ),
+      sourceChannels: SOURCE_CHANNELS.map((channel) =>
+        getSourceSummary(channel),
+      ),
+      flags: (["pricing_approval", "regulated_review"] as const).map(
+        (flag) => getFlagSummary(flag),
+      ),
+    };
+  }
+
+  recordPolicyEvaluationRecommendations(
+    input: PolicyRecommendationRunInput,
+  ): PolicyRecommendationRunResult {
+    assertCanonicalIsoUtc(input.evaluatedAt, "policy recommendation evaluatedAt");
+    const createdBy = nonEmptyLabel(
+      input.createdBy,
+      "policy recommendation createdBy",
+    );
+    const limit = policyRecommendationLimit(input.limit);
+    const prefetchLimit = Math.min(
+      250,
+      Math.max(limit * POLICY_RECOMMENDATION_PREFETCH_MULTIPLIER, limit),
+    );
+    const report = this.policyEvaluation(prefetchLimit, undefined, input.evaluatedAt);
+    const candidates = sortPolicyRecommendationCandidates([
+      ...report.humanAssistedRisk,
+      ...report.selfServeExpanded,
+    ]).slice(0, limit);
+
+    // Audit rows are useful only if they describe exactly the suggestions that
+    // committed, so a hard write error aborts the whole run instead of keeping
+    // partial suggestions with no trustworthy parent record.
+    return this.transactionImmediate(() => {
+      const results = candidates.map((candidate) => {
+        const suggestionInput: LocalAgentSuggestionInput = {
+          dealId: candidate.dealId,
+          sourceEventId: policyRecommendationSourceEventId(candidate),
+          kind: "policy_change_recommendation",
+          title: policyRecommendationTitle(candidate),
+          body: policyRecommendationBody(candidate),
+          rationale: policyRecommendationRationale(candidate),
+          createdBy,
+          occurredAt: candidate.signalObservedAt,
+        };
+        const result =
+          this.recordLocalAgentSuggestionInTransaction(suggestionInput);
+        return {
+          dealId: candidate.dealId,
+          signal: candidate.signal,
+          sourceEventId: suggestionInput.sourceEventId,
+          status: result.status,
+          suggestionId: result.suggestion?.id ?? null,
+          title: suggestionInput.title,
+        };
+      });
+
+      const statusCounts = emptyAgentSuggestionWriteStatusCounts();
+      for (const result of results) {
+        statusCounts[result.status] += 1;
+      }
+      const recorded = statusCounts.recorded;
+      const duplicate = statusCounts.duplicate;
+      const idempotencyConflict = statusCounts.idempotency_conflict;
+      const skipped = statusCounts.not_found + statusCounts.not_routed;
+      const status = agentSuggestionRunStatus({
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+      });
+      const createdAt = new Date().toISOString();
+      const runId = `PRR-${randomUUID()}`;
+      const run: PolicyRecommendationRunResult = {
+        id: runId,
+        status,
+        createdBy,
+        limit,
+        evaluatedAt: input.evaluatedAt,
+        createdAt,
+        attempted: results.length,
+        recorded,
+        duplicate,
+        idempotencyConflict,
+        skipped,
+        statusCounts,
+        results,
+      };
+      this.insertPolicyRecommendationRun(run);
+      return run;
+    });
+  }
+
+  private insertPolicyRecommendationRun(run: PolicyRecommendationRunResult): void {
+    this.db
+      .prepare(
+        `INSERT INTO policy_recommendation_runs (
+           id, status, created_by, evaluated_at, limit_count, attempted,
+           recorded, duplicate, idempotency_conflict, skipped,
+           status_counts_json, results_json, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        run.id,
+        run.status,
+        run.createdBy,
+        run.evaluatedAt,
+        run.limit,
+        run.attempted,
+        run.recorded,
+        run.duplicate,
+        run.idempotencyConflict,
+        run.skipped,
+        JSON.stringify(run.statusCounts),
+        JSON.stringify(run.results),
+        run.createdAt,
+      );
+  }
+
+  private policyRecommendationRunFromRow(
+    row: Record<string, unknown>,
+  ): PolicyRecommendationRunRecord {
+    return {
+      id: String(row.id),
+      status: AgentSuggestionRunStatusSchema.parse(row.status),
+      createdBy: String(row.created_by),
+      evaluatedAt: String(row.evaluated_at),
+      limit: Number(row.limit_count),
+      createdAt: String(row.created_at),
+      attempted: Number(row.attempted),
+      recorded: Number(row.recorded),
+      duplicate: Number(row.duplicate),
+      idempotencyConflict: Number(row.idempotency_conflict),
+      skipped: Number(row.skipped),
+      statusCounts: AgentSuggestionWriteStatusCounts.parse(
+        JSON.parse(String(row.status_counts_json)),
+      ),
+      results: PolicyRecommendationDraftResultSchema.array().parse(
+        JSON.parse(String(row.results_json)),
+      ),
+    };
   }
 
   deploymentReadinessRecords(
@@ -4321,32 +7928,38 @@ export class Store {
       outcomesByDeal.set(metricRow.dealId, existing);
     }
 
-    const firstProjectedClosedWonAtByDeal = new Map<string, string>();
+    const firstProjectedClosedWonAtByDeal = new Map<
+      string,
+      { occurredAt: string; occurredAtMs: number }
+    >();
+    // Use the customer-reported occurredAt from the append-only commercial-state
+    // event, not the mutable commercial_states projection timestamp, so
+    // cycle-time metrics survive projection refreshes and replays. Parse in JS
+    // rather than using SQL text MIN so legacy non-canonical ISO rows still sort
+    // chronologically; new writes are canonical at the store boundary.
     const commercialEventRows = this.db
       .prepare(
-        `SELECT deal_id, meta
+        `SELECT deal_id,
+                CAST(json_extract(meta, '$.occurredAt') AS TEXT) occurred_at
          FROM events
          WHERE meta IS NOT NULL
-         ORDER BY ts, id`,
+           AND json_valid(meta)
+           AND json_extract(meta, '$.kind') = 'commercial_state'
+           AND json_extract(meta, '$.commercialState') = 'closed_won'
+           AND json_extract(meta, '$.projected') = 1
+           AND json_extract(meta, '$.occurredAt') IS NOT NULL
+         ORDER BY deal_id, ts, id`,
       )
-      .all() as Array<{ deal_id: string; meta: string }>;
+      .all() as Array<{ deal_id: string; occurred_at: string }>;
     for (const row of commercialEventRows) {
-      let meta: PipelineEventMeta;
-      try {
-        meta = JSON.parse(row.meta) as PipelineEventMeta;
-      } catch {
-        continue;
-      }
-      if (
-        meta.kind !== "commercial_state" ||
-        meta.commercialState !== "closed_won" ||
-        meta.projected !== true
-      ) {
-        continue;
-      }
-      const previous = firstProjectedClosedWonAtByDeal.get(row.deal_id);
-      if (previous === undefined || meta.occurredAt < previous) {
-        firstProjectedClosedWonAtByDeal.set(row.deal_id, meta.occurredAt);
+      const occurredAtMs = Date.parse(row.occurred_at);
+      if (Number.isNaN(occurredAtMs)) continue;
+      const existing = firstProjectedClosedWonAtByDeal.get(row.deal_id);
+      if (!existing || occurredAtMs < existing.occurredAtMs) {
+        firstProjectedClosedWonAtByDeal.set(row.deal_id, {
+          occurredAt: row.occurred_at,
+          occurredAtMs,
+        });
       }
     }
 
@@ -4456,7 +8069,8 @@ export class Store {
         firstDeployed !== null &&
         commercialState === "closed_won"
       ) {
-        const closedWonAt = firstProjectedClosedWonAtByDeal.get(dealId);
+        const closedWonAt =
+          firstProjectedClosedWonAtByDeal.get(dealId)?.occurredAt;
         if (closedWonAt !== undefined) {
           const hours = hoursBetween(closedWonAt, firstDeployed.occurredAt);
           if (hours !== null) closedWonToDeployedHours.push(hours);

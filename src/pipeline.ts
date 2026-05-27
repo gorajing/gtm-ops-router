@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { ENRICHMENT_FACT_MIN_CONFIDENCE } from "./constants.js";
 import { normalize } from "./intake.js";
 import { score } from "./score.js";
 import { route } from "./route.js";
@@ -37,7 +38,7 @@ import type {
 
 // Below this enrichment confidence we refuse to score — acting on data we
 // don't believe is how silent corruption enters an ops system.
-export const LOW_CONFIDENCE = 0.2;
+export const LOW_CONFIDENCE = ENRICHMENT_FACT_MIN_CONFIDENCE;
 
 export interface PipelineOptions {
   /** Default true: do not attempt the external write, just record intent. */
@@ -81,6 +82,7 @@ export type EnrichmentGateResult =
       ok: false;
       code: "enrichment_unresolved" | "insufficient_data";
       reason: string;
+      enrichment?: Enrichment;
     };
 
 export async function enrichWithGate(
@@ -110,6 +112,7 @@ export async function enrichWithGate(
       ok: false,
       code: "insufficient_data",
       reason: `enrichment confidence ${enrichment.confidence.toFixed(2)} < ${LOW_CONFIDENCE}`,
+      enrichment,
     };
   }
   return { ok: true, enrichment };
@@ -132,6 +135,8 @@ function quarantine(
   code: QuarantineCode,
   reason: string,
   t0: number,
+  deal?: Deal,
+  routedDeal?: RoutedDeal,
 ): PipelineOutcome {
   const q: Quarantine = {
     dealId,
@@ -146,6 +151,8 @@ function quarantine(
       Math.round(performance.now() - t0),
       from,
       `${code}: ${reason}`,
+      deal,
+      routedDeal,
     );
     return { ok: false, quarantine: q };
   } catch (err) {
@@ -178,6 +185,66 @@ function quarantine(
   }
 }
 
+function recordEnrichmentEvidence(
+  store: Store,
+  deal: Deal,
+  enricher: Enricher,
+  enrichment: Enrichment,
+): void {
+  try {
+    const result = store.recordEnrichmentObservation(deal, enricher.name, enrichment);
+    if (result.status !== "idempotency_conflict") return;
+    // The current pipeline source id is content-addressed, so this branch should
+    // only fire if that identity contract changes or the store detects
+    // corruption. Keep it loud but advisory for future provider-backed enrichers.
+    console.error(
+      JSON.stringify({
+        level: "error",
+        event: "enrichment_evidence_idempotency_conflict",
+        dealId: deal.id,
+        provider: enricher.name,
+      }),
+    );
+    try {
+      // This may create an intake -> enriched breadcrumb immediately before the
+      // normal success or quarantine intake -> enriched event. The duplicated
+      // edge is intentional: one row is advisory-evidence failure, the next row
+      // remains the actual pipeline outcome.
+      store.appendEvent(
+        deal.id,
+        "intake",
+        "enriched",
+        "enrichment_evidence_idempotency_conflict",
+      );
+    } catch {
+      // Evidence is advisory to routing. If even the audit breadcrumb fails,
+      // stderr remains the loud surface and the original route/quarantine holds.
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      JSON.stringify({
+        level: "error",
+        event: "enrichment_evidence_persist_failed",
+        dealId: deal.id,
+        provider: enricher.name,
+        reason: msg,
+      }),
+    );
+    try {
+      store.appendEvent(
+        deal.id,
+        "intake",
+        "enriched",
+        `enrichment_evidence_persist_failed: ${msg}`,
+      );
+    } catch {
+      // Preserve the original route/quarantine outcome even if evidence logging
+      // fails; the evidence surface must not become a new routing gate.
+    }
+  }
+}
+
 export async function processOne(
   raw: unknown,
   store: Store,
@@ -206,6 +273,14 @@ export async function processOne(
   // ── Stage 2: enrich (the riskiest external boundary) ─────────────────────
   const enrichmentResult = await enrichWithGate(deal, enricher);
   if (!enrichmentResult.ok) {
+    if (enrichmentResult.enrichment) {
+      recordEnrichmentEvidence(
+        store,
+        deal,
+        enricher,
+        enrichmentResult.enrichment,
+      );
+    }
     return quarantine(
       store,
       deal.id,
@@ -214,9 +289,16 @@ export async function processOne(
       enrichmentResult.code,
       enrichmentResult.reason,
       t0,
+      deal,
     );
   }
   const enrichment = enrichmentResult.enrichment;
+  recordEnrichmentEvidence(
+    store,
+    deal,
+    enricher,
+    enrichment,
+  );
   store.appendEvent(
     deal.id,
     "intake",
@@ -280,6 +362,8 @@ export async function processOne(
           "sink_terminal",
           err.message,
           t0,
+          deal,
+          routed,
         );
       }
       if (err instanceof SinkExhaustedError) {
@@ -291,6 +375,8 @@ export async function processOne(
           "sink_exhausted",
           err.message,
           t0,
+          deal,
+          routed,
         );
       }
       throw err; // unknown — do not absorb
@@ -311,6 +397,7 @@ export async function processOne(
       "store_error",
       `persist failed: ${msg}`,
       t0,
+      deal,
     );
   }
   return { ok: true, deal: routed };
