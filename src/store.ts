@@ -1,11 +1,10 @@
 /**
  * Persistence + observability store.
  *
- * Uses Node's BUILT-IN SQLite (`node:sqlite`) on purpose: real SQL (the JD
- * asks for SQL), zero native build step, so `git clone && npm i && npm run
- * demo` works on any machine running Node >= 22.5. Trading a battle-tested
- * native dep for clone-and-run reliability is a deliberate tradeoff: real
- * SQL with no native build step.
+ * Uses Node's BUILT-IN SQLite (`node:sqlite`) on purpose: real SQL, zero native
+ * build step, so `git clone && npm i && npm run demo` works on any machine
+ * running Node >= 22.5. Trading a battle-tested native dep for clone-and-run
+ * reliability is a deliberate tradeoff: real SQL with no native build step.
  *
  * DDL and pragmas are issued one statement per prepared call (no
  * multi-statement string execution) — explicit, lint-clean, and easy to audit.

@@ -12,7 +12,7 @@
 
 import type { EnrichedDeal, ScoreBreakdown } from "./types.js";
 
-// HappyRobot is logistics-origin AI infra — freight/3PL/supply-chain is core.
+// Logistics-heavy operations are the primary ICP for this demo policy.
 const TARGET_INDUSTRIES = new Set([
   "logistics",
   "freight",

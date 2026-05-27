@@ -1,6 +1,6 @@
 # gtm-ops-router
 
-**A working slice of the Strategy & Ops Engineer role, built for HappyRobot.**
+**A working GTM ops control plane for AI-native revenue teams.**
 
 Inbound deal → enrich → score → route across **sales / finance / legal**, with
 typed failure handling, idempotent persistence, and live observability. No
@@ -10,18 +10,16 @@ mock-ups. It runs.
 
 ## Why this exists
 
-HappyRobot sells the thesis that AI workforces make manual operations
-obsolete. The internal-ops function should be the first proof of that thesis,
-not the last. The JD names the target directly:
+Modern GTM teams do not lose leverage only because leads are hard to find.
+They lose it in the **handoff**: an inbound deal that should be auto-qualified
+waits on a human; a $150K regulated deal reaches an AE with no finance or
+legal context; a malformed record gets silently dropped and nobody knows until
+the quarter closes.
 
-> *"Improve go-to-market operations by building better tooling between sales,
-> finance, and legal."*
-
-At S23 → $60M scale, the place leverage leaks is the **handoff**: an inbound
-deal that should be auto-qualified instead waits on a human; a $150K regulated
-deal reaches an AE with no finance or legal context; a malformed record gets
-silently dropped and nobody knows until the quarter closes. This is a small,
-real system that closes those leaks.
+This is a small, real system that closes those leaks. It turns inbound demand
+into routed work, preserves every failure as evidence, and connects the
+commercial lifecycle to deployment readiness without pretending the router is a
+CRM, a legal system, or a deployment tracker.
 
 ---
 
@@ -45,7 +43,7 @@ npm test                # TypeScript suite, incl. every failure mode
 npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes  # seed SQLite with receipts + post-sale outcomes
 npm run serve -- --integrations                       # open http://localhost:8787
 
-# Python side (stdlib only — the JD names Python explicitly):
+# Python side (stdlib only):
 python3 ops_audit.py --db data/router.db  # data-integrity + SLO gate; exit 1 on breach
 python3 -m unittest test_ops_audit        # Python tests
 ```
@@ -226,7 +224,7 @@ Built to a production bar.
 
 ## What I deliberately did NOT automate
 
-Knowing where automation stops is part of the job.
+Knowing where automation stops is part of the product.
 
 - **The close above $10K stays human.** Buyers will not self-serve at that
   size — trust is the product. The system routes and *prepares* the human
@@ -239,15 +237,15 @@ Knowing where automation stops is part of the job.
 
 That boundary is a deliberate design output, not a missing feature.
 
-## JD requirement → where it's demonstrated
+## Capability → where it's demonstrated
 
-| Their "Must Have" | In this repo |
+| Capability | In this repo |
 |---|---|
 | Ship real systems, strong SWE fundamentals | runs end-to-end; `tsc` strict + `noUncheckedIndexedAccess`; TS + Python suites |
 | Automations/tools w/ **Python**, SQL, APIs, scripting | Python `ops_audit.py` (SLO gate, stdlib, tested); `node:sqlite` store; `node:http` API; HubSpot + Slack REST adapters; cron-shaped `run` |
 | Reason about edge cases, failure modes, maintainability | 7 typed quarantine codes incl. injected `store_error`; retryable-vs-terminal sink taxonomy w/ bounded backoff; dry-run |
 | Business intuition (cost, speed, scale) | routed/human ARR + auto-handled metrics; `$10K`/`$50K` gates are named policy |
-| Extreme ownership, ambiguity | scoped from a one-line JD bullet to a running system; `ASSUMPTIONS.md` + `RUNBOOK.md` |
+| Operating ownership under ambiguity | scoped from an ambiguous workflow problem to a running system; `ASSUMPTIONS.md` + `RUNBOOK.md` |
 | Clear communication | this README, runbook, assumptions; one audit note per score dimension |
 
 ## What I'd build next (ownership beyond the demo)
@@ -293,8 +291,8 @@ an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
 
 ## 90-second walkthrough (for the screen recording)
 
-1. (0:00) "HappyRobot sells autonomous ops. This is a working slice of the
-   sales/finance/legal tooling bullet from the JD — built, not mocked."
+1. (0:00) "This is a working GTM ops control plane for the messy handoff between
+   inbound demand, sales, finance, legal, deployment, and audit."
 2. (0:10) `npm run run -- data/inbound.seed.jsonl --integrations && npm run serve -- --integrations`,
    then open `http://localhost:8787` — point at the dashboard metrics: "13 in,
    9 routed, 4 quarantined. Conversion and quarantine-by-code are asserted in
@@ -312,5 +310,5 @@ an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
 
 ---
 
-Built by Jin Choi as a concrete artifact for the HappyRobot Strategy & Ops
-Engineer role. Clone it, run `npm run demo`, read `pipeline.ts`.
+Built by Jin Choi as a concrete GTM operations artifact. Clone it, run
+`npm run demo`, read `pipeline.ts`.

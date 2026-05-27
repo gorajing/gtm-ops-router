@@ -3,9 +3,9 @@
 This plan evolves `gtm-ops-router` from a deal-routing proof into a small,
 closed-loop operating spine for a fast-scaling AI company.
 
-The primary audience for the next slice is still a reviewer/operator evaluating
-the repo as a portfolio artifact. Phase 1 should be production-shaped, but it
-is not a production rollout plan.
+The primary audience for the next slice is an operator evaluating whether the
+repo can become a reusable control plane. Phase 1 should be production-shaped,
+but it is not a production rollout plan.
 
 The goal is not to replace HubSpot, Slack, finance tooling, legal tooling, or
 deployment project management. The goal is to make the handoffs between them
@@ -65,7 +65,7 @@ reliable handoff record is just another dashboard with soft numbers.
 
 - Add this master plan.
 - Link it from the README under "What I'd build next".
-- Keep private hiring research out of the repo.
+- Keep private company, customer, and hiring research out of the repo.
 
 **Acceptance checks**
 
