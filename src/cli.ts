@@ -12,7 +12,8 @@
  * Pass --no-demo-outcomes to show only the intake→route surface.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   applyDemoOutcomeFixtures,
@@ -38,6 +39,7 @@ import {
   renderRoutedTable,
 } from "./observe.js";
 import { startServer } from "./server.js";
+import { buildSalesHandoffExport } from "./sales-handoff.js";
 import { FlakySink } from "./sink.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -89,6 +91,25 @@ function integrationMode(args: string[]): "off" | "dry-run" | "live" {
   if (args.includes("--live-integrations")) return "live";
   if (args.includes("--integrations")) return "dry-run";
   return "off";
+}
+
+function flagValue(args: string[], name: string): string | undefined {
+  const inline = args.find((arg) => arg.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1);
+  const idx = args.indexOf(name);
+  if (idx < 0) return undefined;
+  const value = args[idx + 1];
+  return value && !value.startsWith("-") ? value : undefined;
+}
+
+function intFlag(args: string[], name: string, fallback: number): number {
+  const raw = flagValue(args, name);
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
 }
 
 function pipelineOptions(
@@ -427,6 +448,31 @@ async function cmdDoctor(args: string[]): Promise<void> {
   }
 }
 
+async function cmdExportSales(args: string[]): Promise<void> {
+  const Store = await loadStore();
+  const store = new Store(`${ROOT}data/router.db`);
+  try {
+    const payload = buildSalesHandoffExport(store, {
+      limit: intFlag(args, "--limit", 25),
+      includeAllRoutes: args.includes("--include-all-routes"),
+    });
+    const json = `${JSON.stringify(payload, null, 2)}\n`;
+    const outPath = flagValue(args, "--out");
+    if (outPath) {
+      const absolutePath = resolve(process.cwd(), outPath);
+      mkdirSync(dirname(absolutePath), { recursive: true });
+      writeFileSync(absolutePath, json);
+      console.log(
+        `wrote ${payload.accounts.length} sales handoff account(s) to ${absolutePath}`,
+      );
+    } else {
+      process.stdout.write(json);
+    }
+  } finally {
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   loadDotEnv();
   const args = process.argv.slice(2);
@@ -445,10 +491,13 @@ async function main(): Promise<void> {
     case "doctor":
       await cmdDoctor(args);
       return;
+    case "export-sales":
+      await cmdExportSales(args);
+      return;
     default:
       console.error(
-        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve | doctor` +
-          ` (flags: --flaky | --integrations | --live-integrations | --demo-outcomes | --no-demo-outcomes | --send-test)`,
+        `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve | doctor | export-sales` +
+          ` (flags: --flaky | --integrations | --live-integrations | --demo-outcomes | --no-demo-outcomes | --send-test | --limit | --out | --include-all-routes)`,
       );
       process.exitCode = 2;
   }

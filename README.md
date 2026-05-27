@@ -21,6 +21,31 @@ into routed work, preserves every failure as evidence, and connects the
 commercial lifecycle to deployment readiness without pretending the router is a
 CRM, a legal system, or a deployment tracker.
 
+## Companion Sales tool
+
+This repo is the GTM control plane: it decides what needs attention, records
+why, and keeps the operating ledger honest. The companion
+[`gorajing/sales`](https://github.com/gorajing/sales) repo is the
+evidence-grounded outreach engine: it turns account research into cited drafts,
+runs critic review, validates claims against source snippets, and preserves
+revision history.
+
+The bridge is intentionally a narrow JSON contract, not a hidden live sync:
+
+```text
+inbound deal -> route/work item -> sales handoff JSON -> evidence research -> drafted outreach -> critic review
+        gtm-ops-router                         gorajing/sales
+```
+
+Generate the handoff after seeding the router:
+
+```bash
+npm run export:sales -- --limit 10 --out data/sales-handoff.json
+```
+
+See [docs/SALES_HANDOFF_CONTRACT.md](docs/SALES_HANDOFF_CONTRACT.md) for the
+contract and invariants.
+
 ---
 
 ## Run it (about 60 seconds)
@@ -37,6 +62,7 @@ npm run demo -- --no-demo-outcomes # intake→route only, no in-memory outcome f
 npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm run doctor          # live HubSpot/Slack setup check; no secrets printed
+npm run export:sales -- --out data/sales-handoff.json # JSON handoff seed for gorajing/sales
 npm test                # TypeScript suite, incl. every failure mode
 
 # Dashboard proof surface:
@@ -266,6 +292,10 @@ That boundary is a deliberate design output, not a missing feature.
   nudges, and policy recommendations; humans accept or reject them; nothing
   mutates HubSpot, Slack, or routing policy automatically. See
   [docs/PHASE5_AGENT_RAILS_SPEC.md](docs/PHASE5_AGENT_RAILS_SPEC.md).
+- **Sales handoff seam:** `npm run export:sales` emits
+  `gtm-ops-router.sales-handoff.v1`, a typed JSON seed for the companion
+  evidence-grounded Sales tool. See
+  [docs/SALES_HANDOFF_CONTRACT.md](docs/SALES_HANDOFF_CONTRACT.md).
 - A more detailed org-level roadmap is in
   [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md). The current branch ships
   the first operator surface from that roadmap: closed-won and deployment

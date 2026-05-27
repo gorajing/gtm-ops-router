@@ -12,6 +12,7 @@
     "run": "tsx src/cli.ts run",
     "serve": "tsx src/cli.ts serve",
     "doctor": "tsx src/cli.ts doctor",
+    "export:sales": "tsx src/cli.ts export-sales",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
