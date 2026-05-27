@@ -52,8 +52,8 @@ python3 -m unittest test_ops_audit        # Python tests
 
 `npm run demo` prints the same proof in the terminal. The dashboard renders it
 as an operator view: KPIs, route mix, routed deals, role-specific queues,
-policy evaluation, deployment readiness, quarantine ledger, and an event trail,
-all backed by the same SQLite store. Node prints one
+policy evaluation, deployment readiness, local lifecycle controls, quarantine
+ledger, and an event trail, all backed by the same SQLite store. Node prints one
 `ExperimentalWarning: SQLite ...` line — expected, the disclosed cost of zero
 native deps, not a defect.
 
@@ -76,6 +76,26 @@ Compatibility note: local write endpoints require canonical UTC timestamps in
 `YYYY-MM-DDTHH:mm:ss.sssZ` form. Valid ISO variants such as
 `2026-05-21T12:00:00Z` or `+00:00` offsets are rejected at the API boundary so
 SQLite text ordering, TypeScript metrics, and the Python audit stay aligned.
+
+### Local lifecycle controls
+
+The console is now a small operator workbench, not just a read-only dashboard.
+With local writes enabled, an operator can:
+
+- move a routed deal through `open`, `closed_won`, `closed_lost`, and
+  `reopened` via `POST /commercial-state`;
+- add deployment facts such as `deployment_started`, `deployed`, `landed`,
+  `expanded`, and `churned` via `POST /deployment-facts`;
+- retry failed or expired-pending deployment-readiness handoff notifications
+  via `POST /notification-retry`.
+
+Those controls stay deliberately local-only: the server rejects them unless
+loopback/host checks pass and the caller provides the local write secret. The
+dashboard uses deterministic UUIDv4 source-event ids, preserves retry identity
+across reloads, rejects changed-payload replays, and shows retry status in the
+deployment-handoff table. In other words: an operator can advance the demo
+workflow and repair notification failures without granting the console
+authority to mutate HubSpot, Slack, or routing policy silently.
 
 ### Live HubSpot + Slack
 
@@ -249,8 +269,11 @@ That boundary is a deliberate design output, not a missing feature.
   mutates HubSpot, Slack, or routing policy automatically. See
   [docs/PHASE5_AGENT_RAILS_SPEC.md](docs/PHASE5_AGENT_RAILS_SPEC.md).
 - A more detailed org-level roadmap is in
-  [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md): the next production slice is
-  a closed-loop deployment handoff, not a CRM clone.
+  [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md). The current branch ships
+  the first operator surface from that roadmap: closed-won and deployment
+  facts now re-derive readiness and handoff notifications locally. The next
+  production hardening is authenticated operator identity, role permissions,
+  and real deployment ownership workflows — not a CRM clone.
 
 ## Architecture
 
