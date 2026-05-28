@@ -8,6 +8,27 @@ mock-ups. It runs.
 
 ---
 
+## Read this first (the 60-second map)
+
+Start in [`src/pipeline.ts`](src/pipeline.ts) — the stage order and error
+boundaries are the core. Everything else is one of 8 domains; each owns a few
+tables and a few modules:
+
+| # | Domain | Start in | Tables |
+|---|---|---|---|
+| 1 | Intake → score → route | `pipeline.ts` · `intake.ts` · `score.ts` · `route.ts` | `deals`, `events` |
+| 2 | Downstream sync (HubSpot/Slack) | `sink.ts` · `integrations.ts` | `external_event_keys`, `external_event_observations` |
+| 3 | Commercial lifecycle | `store.ts` (commercial-state fns) | `commercial_states` |
+| 4 | Deployment readiness | `store.ts` (readiness fns) | `deployment_facts`, `deployment_facts_rejections`, `deployment_readiness` |
+| 5 | Post-sale outcome loop | `store.ts` (outcome fns) · `ops_audit.py` | `outcome_events`, `outcome_rejections` |
+| 6 | Enrichment evidence | `enrich.ts` · `store.ts` | `provider_observations`, `enriched_subject_facts` |
+| 7 | Agent governance (draft, human-decides) | `store.ts` · `demo-fixtures.ts` | `agent_suggestions`, `policy_recommendation_runs` |
+| 8 | Operator workflow + console | `server.ts` | `work_items`, `work_item_events` |
+| — | Integrity / audit (cross-cutting) | `store.ts` · `ops_audit.py` | `integration_config`, `idempotency_violations` |
+
+The cross-repo handoff (`src/sales-handoff.ts` → JSON) feeds the companion Sales
+repo. See **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** for the end-to-end demo.
+
 ## Why this exists
 
 Modern GTM teams do not lose leverage only because leads are hard to find.
@@ -45,6 +66,10 @@ npm run export:sales -- --limit 10 --out data/sales-handoff.json
 
 See [docs/SALES_HANDOFF_CONTRACT.md](docs/SALES_HANDOFF_CONTRACT.md) for the
 contract and invariants.
+
+Run the full cross-repo demo: **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)**. A
+frozen, committed export lives at `data/sales-handoff.sample.json`, so the Sales
+side can be demoed without setting up the router first.
 
 ---
 
