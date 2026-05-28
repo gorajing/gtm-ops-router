@@ -1,0 +1,417 @@
+{
+  "schemaVersion": "gtm-ops-router.sales-handoff.v1",
+  "generatedAt": "2026-05-28T03:18:36.566Z",
+  "source": {
+    "system": "gtm-ops-router",
+    "purpose": "Seed evidence-grounded sales research and outreach."
+  },
+  "filters": {
+    "limit": 10,
+    "includeAllRoutes": false
+  },
+  "accounts": [
+    {
+      "routerDealId": "D-c1a288cc8d32",
+      "account": {
+        "name": "EuroDist",
+        "domain": "eurodist.eu",
+        "region": "EU",
+        "sourceChannel": "event"
+      },
+      "contact": {
+        "name": "Ines Roth",
+        "email": "ines@eurodist.eu"
+      },
+      "opportunity": {
+        "amountUsd": 12000,
+        "statedNeed": "manual ops causing errors",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.lindqvist",
+          "financeFlag": null,
+          "legalFlag": "regulated_review",
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 0.81,
+          "notes": [
+            "icpFit=0.50: industry \"distribution\" is adjacent",
+            "painSignal=0.95: 3 pain keyword(s) + tech signals present",
+            "sizeFit=1.00: 800 employees (mid-market sweet spot)",
+            "regionFit=1.00: region EU"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": null,
+        "deploymentReadiness": null,
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.9,
+        "industry": "distribution",
+        "employees": 800,
+        "techSignals": [
+          "aircall"
+        ],
+        "regulated": false,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.634Z",
+        "sourceObservationId": "PO-e8bd40e45c7023b7443472e09e610301"
+      },
+      "salesToolInput": {
+        "accountName": "EuroDist",
+        "accountDomain": "eurodist.eu",
+        "researchBrief": "EuroDist entered the GTM router from event. Stated need: manual ops causing errors. Routed as human_assisted to ae.lindqvist. Review flags: regulated_review.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that EuroDist has the operations pain described as: \"manual ops causing errors\".",
+          "Find buyer-relevant facts for EuroDist: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.lindqvist tailor a first-touch or follow-up for a 12,000 USD opportunity.",
+          "Find public regulatory, privacy, geography, or procurement context that could affect messaging or legal review."
+        ]
+      }
+    },
+    {
+      "routerDealId": "D-7bb8d19f40b0",
+      "account": {
+        "name": "Britannia Haulage",
+        "domain": "britannia-haulage.co.uk",
+        "region": "UK",
+        "sourceChannel": "referral"
+      },
+      "contact": {
+        "name": "Nigel Boateng",
+        "email": "nigel@britannia-haulage.co.uk"
+      },
+      "opportunity": {
+        "amountUsd": 150000,
+        "statedNeed": "manual paperwork, headcount cost, backlog of bookings",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.okafor",
+          "financeFlag": "pricing_approval",
+          "legalFlag": "regulated_review",
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 0.99,
+          "notes": [
+            "icpFit=1.00: industry \"freight\" is core",
+            "painSignal=0.95: 3 pain keyword(s) + tech signals present",
+            "sizeFit=1.00: 2000 employees (mid-market sweet spot)",
+            "regionFit=1.00: region UK"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": null,
+        "deploymentReadiness": null,
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.93,
+        "industry": "freight",
+        "employees": 2000,
+        "techSignals": [
+          "twilio"
+        ],
+        "regulated": true,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.633Z",
+        "sourceObservationId": "PO-9349fb4c93f60bcb4754af46496e2dbf"
+      },
+      "salesToolInput": {
+        "accountName": "Britannia Haulage",
+        "accountDomain": "britannia-haulage.co.uk",
+        "researchBrief": "Britannia Haulage entered the GTM router from referral. Stated need: manual paperwork, headcount cost, backlog of bookings. Routed as human_assisted to ae.okafor. Review flags: pricing_approval, regulated_review.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that Britannia Haulage has the operations pain described as: \"manual paperwork, headcount cost, backlog of bookings\".",
+          "Find buyer-relevant facts for Britannia Haulage: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.okafor tailor a first-touch or follow-up for a 150,000 USD opportunity.",
+          "Find public regulatory, privacy, geography, or procurement context that could affect messaging or legal review.",
+          "Find value, ROI, urgency, or budget-context evidence that could support pricing approval."
+        ]
+      }
+    },
+    {
+      "routerDealId": "D-a2ff6592e43f",
+      "account": {
+        "name": "Globex Foods",
+        "domain": "globexfoods.com",
+        "region": "APAC",
+        "sourceChannel": "inbound_form"
+      },
+      "contact": {
+        "name": "Lena Brandt",
+        "email": "lena@globexfoods.com"
+      },
+      "opportunity": {
+        "amountUsd": 90000,
+        "statedNeed": "after hours call volume is 24/7 and overwhelming",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.tan",
+          "financeFlag": "pricing_approval",
+          "legalFlag": null,
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 0.72,
+          "notes": [
+            "icpFit=0.50: industry \"manufacturing\" is adjacent",
+            "painSignal=1.00: 4 pain keyword(s) + tech signals present",
+            "sizeFit=0.70: 6000 employees (outside core band)",
+            "regionFit=0.70: region APAC"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": null,
+        "deploymentReadiness": null,
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.85,
+        "industry": "manufacturing",
+        "employees": 6000,
+        "techSignals": [
+          "genesys"
+        ],
+        "regulated": false,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.630Z",
+        "sourceObservationId": "PO-69b136704ce83bd3c05a6be3e9b8e82c"
+      },
+      "salesToolInput": {
+        "accountName": "Globex Foods",
+        "accountDomain": "globexfoods.com",
+        "researchBrief": "Globex Foods entered the GTM router from inbound_form. Stated need: after hours call volume is 24/7 and overwhelming. Routed as human_assisted to ae.tan. Review flags: pricing_approval.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that Globex Foods has the operations pain described as: \"after hours call volume is 24/7 and overwhelming\".",
+          "Find buyer-relevant facts for Globex Foods: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.tan tailor a first-touch or follow-up for a 90,000 USD opportunity.",
+          "Find value, ROI, urgency, or budget-context evidence that could support pricing approval."
+        ]
+      }
+    },
+    {
+      "routerDealId": "D-8eb789ad84fc",
+      "account": {
+        "name": "Acme Retail",
+        "domain": "acme-retail.com",
+        "region": "NA",
+        "sourceChannel": "event"
+      },
+      "contact": {
+        "name": "Priya Anand",
+        "email": "priya@acme-retail.com"
+      },
+      "opportunity": {
+        "amountUsd": 25000,
+        "statedNeed": "call volume backlog, phone lines jammed",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.morgan",
+          "financeFlag": null,
+          "legalFlag": null,
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 0.81,
+          "notes": [
+            "icpFit=0.50: industry \"retail\" is adjacent",
+            "painSignal=0.95: 3 pain keyword(s) + tech signals present",
+            "sizeFit=1.00: 900 employees (mid-market sweet spot)",
+            "regionFit=1.00: region NA"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": null,
+        "deploymentReadiness": null,
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.88,
+        "industry": "retail",
+        "employees": 900,
+        "techSignals": [
+          "zendesk"
+        ],
+        "regulated": false,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.628Z",
+        "sourceObservationId": "PO-225a551326f74951c6fce270ec8dea0a"
+      },
+      "salesToolInput": {
+        "accountName": "Acme Retail",
+        "accountDomain": "acme-retail.com",
+        "researchBrief": "Acme Retail entered the GTM router from event. Stated need: call volume backlog, phone lines jammed. Routed as human_assisted to ae.morgan.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that Acme Retail has the operations pain described as: \"call volume backlog, phone lines jammed\".",
+          "Find buyer-relevant facts for Acme Retail: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.morgan tailor a first-touch or follow-up for a 25,000 USD opportunity."
+        ]
+      }
+    },
+    {
+      "routerDealId": "D-cdea8ac45022",
+      "account": {
+        "name": "Cargo Loop",
+        "domain": "cargoloop.io",
+        "region": "EU",
+        "sourceChannel": "referral"
+      },
+      "contact": {
+        "name": "Mira Schwartz",
+        "email": "mira@cargoloop.io"
+      },
+      "opportunity": {
+        "amountUsd": 60000,
+        "statedNeed": "tracking shipments in a spreadsheet, manual and error prone",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.lindqvist",
+          "financeFlag": "pricing_approval",
+          "legalFlag": "regulated_review",
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 0.99,
+          "notes": [
+            "icpFit=1.00: industry \"freight-brokerage\" is core",
+            "painSignal=0.95: 3 pain keyword(s) + tech signals present",
+            "sizeFit=1.00: 400 employees (mid-market sweet spot)",
+            "regionFit=1.00: region EU"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": "closed_won",
+        "deploymentReadiness": {
+          "readiness": "pending",
+          "blockerCode": null,
+          "reason": "awaiting deployment facts",
+          "updatedAt": "2026-05-28T03:12:58.637Z"
+        },
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.92,
+        "industry": "freight-brokerage",
+        "employees": 400,
+        "techSignals": [
+          "hubspot"
+        ],
+        "regulated": true,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.627Z",
+        "sourceObservationId": "PO-271cc36ec40b264107fc69a8d115b9ab"
+      },
+      "salesToolInput": {
+        "accountName": "Cargo Loop",
+        "accountDomain": "cargoloop.io",
+        "researchBrief": "Cargo Loop entered the GTM router from referral. Stated need: tracking shipments in a spreadsheet, manual and error prone. Routed as human_assisted to ae.lindqvist. Review flags: pricing_approval, regulated_review. Current workflow status: pending.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that Cargo Loop has the operations pain described as: \"tracking shipments in a spreadsheet, manual and error prone\".",
+          "Find buyer-relevant facts for Cargo Loop: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.lindqvist tailor a first-touch or follow-up for a 60,000 USD opportunity.",
+          "Find public regulatory, privacy, geography, or procurement context that could affect messaging or legal review.",
+          "Find value, ROI, urgency, or budget-context evidence that could support pricing approval."
+        ]
+      }
+    },
+    {
+      "routerDealId": "D-fb65c15017ef",
+      "account": {
+        "name": "Ryder Digital",
+        "domain": "ryder-digital.com",
+        "region": "NA",
+        "sourceChannel": "inbound_form"
+      },
+      "contact": {
+        "name": "Dana Pruitt",
+        "email": "dana@ryder-digital.com"
+      },
+      "opportunity": {
+        "amountUsd": 120000,
+        "statedNeed": "30 reps stuck on manual check calls after hours, we can't scale",
+        "route": {
+          "kind": "human_assisted",
+          "salesOwner": "ae.morgan",
+          "financeFlag": "pricing_approval",
+          "legalFlag": "regulated_review",
+          "queue": null,
+          "reason": null,
+          "slaHours": 4
+        },
+        "score": {
+          "total": 1,
+          "notes": [
+            "icpFit=1.00: industry \"logistics\" is core",
+            "painSignal=1.00: 4 pain keyword(s) + tech signals present",
+            "sizeFit=1.00: 1200 employees (mid-market sweet spot)",
+            "regionFit=1.00: region NA"
+          ]
+        }
+      },
+      "workflow": {
+        "commercialState": "closed_won",
+        "deploymentReadiness": {
+          "readiness": "pending",
+          "blockerCode": null,
+          "reason": "awaiting deployment facts",
+          "updatedAt": "2026-05-28T03:12:58.635Z"
+        },
+        "workItems": [],
+        "agentSuggestions": []
+      },
+      "enrichmentEvidence": {
+        "sourceProvider": "fixture",
+        "confidence": 0.95,
+        "industry": "logistics",
+        "employees": 1200,
+        "techSignals": [
+          "salesforce",
+          "twilio"
+        ],
+        "regulated": true,
+        "freshnessStatus": "fresh",
+        "observedAt": "2026-05-28T03:12:58.618Z",
+        "sourceObservationId": "PO-cc226c3eedbd32c891407743fe05466f"
+      },
+      "salesToolInput": {
+        "accountName": "Ryder Digital",
+        "accountDomain": "ryder-digital.com",
+        "researchBrief": "Ryder Digital entered the GTM router from inbound_form. Stated need: 30 reps stuck on manual check calls after hours, we can't scale. Routed as human_assisted to ae.morgan. Review flags: pricing_approval, regulated_review. Current workflow status: pending.",
+        "suggestedEvidenceQuestions": [
+          "Find current public evidence that Ryder Digital has the operations pain described as: \"30 reps stuck on manual check calls after hours, we can't scale\".",
+          "Find buyer-relevant facts for Ryder Digital: scale, operating footprint, integrations, recent growth, or hiring signals.",
+          "Find evidence that helps ae.morgan tailor a first-touch or follow-up for a 120,000 USD opportunity.",
+          "Find public regulatory, privacy, geography, or procurement context that could affect messaging or legal review.",
+          "Find value, ROI, urgency, or budget-context evidence that could support pricing approval."
+        ]
+      }
+    }
+  ]
+}

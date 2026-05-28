@@ -12,3 +12,6 @@ data/sales-handoff*.json
 .DS_Store
 dist/
 .playwright-mcp/
+
+# committed public demo fixture (live exports stay ignored)
+!data/sales-handoff.sample.json
