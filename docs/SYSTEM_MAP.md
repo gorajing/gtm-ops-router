@@ -14,7 +14,9 @@ happen, records why it happened, and keeps every failure visible.
 right account context into public evidence, audited facts, cited drafts, critic
 review, and export-ready outreach.
 
-The handoff between them is a versioned JSON file, not a hidden live sync.
+The handoff between them is a versioned JSON file, not a hidden live sync. See
+[SALES_HANDOFF_CONTRACT.md](SALES_HANDOFF_CONTRACT.md) for the contract and its
+invariants.
 
 ## Ownership Boundary
 

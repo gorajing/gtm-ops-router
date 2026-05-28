@@ -320,17 +320,17 @@ That boundary is a deliberate design output, not a missing feature.
   ledger. Agents can draft handoffs, missing-field questions, stale-deal
   nudges, and policy recommendations; humans accept or reject them; nothing
   mutates HubSpot, Slack, or routing policy automatically. See
-  [docs/PHASE5_AGENT_RAILS_SPEC.md](docs/PHASE5_AGENT_RAILS_SPEC.md).
+  [docs/planning/PHASE5_AGENT_RAILS_SPEC.md](docs/planning/PHASE5_AGENT_RAILS_SPEC.md).
 - **Sales handoff seam:** `npm run export:sales` emits
   `gtm-ops-router.sales-handoff.v1`, a typed JSON seed for the companion
   evidence-grounded Sales tool. See
   [docs/SALES_HANDOFF_CONTRACT.md](docs/SALES_HANDOFF_CONTRACT.md).
-- A more detailed org-level roadmap is in
-  [docs/ORG_MASTERPLAN.md](docs/ORG_MASTERPLAN.md). The current branch ships
-  the first operator surface from that roadmap: closed-won and deployment
-  facts now re-derive readiness and handoff notifications locally. The next
-  production hardening is authenticated operator identity, role permissions,
-  and real deployment ownership workflows — not a CRM clone.
+- The org-level roadmap and per-phase specs live in
+  [docs/planning/](docs/planning/). Phases 0–5 of that plan have landed
+  (deployment readiness, outcome loop, role queues, policy evaluation, agent
+  rails); what remains is the deferred-specification checklist — authenticated
+  operator identity, role permissions, and real deployment ownership workflows,
+  not a CRM clone.
 
 ## Architecture
 

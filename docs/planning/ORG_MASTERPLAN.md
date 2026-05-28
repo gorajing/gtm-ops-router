@@ -70,8 +70,8 @@ reliable handoff record is just another dashboard with soft numbers.
 **Acceptance checks**
 
 ```bash
-rg -n "^## Phase 1: Deployment readiness handoff$" docs/ORG_MASTERPLAN.md
-rg -F "(docs/ORG_MASTERPLAN.md)" README.md
+rg -n "^## Phase 1: Deployment readiness handoff$" docs/planning/ORG_MASTERPLAN.md
+rg -F "(docs/planning/)" README.md
 ! rg "Employment[[:space:]]Type|Compensat[i]on|Apply[[:space:]]for[[:space:]]this[[:space:]]Job" docs README.md
 ! git ls-files | rg '(^|/)\.env$'
 ```
