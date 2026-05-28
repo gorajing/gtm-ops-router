@@ -107,15 +107,24 @@ describe("sales handoff export", () => {
       consoleUrl: `http://localhost:8787/?deal=${encodeURIComponent(outcome.deal.id)}`,
       eventsUrl: `http://localhost:8787/deals/${encodeURIComponent(outcome.deal.id)}/events`,
     });
+    // A loopback base URL with a subpath still joins correctly.
     const subpathPayload = buildSalesHandoffExport(store, {
       generatedAt: "2026-05-24T15:10:00.000Z",
       limit: 10,
-      operatorBaseUrl: "https://demo.example.com/router",
+      operatorBaseUrl: "http://127.0.0.1:8787/router",
     });
     expect(subpathPayload.accounts[0]?.operatorLinks).toEqual({
-      consoleUrl: `https://demo.example.com/router/?deal=${encodeURIComponent(outcome.deal.id)}`,
-      eventsUrl: `https://demo.example.com/router/deals/${encodeURIComponent(outcome.deal.id)}/events`,
+      consoleUrl: `http://127.0.0.1:8787/router/?deal=${encodeURIComponent(outcome.deal.id)}`,
+      eventsUrl: `http://127.0.0.1:8787/router/deals/${encodeURIComponent(outcome.deal.id)}/events`,
     });
+    // Operator links are local affordances only — a non-loopback base URL is refused.
+    expect(() =>
+      buildSalesHandoffExport(store, {
+        generatedAt: "2026-05-24T15:10:00.000Z",
+        limit: 10,
+        operatorBaseUrl: "https://demo.example.com/router",
+      }),
+    ).toThrow(/local router console/);
     expect(payload.accounts[0]?.workflow.workItems).toEqual([
       expect.objectContaining({
         queue: "ae_attention",

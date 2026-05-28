@@ -261,6 +261,16 @@ function normalizeOperatorBaseUrl(raw: string | undefined): string | null {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("--operator-base-url must use http or https");
   }
+  // Operator links are local navigation affordances only (docs/SYSTEM_MAP.md):
+  // the router console binds to loopback, so refuse to emit a "local" link that
+  // actually points at an external host (it renders as an <a href> in Sales).
+  const host = url.hostname;
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]" && host !== "::1") {
+    throw new Error(
+      "--operator-base-url must point at the local router console " +
+        "(localhost, 127.0.0.1, or [::1])",
+    );
+  }
   if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
   return url.toString();
 }
