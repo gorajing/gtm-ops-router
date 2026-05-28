@@ -3232,20 +3232,23 @@ describe("server dashboard", () => {
   it("renders the embedded dashboard script against a representative state payload", async () => {
     const { baseUrl } = await app();
     const dashboard = await fetch(`${baseUrl}/`).then((r) => r.text());
-    const dashboardScripts = [
-      ...dashboard.matchAll(
-        /<script\b[^>]*>([\s\S]*?)<\/script>/g,
-      ),
-    ]
-      .map((match) => match[1] ?? "")
-      .filter(
-        (candidate) =>
-          candidate.includes("void pollState();") &&
-          candidate.includes("void pollHealth();"),
-      );
-    expect(dashboardScripts).toHaveLength(1);
-    const script = dashboardScripts[0];
-    if (!script?.trim()) throw new Error("dashboard script is missing");
+    // The dashboard client JS is now served as a static asset, not inlined.
+    expect(dashboard).toContain('<script src="/dashboard.js">');
+    const script = await fetch(`${baseUrl}/dashboard.js`).then((r) => r.text());
+    if (!script.trim()) throw new Error("dashboard.js is missing");
+    if (
+      !script.includes("void pollState();") ||
+      !script.includes("void pollHealth();")
+    ) {
+      throw new Error("dashboard.js does not look like the dashboard client");
+    }
+    // Use the REAL bootstrap config the shell emits (not a hardcoded copy) so a
+    // drift between the emitted window.__DASH__ and the client's reads fails here.
+    const dashMatch = dashboard.match(/window\.__DASH__\s*=\s*(\{.*?\});<\/script>/);
+    if (!dashMatch?.[1]) {
+      throw new Error("dashboard bootstrap (window.__DASH__) not found in shell");
+    }
+    const dashConfig = runInNewContext(`(${dashMatch[1]})`, {});
 
     const dashboardElementTags = {
       "agent-action-status": "div",
@@ -3767,6 +3770,7 @@ describe("server dashboard", () => {
         },
         clearTimeout: () => {},
         window: {
+          __DASH__: dashConfig,
           prompt: () => {
             promptCalls += 1;
             return null;
@@ -4046,6 +4050,7 @@ describe("server dashboard", () => {
         },
         clearTimeout: () => {},
         window: {
+          __DASH__: dashConfig,
           prompt: () => {
             promptCalls += 1;
             return null;
@@ -5447,24 +5452,29 @@ describe("server dashboard", () => {
     expect(post.status).toBe(200);
 
     const dashboard = await fetch(`${baseUrl}/`).then((r) => r.text());
+    const dashboardJs = await fetch(`${baseUrl}/dashboard.js`).then((r) => r.text());
+    // Static structure lives in the server-rendered shell.
     expect(dashboard).toContain("Deployment Handoff");
     expect(dashboard).toContain("Recent Policy Runs");
     expect(dashboard).toContain("policy-runs");
     expect(dashboard).toContain("Draft Policy Recommendations");
     expect(dashboard).toContain("Draft Work Item Actions");
-    expect(dashboard).toContain("Manual company evidence");
-    expect(dashboard).toContain("/enrichment-observations");
-    expect(dashboard).toContain("Replay Quarantine");
-    expect(dashboard).toContain("Retry downstream sync");
-    expect(dashboard).toContain("/quarantine-replay");
-    expect(dashboard).toContain("agent-suggestion-runs/policy-evaluation");
-    expect(dashboard).toContain("agent-suggestion-runs/work-items");
-    expect(dashboard).toContain('encodeURIComponent(activeSuggestion.id) + "/decision"');
-    expect(dashboard).toContain("LOCAL_ENDPOINT_SECRET");
-    expect(dashboard).toContain("sessionStorage");
+    // Client behavior (labels + endpoint URLs) lives in the external dashboard.js.
+    expect(dashboardJs).toContain("Manual company evidence");
+    expect(dashboardJs).toContain("/enrichment-observations");
+    expect(dashboardJs).toContain("Replay Quarantine");
+    expect(dashboardJs).toContain("Retry downstream sync");
+    expect(dashboardJs).toContain("/quarantine-replay");
+    expect(dashboardJs).toContain("agent-suggestion-runs/policy-evaluation");
+    expect(dashboardJs).toContain("agent-suggestion-runs/work-items");
+    expect(dashboardJs).toContain('encodeURIComponent(activeSuggestion.id) + "/decision"');
+    expect(dashboardJs).toContain("LOCAL_ENDPOINT_SECRET");
+    expect(dashboardJs).toContain("sessionStorage");
+    // Core safety: routed deal text is never baked into the served shell, and
+    // the client renders without innerHTML.
     expect(dashboard).not.toContain(payload.company);
     expect(dashboard).not.toContain(`alert("owned")`);
-    expect(dashboard).not.toContain("innerHTML");
+    expect(dashboardJs).not.toContain("innerHTML");
 
     const state = (await fetch(`${baseUrl}/state`).then((r) =>
       r.json(),
