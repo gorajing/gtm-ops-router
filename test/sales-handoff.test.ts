@@ -72,6 +72,10 @@ describe("sales handoff export", () => {
     expect(payload.accounts[0]).toEqual(
       expect.objectContaining({
         routerDealId: outcome.deal.id,
+        trace: {
+          sourceSystem: "gtm-ops-router",
+          evidenceBoundary: "research_seed_not_verified_evidence",
+        },
         account: expect.objectContaining({
           name: "Ryder Digital",
           domain: "ryder-digital.com",
@@ -93,6 +97,25 @@ describe("sales handoff export", () => {
         }),
       }),
     );
+    expect(payload.accounts[0]?.operatorLinks).toBeUndefined();
+    const linkedPayload = buildSalesHandoffExport(store, {
+      generatedAt: "2026-05-24T15:10:00.000Z",
+      limit: 10,
+      operatorBaseUrl: "http://localhost:8787",
+    });
+    expect(linkedPayload.accounts[0]?.operatorLinks).toEqual({
+      consoleUrl: `http://localhost:8787/?deal=${encodeURIComponent(outcome.deal.id)}`,
+      eventsUrl: `http://localhost:8787/deals/${encodeURIComponent(outcome.deal.id)}/events`,
+    });
+    const subpathPayload = buildSalesHandoffExport(store, {
+      generatedAt: "2026-05-24T15:10:00.000Z",
+      limit: 10,
+      operatorBaseUrl: "https://demo.example.com/router",
+    });
+    expect(subpathPayload.accounts[0]?.operatorLinks).toEqual({
+      consoleUrl: `https://demo.example.com/router/?deal=${encodeURIComponent(outcome.deal.id)}`,
+      eventsUrl: `https://demo.example.com/router/deals/${encodeURIComponent(outcome.deal.id)}/events`,
+    });
     expect(payload.accounts[0]?.workflow.workItems).toEqual([
       expect.objectContaining({
         queue: "ae_attention",

@@ -39,10 +39,18 @@ import {
   renderRoutedTable,
 } from "./observe.js";
 import { startServer } from "./server.js";
-import { buildSalesHandoffExport } from "./sales-handoff.js";
+import {
+  buildSalesHandoffExport,
+  type SalesHandoffExportOptions,
+} from "./sales-handoff.js";
 import { FlakySink } from "./sink.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+function routerDbPath(): string {
+  const override = process.env.GTM_ROUTER_DB_PATH;
+  return override ? resolve(ROOT, override) : resolve(ROOT, "data/router.db");
+}
 
 function loadDotEnv(): void {
   const path = `${ROOT}.env`;
@@ -246,10 +254,10 @@ function rejectPersistentDemoOutcomeLayering(
       ? ""
       : ` ${committedRoutedThisRun} routed deal(s) from this run were already committed before the overlay was refused.`;
   console.error(
-    `[demo outcomes] refusing to layer fixtures into data/router.db with ` +
+    `[demo outcomes] refusing to layer fixtures into ${routerDbPath()} with ` +
       `${check.nonDemoOutcomes} non-demo outcome rows on fixture deals and ` +
       `${check.nonDemoCommercialStates} non-demo commercial-state events on fixture deals; ` +
-      "use a fresh data/router.db or rerun without --demo-outcomes." +
+      "use a fresh router DB or rerun without --demo-outcomes." +
       committedDetail,
   );
   store.close();
@@ -322,7 +330,7 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
     return;
   }
   const Store = await loadStore();
-  const store = new Store(`${ROOT}data/router.db`);
+  const store = new Store(routerDbPath());
   const enricher = new FixtureEnricher(loadFixture());
   const { opts, configBundle } = pipelineOptions(args);
   const skipsDemoOutcomes = args.includes("--no-demo-outcomes");
@@ -383,7 +391,7 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
     return;
   }
   const Store = await loadStore();
-  const store = new Store(`${ROOT}data/router.db`);
+  const store = new Store(routerDbPath());
   const enricher = new FixtureEnricher(loadFixture());
   const mode = integrationMode(args);
   const {
@@ -450,12 +458,15 @@ async function cmdDoctor(args: string[]): Promise<void> {
 
 async function cmdExportSales(args: string[]): Promise<void> {
   const Store = await loadStore();
-  const store = new Store(`${ROOT}data/router.db`);
+  const store = new Store(routerDbPath());
   try {
-    const payload = buildSalesHandoffExport(store, {
+    const exportOptions: SalesHandoffExportOptions = {
       limit: intFlag(args, "--limit", 25),
       includeAllRoutes: args.includes("--include-all-routes"),
-    });
+    };
+    const operatorBaseUrl = flagValue(args, "--operator-base-url");
+    if (operatorBaseUrl !== undefined) exportOptions.operatorBaseUrl = operatorBaseUrl;
+    const payload = buildSalesHandoffExport(store, exportOptions);
     const json = `${JSON.stringify(payload, null, 2)}\n`;
     const outPath = flagValue(args, "--out");
     if (outPath) {

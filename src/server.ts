@@ -555,6 +555,7 @@ function consoleHtml(sinkLabel: string): string {
  </div>
  <div class="stamp">SINK ${escapeHtml(sinkLabel)}<br><span id="last-refresh">loading</span></div>
 </header>
+<div class="action-status" id="url-pin-status"></div>
 <div class="top">
  <section class="panel">
   <h2>Operating State</h2>
@@ -674,9 +675,13 @@ const WORK_ITEM_SUGGESTION_RUNNER = "console-work-item-agent";
 const OPERATOR_PRINCIPAL = "operator-console";
 const MANUAL_ENRICHMENT_MAX_EMPLOYEES = ${MAX_MANUAL_ENRICHMENT_EMPLOYEES};
 const MANUAL_ENRICHMENT_RETRY_WINDOW_MS = 5 * 60 * 1000;
-const OPERATOR_DEMO_MODE = new URLSearchParams(window.location.search).get("demo") === "operator";
+const OPERATOR_URL_PARAMS = new URLSearchParams(window.location.search);
+const OPERATOR_DEMO_MODE = OPERATOR_URL_PARAMS.get("demo") === "operator";
+const URL_PINNED_DEAL_ID = OPERATOR_URL_PARAMS.get("deal");
 let state = null;
-let selectedId = null;
+let selectedId = URL_PINNED_DEAL_ID && URL_PINNED_DEAL_ID.length > 0 ? URL_PINNED_DEAL_ID : null;
+let urlPinnedDealId = selectedId;
+let missingUrlPinnedDealId = null;
 let demoAutoPilotPaused = false;
 let agentSuggestionFilter = "open";
 const warnedAgentSuggestionStatuses = new Set();
@@ -1255,6 +1260,27 @@ function setWorkItemActionStatus(message, className){
   if (!root) return;
   root.className = "action-status" + (className ? " " + className : "");
   root.textContent = message;
+}
+function renderUrlPinStatus(){
+  const root = qs("#url-pin-status");
+  if (!root) return;
+  if (!missingUrlPinnedDealId) {
+    root.className = "action-status";
+    root.textContent = "";
+    return;
+  }
+  root.className = "action-status fail";
+  root.textContent = "Router trace link target " + missingUrlPinnedDealId + " is not in the current workflow state; showing the next available deal instead.";
+}
+function clearUrlDealParam(){
+  if (!window || !window.history || typeof window.history.replaceState !== "function") return;
+  const params = new URLSearchParams(window.location.search || "");
+  if (!params.has("deal")) return;
+  params.delete("deal");
+  const query = params.toString();
+  const path = window.location.pathname || "/";
+  const hash = window.location.hash || "";
+  window.history.replaceState(null, "", path + (query ? "?" + query : "") + hash);
 }
 function renderKpis(){
   const m = state.metrics;
@@ -2946,8 +2972,12 @@ function dealSuggestionSection(dealId){
   return section;
 }
 function selectDeal(dealId){
+  urlPinnedDealId = null;
+  missingUrlPinnedDealId = null;
+  clearUrlDealParam();
   selectedId = dealId;
   pauseDemoAutoPilot();
+  renderUrlPinStatus();
   renderWorkflowGuide();
   renderQueue();
   renderRoleQueues();
@@ -3089,18 +3119,33 @@ async function loadState(){
     const next = await fetchJson("/state");
     if (seq !== stateRequestSeq) return "stale";
     state = next;
+    const workflowIds = workflowDealIds();
+    if (urlPinnedDealId) {
+      if (workflowIds.has(urlPinnedDealId)) {
+        selectedId = urlPinnedDealId;
+        missingUrlPinnedDealId = null;
+      }
+      else {
+        missingUrlPinnedDealId = urlPinnedDealId;
+        urlPinnedDealId = null;
+        selectedId = null;
+        clearUrlDealParam();
+      }
+    }
     const demoCanRetarget =
       OPERATOR_DEMO_MODE &&
+      !urlPinnedDealId &&
       !demoAutoPilotPaused &&
       pendingSuggestionDecisions.size === 0 &&
       pendingWorkItemActions.size === 0;
     if (demoCanRetarget) {
-      if (selectedId && !workflowDealIds().has(selectedId)) selectedId = null;
+      if (selectedId && !workflowIds.has(selectedId)) selectedId = null;
       selectedId = preferredWorkflowDealId() || selectedId;
     }
     if (!selectedId && (state.queue || [])[0]) selectedId = (state.queue || [])[0].id;
     if (!selectedId && (state.deploymentReadiness || [])[0]) selectedId = state.deploymentReadiness[0].dealId;
     qs("#last-refresh").textContent = new Date().toLocaleTimeString();
+    renderUrlPinStatus();
     renderKpis();
     renderQueue();
     renderRoleQueues();
