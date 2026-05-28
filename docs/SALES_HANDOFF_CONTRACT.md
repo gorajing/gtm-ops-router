@@ -25,11 +25,39 @@ npm run export:sales -- --limit 10 --out data/sales-handoff.json
 ```
 
 Use `--include-all-routes` when you want nurture and self-serve deals included
-for analysis instead of only human-assisted opportunities.
+for analysis instead of only human-assisted opportunities. Add
+`--operator-base-url http://localhost:8787` only when you want the exported
+handoff to include local operator-console links; the default export avoids
+persisting machine-specific URLs.
+
+The companion Sales consumer command is pinned as part of this integration
+contract:
+
+```bash
+pnpm import:gtm-handoff -- ../gtm-ops-router/data/sales-handoff.json
+```
+
+Changing that command in Sales should be paired with this contract doc and the
+cross-repo demo script.
+
+The cross-repo demo also relies on the Sales repo exposing:
+
+- `pnpm db:migrate`, applied against the `SALES_DB_PATH` environment override;
+- `pnpm import:gtm-handoff -- <handoff.json> --out <result.json>`;
+- `SALES_DB_PATH=<demo.db> pnpm dev`, so the UI opens the same imported demo
+  accounts;
+- an import result with `databasePath`, `imported[].accountId`,
+  `imported[].accountName`, and `imported[].routerDealId`.
+
+Those are treated as the consumer-side seam, not incidental implementation
+details.
 
 ## Schema
 
 The export is a narrow file/stdout contract, not live CRM sync:
+
+`trace` is required in the current v1 contract. Older v1 exports that predate
+the trace field should be regenerated before importing into Sales.
 
 ```json
 {
@@ -46,6 +74,10 @@ The export is a narrow file/stdout contract, not live CRM sync:
   "accounts": [
     {
       "routerDealId": "D-fb65c15017ef",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Ryder Digital",
         "domain": "ryder-digital.com",
@@ -113,6 +145,10 @@ The export is a narrow file/stdout contract, not live CRM sync:
 - The router never writes directly into the Sales database.
 - The Sales tool should treat `salesToolInput` as a research seed, not as
   verified evidence.
+- `trace.evidenceBoundary` is intentionally literal:
+  `research_seed_not_verified_evidence`.
+- `operatorLinks` is optional and environment-specific; consumers should render
+  only `http` or `https` links.
 - Public facts still need to become Sales `evidence` rows and pass that repo's
   verification/critic workflow before appearing in outreach.
 - `routerDealId` is the stable cross-repo trace key for future manual imports,

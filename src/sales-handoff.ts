@@ -18,6 +18,7 @@ export interface SalesHandoffExportOptions {
   generatedAt?: string;
   limit?: number;
   includeAllRoutes?: boolean;
+  operatorBaseUrl?: string;
 }
 
 export interface SalesHandoffExport {
@@ -36,6 +37,14 @@ export interface SalesHandoffExport {
 
 export interface SalesHandoffAccount {
   routerDealId: string;
+  trace: {
+    sourceSystem: "gtm-ops-router";
+    evidenceBoundary: "research_seed_not_verified_evidence";
+  };
+  operatorLinks?: {
+    consoleUrl: string;
+    eventsUrl: string;
+  };
   account: {
     name: string;
     domain: string | null;
@@ -241,6 +250,43 @@ function suggestedEvidenceQuestions(deal: RoutedDeal): string[] {
   return questions;
 }
 
+function normalizeOperatorBaseUrl(raw: string | undefined): string | null {
+  if (raw === undefined || raw.trim().length === 0) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("--operator-base-url must be a valid URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("--operator-base-url must use http or https");
+  }
+  // Operator links are local navigation affordances only (docs/SYSTEM_MAP.md):
+  // the router console binds to loopback, so refuse to emit a "local" link that
+  // actually points at an external host (it renders as an <a href> in Sales).
+  const host = url.hostname;
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]" && host !== "::1") {
+    throw new Error(
+      "--operator-base-url must point at the local router console " +
+        "(localhost, 127.0.0.1, or [::1])",
+    );
+  }
+  if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
+  return url.toString();
+}
+
+function operatorLinksForDeal(
+  dealId: string,
+  operatorBaseUrl: string | null,
+): SalesHandoffAccount["operatorLinks"] {
+  if (!operatorBaseUrl) return undefined;
+  const encoded = encodeURIComponent(dealId);
+  return {
+    consoleUrl: new URL(`./?deal=${encoded}`, operatorBaseUrl).toString(),
+    eventsUrl: new URL(`./deals/${encoded}/events`, operatorBaseUrl).toString(),
+  };
+}
+
 export function buildSalesHandoffExport(
   store: SalesHandoffStore | Store,
   options: SalesHandoffExportOptions = {},
@@ -248,6 +294,7 @@ export function buildSalesHandoffExport(
   const generatedAt = options.generatedAt ?? new Date().toISOString();
   const limit = clampLimit(options.limit);
   const includeAllRoutes = options.includeAllRoutes === true;
+  const operatorBaseUrl = normalizeOperatorBaseUrl(options.operatorBaseUrl);
   const scanLimit = includeAllRoutes ? limit : Math.min(1000, Math.max(100, limit * 5));
   const readinessByDeal = new Map(
     store
@@ -270,9 +317,15 @@ export function buildSalesHandoffExport(
       generatedAt,
     );
     const latestStatus = workItems[0]?.status ?? readiness?.readiness ?? null;
+    const operatorLinks = operatorLinksForDeal(deal.id, operatorBaseUrl);
 
     accounts.push({
       routerDealId: deal.id,
+      trace: {
+        sourceSystem: "gtm-ops-router",
+        evidenceBoundary: "research_seed_not_verified_evidence",
+      },
+      ...(operatorLinks ? { operatorLinks } : {}),
       account: {
         name: deal.company,
         domain: deal.domain ?? null,

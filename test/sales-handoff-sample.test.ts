@@ -19,6 +19,11 @@ describe("committed sales-handoff sample", () => {
     for (const a of doc.accounts as Array<Record<string, any>>) {
       expect(typeof a.routerDealId).toBe("string");
       expect(a.routerDealId.length).toBeGreaterThan(0);
+      expect(a.trace).toEqual({
+        sourceSystem: "gtm-ops-router",
+        evidenceBoundary: "research_seed_not_verified_evidence",
+      });
+      expect(a.operatorLinks).toBeUndefined();
       expect(a.account?.name).toBeTruthy();
       expect(a.salesToolInput?.researchBrief).toBeTruthy();
       expect(Array.isArray(a.salesToolInput?.suggestedEvidenceQuestions)).toBe(true);

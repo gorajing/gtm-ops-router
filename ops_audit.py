@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -29,6 +30,13 @@ from datetime import datetime
 
 TERMINAL_STAGES = ("routed", "quarantined")
 ROUTE_KINDS = ("nurture", "self_serve", "human_assisted")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def router_db_path(raw: str) -> str:
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(ROOT, raw)
 
 
 def percentile(values: list[int], p: float) -> int:
@@ -408,18 +416,23 @@ def render(r: AuditReport) -> str:
 
 
 def main(argv: list[str]) -> int:
+    env_db = os.environ.get("GTM_ROUTER_DB_PATH")
     ap = argparse.ArgumentParser(description="Router SQLite audit + SLO gate")
-    ap.add_argument("--db", default="data/router.db")
+    ap.add_argument("--db", default=None)
     ap.add_argument("--max-quarantine-rate", type=float, default=0.35)
     ap.add_argument("--max-p95-ms", type=int, default=2000)
     ap.add_argument("--json", action="store_true", help="machine-readable out")
     args = ap.parse_args(argv)
+    db_path = args.db
+    if db_path is None:
+        db_path = env_db or "data/router.db"
+    db_path = router_db_path(db_path)
 
     try:
-        conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.OperationalError as e:
         sys.stderr.write(
-            f"cannot open db {args.db!r} ({e}). "
+            f"cannot open db {db_path!r} ({e}). "
             f"Produce one first: `npm run run -- data/inbound.seed.jsonl`\n"
         )
         return 2

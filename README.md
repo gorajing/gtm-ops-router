@@ -26,8 +26,10 @@ tables and a few modules:
 | 8 | Operator workflow + console | `server.ts` | `work_items`, `work_item_events` |
 | — | Integrity / audit (cross-cutting) | `store.ts` · `ops_audit.py` | `integration_config`, `idempotency_violations` |
 
-The cross-repo handoff (`src/sales-handoff.ts` → JSON) feeds the companion Sales
-repo. See **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** for the end-to-end demo.
+The cross-repo handoff (`src/sales-handoff.ts` → JSON) feeds the companion
+Sales repo. See **[docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)** for the ownership
+boundary and **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** for the end-to-end
+demo.
 
 ## Why this exists
 
@@ -67,9 +69,10 @@ npm run export:sales -- --limit 10 --out data/sales-handoff.json
 See [docs/SALES_HANDOFF_CONTRACT.md](docs/SALES_HANDOFF_CONTRACT.md) for the
 contract and invariants.
 
-Run the full cross-repo demo: **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)**. A
-frozen, committed export lives at `data/sales-handoff.sample.json`, so the Sales
-side can be demoed without setting up the router first.
+Run the full cross-repo demo with `npm run demo:cross-repo`, or follow
+**[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** manually. A frozen, committed
+export lives at `data/sales-handoff.sample.json`, so the Sales side can be
+demoed without setting up the router first.
 
 ---
 
@@ -87,6 +90,7 @@ npm run demo -- --no-demo-outcomes # intake→route only, no in-memory outcome f
 npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm run doctor          # live HubSpot/Slack setup check; no secrets printed
+npm run demo:cross-repo # router -> sales handoff -> Sales import
 npm run export:sales -- --out data/sales-handoff.json # JSON handoff seed for gorajing/sales
 npm test                # TypeScript suite, incl. every failure mode
 

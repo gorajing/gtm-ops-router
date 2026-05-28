@@ -1,6 +1,6 @@
 {
   "schemaVersion": "gtm-ops-router.sales-handoff.v1",
-  "generatedAt": "2026-05-28T03:18:36.566Z",
+  "generatedAt": "2026-05-28T07:26:01.679Z",
   "source": {
     "system": "gtm-ops-router",
     "purpose": "Seed evidence-grounded sales research and outreach."
@@ -12,6 +12,10 @@
   "accounts": [
     {
       "routerDealId": "D-c1a288cc8d32",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "EuroDist",
         "domain": "eurodist.eu",
@@ -60,7 +64,7 @@
         ],
         "regulated": false,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.634Z",
+        "observedAt": "2026-05-28T07:26:01.408Z",
         "sourceObservationId": "PO-e8bd40e45c7023b7443472e09e610301"
       },
       "salesToolInput": {
@@ -77,6 +81,10 @@
     },
     {
       "routerDealId": "D-7bb8d19f40b0",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Britannia Haulage",
         "domain": "britannia-haulage.co.uk",
@@ -125,7 +133,7 @@
         ],
         "regulated": true,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.633Z",
+        "observedAt": "2026-05-28T07:26:01.407Z",
         "sourceObservationId": "PO-9349fb4c93f60bcb4754af46496e2dbf"
       },
       "salesToolInput": {
@@ -143,6 +151,10 @@
     },
     {
       "routerDealId": "D-a2ff6592e43f",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Globex Foods",
         "domain": "globexfoods.com",
@@ -191,7 +203,7 @@
         ],
         "regulated": false,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.630Z",
+        "observedAt": "2026-05-28T07:26:01.404Z",
         "sourceObservationId": "PO-69b136704ce83bd3c05a6be3e9b8e82c"
       },
       "salesToolInput": {
@@ -208,6 +220,10 @@
     },
     {
       "routerDealId": "D-8eb789ad84fc",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Acme Retail",
         "domain": "acme-retail.com",
@@ -256,7 +272,7 @@
         ],
         "regulated": false,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.628Z",
+        "observedAt": "2026-05-28T07:26:01.402Z",
         "sourceObservationId": "PO-225a551326f74951c6fce270ec8dea0a"
       },
       "salesToolInput": {
@@ -272,6 +288,10 @@
     },
     {
       "routerDealId": "D-cdea8ac45022",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Cargo Loop",
         "domain": "cargoloop.io",
@@ -310,7 +330,7 @@
           "readiness": "pending",
           "blockerCode": null,
           "reason": "awaiting deployment facts",
-          "updatedAt": "2026-05-28T03:12:58.637Z"
+          "updatedAt": "2026-05-28T07:26:01.411Z"
         },
         "workItems": [],
         "agentSuggestions": []
@@ -325,7 +345,7 @@
         ],
         "regulated": true,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.627Z",
+        "observedAt": "2026-05-28T07:26:01.401Z",
         "sourceObservationId": "PO-271cc36ec40b264107fc69a8d115b9ab"
       },
       "salesToolInput": {
@@ -343,6 +363,10 @@
     },
     {
       "routerDealId": "D-fb65c15017ef",
+      "trace": {
+        "sourceSystem": "gtm-ops-router",
+        "evidenceBoundary": "research_seed_not_verified_evidence"
+      },
       "account": {
         "name": "Ryder Digital",
         "domain": "ryder-digital.com",
@@ -381,7 +405,7 @@
           "readiness": "pending",
           "blockerCode": null,
           "reason": "awaiting deployment facts",
-          "updatedAt": "2026-05-28T03:12:58.635Z"
+          "updatedAt": "2026-05-28T07:26:01.409Z"
         },
         "workItems": [],
         "agentSuggestions": []
@@ -397,7 +421,7 @@
         ],
         "regulated": true,
         "freshnessStatus": "fresh",
-        "observedAt": "2026-05-28T03:12:58.618Z",
+        "observedAt": "2026-05-28T07:26:01.392Z",
         "sourceObservationId": "PO-cc226c3eedbd32c891407743fe05466f"
       },
       "salesToolInput": {
