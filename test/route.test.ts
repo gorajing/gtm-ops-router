@@ -69,6 +69,11 @@ describe("route — the L7 judgment, encoded", () => {
   it("regulated buyer OR EU/UK region sets legal flag", () => {
     const reg = route(scored({ dealUSD: 20000, regulated: true }));
     const eu = route(scored({ dealUSD: 20000, region: "EU" }));
+    // Assert the route kind first, so a routing regression (e.g. these
+    // $20K deals falling to self_serve/nurture) fails the test instead of
+    // silently skipping the flag assertions inside the narrowing guards.
+    expect(reg.kind).toBe("human_assisted");
+    expect(eu.kind).toBe("human_assisted");
     if (reg.kind === "human_assisted") {
       expect(reg.legalFlag).toBe("regulated_review");
     }
@@ -79,6 +84,7 @@ describe("route — the L7 judgment, encoded", () => {
 
   it("non-regulated NA mid-deal triggers neither flag", () => {
     const r = route(scored({ dealUSD: 20000, region: "NA" }));
+    expect(r.kind).toBe("human_assisted");
     if (r.kind === "human_assisted") {
       expect(r.financeFlag).toBeNull();
       expect(r.legalFlag).toBeNull();

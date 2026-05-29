@@ -66,5 +66,8 @@ export class FixtureEnricher implements Enricher {
  *   }
  *
  * The pipeline does not change when you swap enrichers — that is the point
- * of the interface (single responsibility; evergreen-grade modularity).
+ * of the interface (single responsibility; evergreen-grade modularity). One
+ * coupling to know: `Enricher.name` is typed as `ProviderObservationProvider`,
+ * so adding a brand-new provider also means registering it in that enum in
+ * types.ts (it keeps the evidence ledger's provider taxonomy closed and typed).
  */

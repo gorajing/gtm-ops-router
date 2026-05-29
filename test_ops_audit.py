@@ -178,6 +178,89 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(r.invariant_ok)
         self.assertTrue(any("unknown_route_kind" in b for b in r.breaches))
 
+    def test_malformed_routed_payload_is_breach_not_crash(self):
+        # A corrupt (unparseable) routed payload must be a loud breach (exit 1),
+        # not a traceback — symmetric with the null-payload branch above it
+        # (routed_missing_payload). The audit exists to catch this corruption.
+        conn = make_db([("a", "routed", "{not valid json", None, 1, "t", "t")])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertFalse(r.invariant_ok)
+        self.assertFalse(r.ok)
+        self.assertTrue(any("routed_corrupt_payload" in b for b in r.breaches))
+
+    def test_nonnumeric_deal_usd_is_breach_not_crash(self):
+        # A routed payload whose dealUSD is not a number is corruption, not a
+        # crash. float("not-a-number") would raise; it must become a breach.
+        payload = json.dumps(
+            {"id": "a", "dealUSD": "not-a-number", "route": {"kind": "self_serve"}}
+        )
+        conn = make_db([("a", "routed", payload, None, 1, "t", "t")])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertFalse(r.invariant_ok)
+        self.assertTrue(any("routed_corrupt_payload" in b for b in r.breaches))
+
+    def test_nonstring_route_kind_is_breach_not_crash(self):
+        # A parseable payload whose route.kind is not a string (e.g. a list) is
+        # corruption: `kind not in arr` would raise TypeError (unhashable) and
+        # crash the audit. It must be a breach instead.
+        payload = json.dumps({"id": "a", "dealUSD": 1, "route": {"kind": []}})
+        conn = make_db([("a", "routed", payload, None, 1, "t", "t")])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertFalse(r.invariant_ok)
+        self.assertTrue(any("routed_corrupt_payload" in b for b in r.breaches))
+
+    def test_nonfinite_deal_usd_is_breach_not_silent_nan(self):
+        # Python's json accepts NaN/Infinity and float(NaN) succeeds, so a
+        # non-finite amount would silently produce routed_arr_usd=nan with ok.
+        # Non-finite is corruption: it must breach and never leak into the ARR.
+        payload = '{"id": "a", "dealUSD": NaN, "route": {"kind": "self_serve"}}'
+        conn = make_db([("a", "routed", payload, None, 1, "t", "t")])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertFalse(r.invariant_ok)
+        self.assertTrue(any("routed_corrupt_payload" in b for b in r.breaches))
+        self.assertEqual(r.routed_arr_usd, 0)
+        self.assertEqual(r.routed, 0)
+
+    def test_corrupt_deal_usd_variants_are_breaches(self):
+        # dealUSD must match the TS contract z.number().finite().nonnegative()
+        # (src/types.ts). Missing, negative, boolean, and numeric-string values
+        # are corruption — they must breach, never silently coerce into ARR.
+        variants = {
+            "missing": {"id": "a", "route": {"kind": "self_serve"}},
+            "negative": {"id": "a", "dealUSD": -1, "route": {"kind": "self_serve"}},
+            "boolean": {"id": "a", "dealUSD": True, "route": {"kind": "self_serve"}},
+            "string": {"id": "a", "dealUSD": "100", "route": {"kind": "self_serve"}},
+        }
+        for name, obj in variants.items():
+            with self.subTest(variant=name):
+                conn = make_db([("a", "routed", json.dumps(obj), None, 1, "t", "t")])
+                r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+                self.assertEqual(r.stuck, 1)
+                self.assertFalse(r.invariant_ok)
+                self.assertTrue(
+                    any("routed_corrupt_payload" in b for b in r.breaches)
+                )
+                self.assertEqual(r.routed_arr_usd, 0)
+                self.assertEqual(r.routed, 0)
+
+    def test_overflowing_int_deal_usd_is_breach_not_crash(self):
+        # An arbitrarily large JSON integer parses to a Python int whose
+        # math.isfinite() conversion raises OverflowError. JS float64 would
+        # treat it as non-finite and reject it; here it must breach, not crash.
+        payload = (
+            '{"id": "a", "dealUSD": ' + ("9" * 1000) + ', "route": {"kind": "self_serve"}}'
+        )
+        conn = make_db([("a", "routed", payload, None, 1, "t", "t")])
+        r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=9999)
+        self.assertEqual(r.stuck, 1)
+        self.assertFalse(r.invariant_ok)
+        self.assertTrue(any("routed_corrupt_payload" in b for b in r.breaches))
+        self.assertEqual(r.routed_arr_usd, 0)
+
     def test_latency_slo_breach_fails(self):
         conn = make_db([_routed("a", "self_serve", 1000, 9000)])
         r = ops_audit.audit(conn, max_quarantine_rate=1.0, max_p95_ms=2000)

@@ -329,16 +329,46 @@ def audit(
                 r.breaches.append("INVARIANT routed_missing_payload")
                 r.stuck += 1
             else:
-                deal = json.loads(payload)
-                kind = deal.get("route", {}).get("kind", "unknown")
-                usd = float(deal.get("dealUSD", 0))
-                if kind not in arr:
-                    r.breaches.append(f"INVARIANT unknown_route_kind {kind}")
+                try:
+                    deal = json.loads(payload)
+                    kind = deal.get("route", {}).get("kind", "unknown")
+                    raw_usd = deal.get("dealUSD")
+                    # The routed payload must match the TS contract: route.kind a
+                    # string (an unhashable kind would crash `kind not in arr`),
+                    # and dealUSD a z.number().finite().nonnegative() (src/types.ts).
+                    # bool is a subclass of int, so exclude it explicitly. Missing,
+                    # negative, NaN/Infinity, boolean, and string dealUSD are all
+                    # corruption — a breach, never silently coerced into ARR.
+                    if (
+                        not isinstance(kind, str)
+                        or isinstance(raw_usd, bool)
+                        or not isinstance(raw_usd, (int, float))
+                        or not math.isfinite(raw_usd)
+                        or raw_usd < 0
+                    ):
+                        raise ValueError("corrupt routed payload fields")
+                    usd = float(raw_usd)
+                except (
+                    json.JSONDecodeError,
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                ):
+                    # A corrupt routed payload is a loud breach, not a traceback.
+                    # Symmetric with the null-payload branch (routed_missing_payload):
+                    # the audit re-derives invariants and must report corruption
+                    # it cannot parse, never crash on it.
+                    r.breaches.append("INVARIANT routed_corrupt_payload")
                     r.stuck += 1
                 else:
-                    r.routed += 1
-                    arr[kind] += usd
-                    r.routed_arr_usd += usd
+                    if kind not in arr:
+                        r.breaches.append(f"INVARIANT unknown_route_kind {kind}")
+                        r.stuck += 1
+                    else:
+                        r.routed += 1
+                        arr[kind] += usd
+                        r.routed_arr_usd += usd
         elif stage == "quarantined":
             r.quarantined += 1
         else:

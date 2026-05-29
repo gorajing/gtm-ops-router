@@ -260,8 +260,11 @@ Built to a production bar.
 - **Fail loud, never silent.** Every failure is a typed `Quarantine` with a
   code and a human-readable reason. An unknown company is *not guessed*. A
   persistence error is surfaced as `store_error`; an unexpected per-row throw is
-  surfaced as `pipeline_error`. Nothing is ever dropped: routed + quarantined
-  always reconciles to intake.
+  surfaced as `pipeline_error`. Nothing is ever *silently* dropped: routed +
+  valid quarantines reconcile to recognized intake (`store.integrity()`). A
+  `schema_invalid` record never enters intake, so it sits outside that equality;
+  and if persistence itself fails, the record is surfaced loudly via stderr
+  rather than as a store row.
 - **Observability is first-class.** Every stage transition is an event row;
   metrics (conversion, quarantine rate by code, route mix, p50/p95 latency)
   are queryable and rendered on a live dashboard and a JSON endpoint. External
