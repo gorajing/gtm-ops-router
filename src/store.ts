@@ -116,7 +116,11 @@ import {
   type WorkItemSuggestionRunInput,
   type WorkItemSuggestionRunResult,
   type WorkItemStatus as WorkItemStatusType,
+  type EngagementEventRecord,
+  type CommercialSignalRecord,
+  type EngagementImportResult,
 } from "./types.js";
+import type { EngagementFeedback, EngagementEvent } from "./engagement.js";
 
 // Load the experimental built-in SQLite via createRequire. `node:sqlite`
 // isn't in `builtinModules` yet, so static analyzers/bundlers (Vite, Vitest,
@@ -154,6 +158,9 @@ const LOCAL_DEPLOYMENT_FACTS_SOURCE = "local";
 const LOCAL_OUTCOME_SOURCE = "local";
 const LOCAL_AGENT_SUGGESTION_SOURCE = "local_agent";
 const SELF_REPORTED_OPERATOR_SOURCE = "self_reported";
+const SALES_OBSERVED_SOURCE = "sales_observed" as const;
+const SALES_WINDOW_EVALUATOR_SOURCE = "sales_window_evaluator" as const;
+const SALES_REPORTED_SOURCE = "sales_reported" as const;
 const PROVIDER_OBSERVATION_ID_PREFIX = "PO";
 const DAY_MS = 86_400_000;
 const CANONICAL_ISO_UTC =
@@ -1246,7 +1253,9 @@ const SCHEMA: string[] = [
          'outcome',
          'provider_observation',
          'agent_suggestion',
-         'agent_suggestion_decision'
+         'agent_suggestion_decision',
+         'engagement_event',
+         'commercial_signal'
        ) OR
        scope LIKE 'external_event_observation:%'
      )
@@ -1284,6 +1293,42 @@ const SCHEMA: string[] = [
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_status ON agent_suggestions(status, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_agent_suggestions_deal ON agent_suggestions(deal_id, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_policy_recommendation_runs_created ON policy_recommendation_runs(created_at DESC)",
+  `CREATE TABLE IF NOT EXISTS engagement_events (
+     id TEXT PRIMARY KEY,
+     deal_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     source_payload_hash TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     occurred_at TEXT NOT NULL,
+     payload_json TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     UNIQUE (source, source_event_id),
+     CHECK (source IN ('sales_observed', 'sales_window_evaluator')),
+     CHECK (kind IN ('sent', 'replied', 'meeting_booked', 'bounced', 'no_response'))
+   )`,
+  `CREATE TABLE IF NOT EXISTS commercial_signals (
+     id TEXT PRIMARY KEY,
+     deal_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     source_event_id TEXT NOT NULL,
+     source_payload_hash TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     occurred_at TEXT NOT NULL,
+     amount_usd INTEGER,
+     crm_ref TEXT,
+     created_at TEXT NOT NULL,
+     UNIQUE (source, source_event_id),
+     CHECK (source IN ('sales_reported')),
+     CHECK (kind IN ('opportunity_created'))
+   )`,
+  `CREATE TABLE IF NOT EXISTS engagement_feedback_meta (
+     id INTEGER PRIMARY KEY CHECK(id=1),
+     coverage_complete INTEGER NOT NULL,
+     generated_at TEXT NOT NULL
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_engagement_events_deal ON engagement_events(deal_id, occurred_at)",
+  "CREATE INDEX IF NOT EXISTS idx_commercial_signals_deal ON commercial_signals(deal_id, occurred_at)",
 ];
 
 function percentile(sorted: number[], p: number): number {
@@ -1349,6 +1394,14 @@ function canonicalJson(value: unknown): string {
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function engagementEventSource(
+  kind: EngagementEvent["kind"],
+): "sales_observed" | "sales_window_evaluator" {
+  return kind === "no_response"
+    ? SALES_WINDOW_EVALUATOR_SOURCE
+    : SALES_OBSERVED_SOURCE;
 }
 
 function stableUuidV4(seed: string): string {
@@ -1842,6 +1895,8 @@ export class Store {
         "provider_observation",
         "agent_suggestion",
         "agent_suggestion_decision",
+        "engagement_event",
+        "commercial_signal",
       ])
     ) {
       return;
@@ -1867,7 +1922,9 @@ export class Store {
                  'outcome',
                  'provider_observation',
                  'agent_suggestion',
-                 'agent_suggestion_decision'
+                 'agent_suggestion_decision',
+                 'engagement_event',
+                 'commercial_signal'
                ) OR
                scope LIKE 'external_event_observation:%'
              )
@@ -2664,6 +2721,21 @@ export class Store {
       .prepare("SELECT * FROM commercial_states WHERE deal_id = ?")
       .get(dealId) as Record<string, unknown> | undefined;
     return row ? this.commercialStateFromRow(row) : null;
+  }
+
+  /**
+   * Full-table, deterministically ordered snapshot for boundary assertions.
+   * SELECT * FROM commercial_states ORDER BY deal_id → JSON.stringify(rows)
+   */
+  allCommercialStatesSnapshot(): string {
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM commercial_states
+         ORDER BY deal_id`,
+      )
+      .all() as Record<string, unknown>[];
+    return JSON.stringify(rows);
   }
 
   recordLocalCommercialState(
@@ -8196,6 +8268,316 @@ export class Store {
       medianTimeClosedWonToDeployedHours: median(closedWonToDeployedHours),
       medianTimeDeployedToLandedHours: median(deployedToLandedHours),
     };
+  }
+
+  // ─── Engagement events & commercial signals ───────────────────────────────
+
+  private engagementEventFromRow(
+    row: Record<string, unknown>,
+  ): EngagementEventRecord {
+    return {
+      id: String(row["id"]),
+      dealId: String(row["deal_id"]),
+      source: String(row["source"]) as EngagementEventRecord["source"],
+      sourceEventId: String(row["source_event_id"]),
+      sourcePayloadHash: String(row["source_payload_hash"]),
+      kind: String(row["kind"]) as EngagementEventRecord["kind"],
+      occurredAt: String(row["occurred_at"]),
+      payloadJson: String(row["payload_json"]),
+      createdAt: String(row["created_at"]),
+    };
+  }
+
+  private commercialSignalFromRow(
+    row: Record<string, unknown>,
+  ): CommercialSignalRecord {
+    return {
+      id: String(row["id"]),
+      dealId: String(row["deal_id"]),
+      source: SALES_REPORTED_SOURCE,
+      sourceEventId: String(row["source_event_id"]),
+      sourcePayloadHash: String(row["source_payload_hash"]),
+      kind: "opportunity_created",
+      occurredAt: String(row["occurred_at"]),
+      amountUsd:
+        typeof row["amount_usd"] === "number"
+          ? Math.trunc(row["amount_usd"])
+          : null,
+      crmRef:
+        typeof row["crm_ref"] === "string" ? row["crm_ref"] : null,
+      createdAt: String(row["created_at"]),
+    };
+  }
+
+  engagementEvents(dealId?: string): EngagementEventRecord[] {
+    const rows = dealId
+      ? (this.db
+          .prepare(
+            `SELECT *
+             FROM engagement_events
+             WHERE deal_id = ?
+             ORDER BY occurred_at, created_at, id`,
+          )
+          .all(dealId) as Record<string, unknown>[])
+      : (this.db
+          .prepare(
+            `SELECT *
+             FROM engagement_events
+             ORDER BY occurred_at, created_at, id`,
+          )
+          .all() as Record<string, unknown>[]);
+    return rows.map((row) => this.engagementEventFromRow(row));
+  }
+
+  commercialSignals(dealId?: string): CommercialSignalRecord[] {
+    const rows = dealId
+      ? (this.db
+          .prepare(
+            `SELECT *
+             FROM commercial_signals
+             WHERE deal_id = ?
+             ORDER BY occurred_at, created_at, id`,
+          )
+          .all(dealId) as Record<string, unknown>[])
+      : (this.db
+          .prepare(
+            `SELECT *
+             FROM commercial_signals
+             ORDER BY occurred_at, created_at, id`,
+          )
+          .all() as Record<string, unknown>[]);
+    return rows.map((row) => this.commercialSignalFromRow(row));
+  }
+
+  lastEngagementFeedbackCoverageComplete(): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT coverage_complete
+         FROM engagement_feedback_meta
+         WHERE id = 1`,
+      )
+      .get() as { coverage_complete: number } | undefined;
+    if (!row) return true;
+    return row.coverage_complete !== 0;
+  }
+
+  importEngagementFeedback(payload: EngagementFeedback): EngagementImportResult {
+    let eventsRecorded = 0;
+    let eventsDuplicate = 0;
+    let commercialSignalsRecorded = 0;
+    let commercialSignalsDuplicate = 0;
+    const unknownDealRejections: Array<{
+      routerDealId: string;
+      eventCount: number;
+    }> = [];
+
+    for (const deal of payload.deals) {
+      const dealRow = this.db
+        .prepare("SELECT id FROM deals WHERE id = ?")
+        .get(deal.routerDealId) as { id: string } | undefined;
+
+      if (!dealRow) {
+        unknownDealRejections.push({
+          routerDealId: deal.routerDealId,
+          eventCount: deal.events.length,
+        });
+        continue;
+      }
+
+      const { eventsRecorded: er, eventsDuplicate: ed } =
+        this.importEngagementDealEvents(deal.routerDealId, deal.events);
+      eventsRecorded += er;
+      eventsDuplicate += ed;
+
+      const signals = deal.commercialSignals ?? [];
+      const { recorded: sr, duplicate: sd } = this.importCommercialSignals(
+        deal.routerDealId,
+        signals,
+      );
+      commercialSignalsRecorded += sr;
+      commercialSignalsDuplicate += sd;
+    }
+
+    // Persist latest coverage.complete (reconciliation item 1)
+    this.db
+      .prepare(
+        `INSERT INTO engagement_feedback_meta (id, coverage_complete, generated_at)
+         VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           coverage_complete = excluded.coverage_complete,
+           generated_at = excluded.generated_at`,
+      )
+      .run(payload.coverage.complete ? 1 : 0, payload.generatedAt);
+
+    return {
+      schemaVersion: payload.schemaVersion,
+      generatedAt: payload.generatedAt,
+      coverage: payload.coverage,
+      processedDeals: payload.deals.length - unknownDealRejections.length,
+      eventsRecorded,
+      eventsDuplicate,
+      commercialSignalsRecorded,
+      commercialSignalsDuplicate,
+      unknownDealRejections,
+    };
+  }
+
+  private importEngagementDealEvents(
+    dealId: string,
+    events: EngagementEvent[],
+  ): { eventsRecorded: number; eventsDuplicate: number } {
+    let eventsRecorded = 0;
+    let eventsDuplicate = 0;
+
+    this.transactionImmediate(() => {
+      for (const event of events) {
+        assertCanonicalIsoUtc(event.occurredAt, "engagement event occurredAt");
+        if (event.kind === "no_response") {
+          assertCanonicalIsoUtc(event.asOf, "no_response event asOf");
+        }
+        if (event.kind === "meeting_booked") {
+          assertCanonicalIsoUtc(
+            event.meetingAt,
+            "meeting_booked event meetingAt",
+          );
+        }
+
+        const source = engagementEventSource(event.kind);
+        const payloadJson = canonicalJson(event);
+        const payloadHash = sha256Hex(payloadJson);
+
+        const existing = this.db
+          .prepare(
+            `SELECT source_payload_hash
+             FROM engagement_events
+             WHERE source = ?
+               AND source_event_id = ?`,
+          )
+          .get(source, event.eventId) as
+          | { source_payload_hash: string }
+          | undefined;
+
+        if (existing) {
+          if (existing.source_payload_hash === payloadHash) {
+            eventsDuplicate += 1;
+          } else {
+            this.recordIdempotencyViolation(
+              event.eventId,
+              "engagement_event",
+              existing.source_payload_hash,
+              payloadHash,
+              "engagement event id replayed with a different payload",
+              source,
+            );
+            // Skip — do not overwrite
+          }
+          continue;
+        }
+
+        const now = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO engagement_events (
+               id, deal_id, source, source_event_id, source_payload_hash,
+               kind, occurred_at, payload_json, created_at
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            randomUUID(),
+            dealId,
+            source,
+            event.eventId,
+            payloadHash,
+            event.kind,
+            event.occurredAt,
+            payloadJson,
+            now,
+          );
+        eventsRecorded += 1;
+      }
+    });
+
+    return { eventsRecorded, eventsDuplicate };
+  }
+
+  private importCommercialSignals(
+    dealId: string,
+    signals: Array<{
+      kind: "opportunity_created";
+      eventId: string;
+      occurredAt: string;
+      amountUsd: number | null;
+      crmRef: string | null;
+    }>,
+  ): { recorded: number; duplicate: number } {
+    let recorded = 0;
+    let duplicate = 0;
+
+    this.transactionImmediate(() => {
+      for (const signal of signals) {
+        assertCanonicalIsoUtc(
+          signal.occurredAt,
+          "commercial signal occurredAt",
+        );
+
+        const payloadJson = canonicalJson(signal);
+        const payloadHash = sha256Hex(payloadJson);
+
+        const existing = this.db
+          .prepare(
+            `SELECT source_payload_hash
+             FROM commercial_signals
+             WHERE source = ?
+               AND source_event_id = ?`,
+          )
+          .get(SALES_REPORTED_SOURCE, signal.eventId) as
+          | { source_payload_hash: string }
+          | undefined;
+
+        if (existing) {
+          if (existing.source_payload_hash === payloadHash) {
+            duplicate += 1;
+          } else {
+            this.recordIdempotencyViolation(
+              signal.eventId,
+              "commercial_signal",
+              existing.source_payload_hash,
+              payloadHash,
+              "commercial signal id replayed with a different payload",
+              SALES_REPORTED_SOURCE,
+            );
+            // Skip — do not overwrite
+          }
+          continue;
+        }
+
+        const now = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO commercial_signals (
+               id, deal_id, source, source_event_id, source_payload_hash,
+               kind, occurred_at, amount_usd, crm_ref, created_at
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            randomUUID(),
+            dealId,
+            SALES_REPORTED_SOURCE,
+            signal.eventId,
+            payloadHash,
+            signal.kind,
+            signal.occurredAt,
+            signal.amountUsd,
+            signal.crmRef,
+            now,
+          );
+        recorded += 1;
+      }
+    });
+
+    return { recorded, duplicate };
   }
 
   // ─── Integrity self-check & lifecycle ─────────────────────────────────────

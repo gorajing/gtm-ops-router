@@ -20,7 +20,11 @@ import type {
   RoleQueueKind,
   ProviderObservationInput,
   RoutedDeal,
+  EngagementEventRecord,
+  CommercialSignalRecord,
+  EngagementImportResult,
 } from "../src/types.js";
+import type { EngagementFeedback, EngagementEvent, CommercialSignal } from "../src/engagement.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
   StatementSync: unknown;
@@ -6366,5 +6370,670 @@ describe("Store.integrity() — reconciliation invariant fails loud", () => {
     } finally {
       store.close();
     }
+  });
+});
+
+// ─── Engagement helpers ────────────────────────────────────────────────────
+
+function engagementFeedback(
+  overrides: Partial<EngagementFeedback> = {},
+): EngagementFeedback {
+  return {
+    schemaVersion: "sales.engagement-feedback.v1",
+    generatedAt: "2026-05-29T10:00:00.000Z",
+    source: { system: "sales", purpose: "test" },
+    coverage: { complete: true, scanned: 1, emitted: 1, since: null },
+    deals: [],
+    ...overrides,
+  };
+}
+
+function sentEvent(eventId: string, touchId = "touch-001"): EngagementEvent {
+  return {
+    kind: "sent",
+    eventId,
+    occurredAt: "2026-05-20T08:00:00.000Z",
+    touchId,
+    channel: "email",
+  };
+}
+
+function repliedEvent(
+  eventId: string,
+  touchId = "touch-001",
+): EngagementEvent {
+  return {
+    kind: "replied",
+    eventId,
+    occurredAt: "2026-05-21T09:00:00.000Z",
+    touchId,
+    replyIntent: "positive",
+  };
+}
+
+function noResponseEvent(eventId: string): EngagementEvent {
+  return {
+    kind: "no_response",
+    eventId,
+    occurredAt: "2026-05-22T00:00:00.000Z",
+    asOf: "2026-05-22T00:00:00.000Z",
+    windowDays: 7,
+    lastTouchId: "touch-001",
+    derived: true,
+  };
+}
+
+function opportunitySignal(eventId: string): CommercialSignal {
+  return {
+    kind: "opportunity_created",
+    eventId,
+    occurredAt: "2026-05-22T10:00:00.000Z",
+    amountUsd: 80000,
+    crmRef: "HS-001",
+  };
+}
+
+// ─── engagement_events DDL + engagementEvents reader ──────────────────────
+
+describe("store — engagement_events DDL", () => {
+  it("creates engagement_events and commercial_signals tables on construction", () => {
+    withTempStoreDb((db) => {
+      const tables = (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master WHERE type='table' AND name IN ('engagement_events','commercial_signals') ORDER BY name`,
+          )
+          .all() as Array<{ name: string }>
+      ).map((r) => r.name);
+      expect(tables).toEqual(["commercial_signals", "engagement_events"]);
+    });
+  });
+
+  it("engagement_events UNIQUE(source, source_event_id) is enforced by SQLite schema", () => {
+    withTempStoreDb((db) => {
+      const row = db
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='engagement_events'`,
+        )
+        .get() as { sql: string } | undefined;
+      expect(row?.sql).toContain("UNIQUE");
+      expect(row?.sql).toContain("source_event_id");
+    });
+  });
+
+  it("commercial_signals UNIQUE(source, source_event_id) is enforced by SQLite schema", () => {
+    withTempStoreDb((db) => {
+      const row = db
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='commercial_signals'`,
+        )
+        .get() as { sql: string } | undefined;
+      expect(row?.sql).toContain("UNIQUE");
+      expect(row?.sql).toContain("source_event_id");
+    });
+  });
+
+  it("idempotency_violations accepts engagement_event and commercial_signal scopes", () => {
+    withTempStoreDb((db) => {
+      const row = db
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='idempotency_violations'`,
+        )
+        .get() as { sql: string } | undefined;
+      expect(row?.sql).toContain("'engagement_event'");
+      expect(row?.sql).toContain("'commercial_signal'");
+    });
+  });
+});
+
+// ─── importEngagementFeedback — happy path ─────────────────────────────────
+
+describe("store — importEngagementFeedback happy path", () => {
+  it("records a sent+replied deal and returns correct counts", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-sent-1"), repliedEvent("evt-replied-1")],
+          },
+        ],
+      }),
+    );
+
+    expect(result.eventsRecorded).toBe(2);
+    expect(result.eventsDuplicate).toBe(0);
+    expect(result.processedDeals).toBe(1);
+    expect(result.unknownDealRejections).toHaveLength(0);
+    expect(result.commercialSignalsRecorded).toBe(0);
+
+    const events = store.engagementEvents("D-lease");
+    expect(events).toHaveLength(2);
+    expect(events[0]?.kind).toBe("sent");
+    expect(events[0]?.source).toBe("sales_observed");
+    expect(events[1]?.kind).toBe("replied");
+
+    store.close();
+  });
+
+  it("records a commercial signal and returns correct counts", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [],
+            commercialSignals: [opportunitySignal("sig-opp-1")],
+          },
+        ],
+      }),
+    );
+
+    expect(result.commercialSignalsRecorded).toBe(1);
+    expect(result.commercialSignalsDuplicate).toBe(0);
+
+    const signals = store.commercialSignals("D-lease");
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.kind).toBe("opportunity_created");
+    expect(signals[0]?.amountUsd).toBe(80000);
+    expect(signals[0]?.crmRef).toBe("HS-001");
+    expect(signals[0]?.source).toBe("sales_reported");
+
+    store.close();
+  });
+
+  it("engagementEvents() with no dealId returns all rows across all deals", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+    store.recordRouted(
+      {
+        ...routed(),
+        id: "D-other",
+        company: "Other Co",
+        domain: "other.example",
+      },
+      0,
+      { mode: "dry_run", status: "dry_run" },
+    );
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-s1")],
+          },
+          {
+            routerDealId: "D-other",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-s2", "touch-002")],
+          },
+        ],
+      }),
+    );
+
+    expect(store.engagementEvents()).toHaveLength(2);
+    expect(store.engagementEvents("D-lease")).toHaveLength(1);
+    expect(store.engagementEvents("D-other")).toHaveLength(1);
+
+    store.close();
+  });
+
+  it("no_response event gets source='sales_window_evaluator'", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [noResponseEvent("evt-nr-1")],
+          },
+        ],
+      }),
+    );
+
+    const events = store.engagementEvents("D-lease");
+    expect(events).toHaveLength(1);
+    expect(events[0]?.source).toBe("sales_window_evaluator");
+    expect(events[0]?.kind).toBe("no_response");
+
+    store.close();
+  });
+
+  it("lastEngagementFeedbackCoverageComplete returns true before any import", () => {
+    const store = new Store(":memory:");
+    expect(store.lastEngagementFeedbackCoverageComplete()).toBe(true);
+    store.close();
+  });
+
+  it("lastEngagementFeedbackCoverageComplete reflects coverage.complete from last import", () => {
+    const store = new Store(":memory:");
+    store.importEngagementFeedback(
+      engagementFeedback({
+        coverage: { complete: false, scanned: 5, emitted: 2, since: null },
+        deals: [],
+      }),
+    );
+    expect(store.lastEngagementFeedbackCoverageComplete()).toBe(false);
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        coverage: { complete: true, scanned: 5, emitted: 5, since: null },
+        deals: [],
+      }),
+    );
+    expect(store.lastEngagementFeedbackCoverageComplete()).toBe(true);
+    store.close();
+  });
+});
+
+// ─── importEngagementFeedback — idempotency ─────────────────────────────────
+
+describe("store — importEngagementFeedback idempotency", () => {
+  it("re-importing identical events is a duplicate no-op", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const payload = engagementFeedback({
+      deals: [
+        {
+          routerDealId: "D-lease",
+          trace: {
+            sourceSystem: "sales",
+            boundary: "observed_engagement_not_router_truth",
+          },
+          events: [sentEvent("evt-sent-1")],
+        },
+      ],
+    });
+
+    const first = store.importEngagementFeedback(payload);
+    const second = store.importEngagementFeedback(payload);
+
+    expect(first.eventsRecorded).toBe(1);
+    expect(first.eventsDuplicate).toBe(0);
+    expect(second.eventsRecorded).toBe(0);
+    expect(second.eventsDuplicate).toBe(1);
+
+    expect(store.engagementEvents("D-lease")).toHaveLength(1);
+
+    store.close();
+  });
+
+  it("same eventId + changed payload writes an idempotency_violation and skips", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-sent-1")],
+          },
+        ],
+      }),
+    );
+
+    const changedEvent: EngagementEvent = {
+      kind: "sent",
+      eventId: "evt-sent-1",
+      occurredAt: "2026-05-20T08:00:00.000Z",
+      touchId: "touch-001",
+      channel: "linkedin", // changed
+    };
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [changedEvent],
+          },
+        ],
+      }),
+    );
+
+    expect(result.eventsRecorded).toBe(0);
+    expect(store.engagementEvents("D-lease")).toHaveLength(1);
+    expect(store.engagementEvents("D-lease")[0]?.payloadJson).toContain("email");
+
+    store.close();
+  });
+
+  it("a duplicate eventId within a single payload is a safe replay, not a double-count", () => {
+    // The demo-fixture strategy depends on shared deterministic ids being safe
+    // replays: two events with the same eventId in one payload must collapse to
+    // a single stored row, never double-count.
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const dup = sentEvent("evt-dup-1");
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [dup, dup],
+          },
+        ],
+      }),
+    );
+
+    expect(result.eventsRecorded).toBe(1);
+    expect(result.eventsDuplicate).toBe(1);
+    expect(store.engagementEvents("D-lease")).toHaveLength(1);
+
+    store.close();
+  });
+
+  it("changed-payload conflicts persist idempotency_violations rows (not silently swallowed)", () => {
+    const dir = join(
+      tmpdir(),
+      `gtm-router-engagement-idem-${process.pid}-${Date.now()}`,
+    );
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [
+            {
+              routerDealId: "D-lease",
+              trace: {
+                sourceSystem: "sales",
+                boundary: "observed_engagement_not_router_truth",
+              },
+              events: [sentEvent("evt-sent-1")],
+              commercialSignals: [opportunitySignal("sig-1")],
+            },
+          ],
+        }),
+      );
+      // Replay the SAME ids with changed payloads — both must be recorded as
+      // violations, not silently dropped (eventsRecorded===0 alone can't tell).
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [
+            {
+              routerDealId: "D-lease",
+              trace: {
+                sourceSystem: "sales",
+                boundary: "observed_engagement_not_router_truth",
+              },
+              events: [
+                {
+                  kind: "sent",
+                  eventId: "evt-sent-1",
+                  occurredAt: "2026-05-20T08:00:00.000Z",
+                  touchId: "touch-001",
+                  channel: "linkedin",
+                },
+              ],
+              commercialSignals: [
+                {
+                  kind: "opportunity_created",
+                  eventId: "sig-1",
+                  occurredAt: "2026-05-22T10:00:00.000Z",
+                  amountUsd: 99999,
+                  crmRef: "HS-001",
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const eng = db
+          .prepare(
+            `SELECT COUNT(*) n FROM idempotency_violations WHERE scope='engagement_event'`,
+          )
+          .get() as { n: number };
+        const sig = db
+          .prepare(
+            `SELECT COUNT(*) n FROM idempotency_violations WHERE scope='commercial_signal'`,
+          )
+          .get() as { n: number };
+        expect(eng.n).toBeGreaterThanOrEqual(1);
+        expect(sig.n).toBeGreaterThanOrEqual(1);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("same commercial signal eventId + changed payload writes an idempotency_violation and skips", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [],
+            commercialSignals: [opportunitySignal("sig-1")],
+          },
+        ],
+      }),
+    );
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [],
+            commercialSignals: [
+              {
+                kind: "opportunity_created",
+                eventId: "sig-1",
+                occurredAt: "2026-05-22T10:00:00.000Z",
+                amountUsd: 99999, // changed
+                crmRef: "HS-001",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(result.commercialSignalsRecorded).toBe(0);
+    expect(store.commercialSignals("D-lease")).toHaveLength(1);
+    expect(store.commercialSignals("D-lease")[0]?.amountUsd).toBe(80000);
+
+    store.close();
+  });
+});
+
+// ─── importEngagementFeedback — boundary: unknown routerDealId ─────────────
+
+describe("store — importEngagementFeedback boundary", () => {
+  it("unknown routerDealId pushes to unknownDealRejections, writes no events", () => {
+    const store = new Store(":memory:");
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-unknown",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-unknown-1")],
+          },
+        ],
+      }),
+    );
+
+    expect(result.unknownDealRejections).toEqual([
+      { routerDealId: "D-unknown", eventCount: 1 },
+    ]);
+    expect(result.eventsRecorded).toBe(0);
+    expect(store.engagementEvents()).toHaveLength(0);
+    store.close();
+  });
+
+  it("one bad deal in a batch does not abort recording the valid deal", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-unknown-only",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-bad-1")],
+          },
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-good-1")],
+          },
+        ],
+      }),
+    );
+
+    expect(result.unknownDealRejections).toHaveLength(1);
+    expect(result.unknownDealRejections[0]?.routerDealId).toBe("D-unknown-only");
+    expect(result.eventsRecorded).toBe(1);
+    expect(store.engagementEvents("D-lease")).toHaveLength(1);
+    store.close();
+  });
+
+  it("importing engagement feedback does NOT modify commercial_states", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    // Seed a real commercial_states row so the snapshot is non-empty.
+    store.recordLocalCommercialState({
+      dealId: "D-lease",
+      commercialState: "open",
+      sourceEventId: "cc000001-cc00-4c00-8c00-cc0000000001",
+      occurredAt: "2026-05-29T08:00:00.000Z",
+      reason: null,
+      expectedRedPath: false,
+    });
+
+    const before = store.allCommercialStatesSnapshot();
+
+    // Guard: the snapshot must be non-empty and contain the seeded deal,
+    // so this test can never pass vacuously by comparing two empty strings.
+    expect(before).toContain("D-lease");
+
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-lease",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-cs-1")],
+            commercialSignals: [opportunitySignal("sig-cs-1")],
+          },
+        ],
+      }),
+    );
+
+    const after = store.allCommercialStatesSnapshot();
+    // Byte-for-byte unchanged: the importer must never touch commercial_states.
+    expect(after).toBe(before);
+    store.close();
+  });
+
+  it("strict UTC boundary: non-canonical timestamp throws at import, not silently accepted", () => {
+    const store = new Store(":memory:");
+    store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+
+    const badTimestamp = "2026-05-20T08:00:00Z"; // missing .sss milliseconds
+    expect(() =>
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [
+            {
+              routerDealId: "D-lease",
+              trace: {
+                sourceSystem: "sales",
+                boundary: "observed_engagement_not_router_truth",
+              },
+              events: [
+                {
+                  kind: "sent",
+                  eventId: "evt-bad-ts",
+                  occurredAt: badTimestamp,
+                  touchId: "touch-001",
+                  channel: "email",
+                } as EngagementEvent,
+              ],
+            },
+          ],
+        }),
+      ),
+    ).toThrow(/canonical UTC/);
+    expect(store.engagementEvents("D-lease")).toHaveLength(0);
+    store.close();
   });
 });
