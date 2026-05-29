@@ -6350,3 +6350,21 @@ describe("Store external webhook leases", () => {
     }
   });
 });
+
+describe("Store.integrity() — reconciliation invariant fails loud", () => {
+  it("flags a recognized intake with no routed/quarantined terminal as not ok", () => {
+    const store = new Store(":memory:");
+    try {
+      // A recognized intake event with no settling terminal row: the invariant
+      // (recognized intake === routed + valid quarantined) must NOT hold. This
+      // guards against integrity() silently regressing to always-ok — every
+      // other test only ever asserts integrity().ok === true.
+      store.appendEvent("D-orphan", "-", "intake", "orphan intake, never settled");
+      const result = store.integrity();
+      expect(result.ok).toBe(false);
+      expect(result.detail).toContain("recognized intakes but");
+    } finally {
+      store.close();
+    }
+  });
+});
