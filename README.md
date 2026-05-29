@@ -345,8 +345,11 @@ data/router.db ─► ops_audit.py   (Python: invariant + SLO gate, exit 1 on br
 ```
 
 Each stage is single-purpose and swappable; the pipeline doesn't change when
-an enricher or sink does. `src/` is ~11 small files; read `pipeline.ts` first
-— the stage order and error boundaries are the interesting part.
+an enricher or sink does. Read `pipeline.ts` first (~430 lines) — the stage
+order and error boundaries are the interesting part. The pipeline stages stay
+small; the line count concentrates in `store.ts` (the single SQLite
+data-access layer — one cohesive class, signposted by domain) and
+`integrations.ts` (HubSpot + Slack adapters with retry/backoff).
 
 ## 90-second walkthrough (for the screen recording)
 

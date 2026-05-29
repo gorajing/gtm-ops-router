@@ -1604,7 +1604,35 @@ function factFreshness(
   };
 }
 
+/**
+ * The single SQLite data-access layer for the router.
+ *
+ * This is one large, cohesive class on purpose. Every domain below shares one
+ * connection and one `transactionDepth` scope, so a write that spans (say)
+ * commercial state and a deployment-readiness re-derivation commits or rolls
+ * back atomically. Splitting the class into per-domain modules would trade an
+ * unfamiliarly large file for cross-module transaction coupling that is harder
+ * to reason about, not easier — the cohesion is the point. The class is
+ * organized by domain in source order. Each `// ─── … ───` banner below heads
+ * one group; search for the representative method to jump in:
+ *
+ *   schema, migrations, private helpers ......... constructor
+ *   write path — routed/quarantine + event log .. upsertRouted
+ *   HubSpot stage-change webhooks ............... recordExternalStageChange
+ *   commercial lifecycle state .................. commercialState
+ *   enrichment observations + projected facts ... recordEnrichmentObservation
+ *   deployment facts + readiness inputs ......... deploymentFacts
+ *   post-sale outcomes, agent + policy-run reads  outcomeEvents
+ *   operator work-item queue .................... workItems
+ *   readiness derivation + notification retries . deriveDeploymentReadiness
+ *   read & projection surface ................... events
+ *   policy evaluation + recommendation writes ... policyEvaluation
+ *   deployment readiness projection ............. deploymentReadinessRecords
+ *   aggregate metrics ........................... metrics
+ *   integrity self-check + lifecycle ............ integrity
+ */
 export class Store {
+  // ─── Schema, migrations & private setup ───────────────────────────────────
   private db: DatabaseSyncT;
   private transactionDepth = 0;
 
@@ -2114,6 +2142,7 @@ export class Store {
   }
 
   /** Idempotent on deal id — re-ingesting the same id updates, never dupes. */
+  // ─── Write path — routed & quarantine persistence + event log ───────────
   upsertRouted(
     deal: RoutedDeal,
     latencyMs: number,
@@ -2353,6 +2382,7 @@ export class Store {
       );
   }
 
+  // ─── HubSpot stage-change webhooks + integration config ──────────────────
   recordExternalStageChange(
     dealId: string,
     stage: ExternalStageState,
@@ -2591,6 +2621,7 @@ export class Store {
     });
   }
 
+  // ─── Commercial lifecycle state ───────────────────────────────────────────
   private commercialStateFromRow(
     row: Record<string, unknown>,
   ): CommercialStateRecord {
@@ -2963,6 +2994,7 @@ export class Store {
       );
   }
 
+  // ─── Enrichment — provider observations & projected subject facts ─────────
   recordEnrichmentObservation(
     deal: Deal,
     provider: ProviderObservationProvider,
@@ -3702,6 +3734,7 @@ export class Store {
     });
   }
 
+  // ─── Deployment facts & readiness inputs ──────────────────────────────────
   private deploymentFactsFromRow(
     row: Record<string, unknown>,
   ): DeploymentFactsRecord {
@@ -4017,6 +4050,7 @@ export class Store {
     });
   }
 
+  // ─── Post-sale outcomes, agent suggestions & policy recommendations ───────
   private outcomeEventFromRow(row: Record<string, unknown>): OutcomeEventRecord {
     const base = {
       id: String(row.id),
@@ -4906,6 +4940,7 @@ export class Store {
     };
   }
 
+  // ─── Operator work-item queue ─────────────────────────────────────────────
   workItems(limit = 50): WorkItemRecord[] {
     const normalizedLimit = Number.isFinite(limit) ? limit : 50;
     const cappedLimit = Math.max(1, Math.min(250, normalizedLimit));
@@ -5539,6 +5574,7 @@ export class Store {
     throw new Error(`invalid role queue priority: ${String(value)}`);
   }
 
+  // ─── Deployment readiness derivation + notification retries ───────────────
   private deriveDeploymentReadiness(
     dealId: string,
     now: string,
@@ -6709,6 +6745,7 @@ export class Store {
     return { status };
   }
 
+  // ─── Read & projection surface ────────────────────────────────────────────
   private eventFromRow(r: Record<string, unknown>): PipelineEvent {
     let meta: PipelineEventMeta | undefined;
     if (typeof r.meta === "string" && r.meta.length > 0) {
@@ -7187,6 +7224,7 @@ export class Store {
     };
   }
 
+  // ─── Policy evaluation — reports + recommendation-run writes ──────────────
   private policySignalBackfillDealIds(limit: number, now: string): string[] {
     const cappedLimit = Math.max(1, Math.min(ROLE_QUEUE_MAX_SCAN, limit));
     const nowMs = Date.parse(now);
@@ -7682,6 +7720,7 @@ export class Store {
     };
   }
 
+  // ─── Deployment readiness projection ──────────────────────────────────────
   deploymentReadinessRecords(
     now = new Date().toISOString(),
   ): DeploymentReadinessState[] {
@@ -7729,6 +7768,7 @@ export class Store {
     }));
   }
 
+  // ─── Aggregate metrics ────────────────────────────────────────────────────
   metrics(): Metrics {
     const count = (
       sql: string,
@@ -8158,6 +8198,7 @@ export class Store {
     };
   }
 
+  // ─── Integrity self-check & lifecycle ─────────────────────────────────────
   integrity(): { ok: boolean; detail: string } {
     const recognizedIntake = Number(
       (
