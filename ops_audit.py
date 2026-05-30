@@ -151,6 +151,8 @@ class AuditReport:
     outcome_churn_before_deploy: int = 0
     outcome_commercial_state_conflicts: int = 0
     outcome_invalid_histories: int = 0
+    engagement_orphans: int = 0
+    engagement_projection_conflicts: int = 0
     median_time_closed_won_to_deployed_hours: float | None = None
     median_time_deployed_to_landed_hours: float | None = None
     breaches: list[str] = field(default_factory=list)
@@ -309,6 +311,88 @@ def audit_outcomes(conn: sqlite3.Connection, r: AuditReport) -> None:
         )
 
 
+def audit_engagement(conn: sqlite3.Connection, r: AuditReport) -> None:
+    """
+    Integrity-only gate over the engagement ledger (spec D13).
+
+    Checks:
+      1. engagement_orphans — engagement_events OR commercial_signals rows
+         whose deal_id is not the id of a routed deal (a row in `deals` with
+         stage = 'routed'). An orphan means the import boundary was violated:
+         the importer should have rejected the event/signal.
+      2. engagement_projection_conflicts — a no_response for a deal that
+         already has a POSITIVE response (replied or meeting_booked) with
+         occurred_at strictly BEFORE the no_response. The deal had already
+         responded, so the "no response" verdict is wrong. A `sent` (or
+         `bounced`) before a no_response is the NORMAL flow and is NOT a
+         conflict; a reply AFTER a no_response is the valid late-reply
+         supersession. Each no_response row is checked, not just the earliest.
+
+    Never checks reply rate, pipeline value, or any GTM performance metric.
+    """
+    has_events = table_exists(conn, "engagement_events")
+    has_signals = table_exists(conn, "commercial_signals")
+    if not has_events and not has_signals:
+        return
+
+    # Routed deal ids are the ground truth: only deals with stage='routed'
+    # are valid anchors for engagement rows.
+    routed_ids: set[str] = {
+        str(deal_id)
+        for (deal_id,) in conn.execute(
+            "SELECT id FROM deals WHERE stage = 'routed'"
+        ).fetchall()
+    }
+
+    # ── 1. Orphan check (engagement_events AND commercial_signals) ──────────
+    orphan_count = 0
+    if has_events:
+        for (deal_id,) in conn.execute(
+            "SELECT deal_id FROM engagement_events"
+        ).fetchall():
+            if str(deal_id) not in routed_ids:
+                orphan_count += 1
+    if has_signals:
+        for (deal_id,) in conn.execute(
+            "SELECT deal_id FROM commercial_signals"
+        ).fetchall():
+            if str(deal_id) not in routed_ids:
+                orphan_count += 1
+    r.engagement_orphans = orphan_count
+
+    # ── 2. Projection-conflict check ───────────────────────────────────────
+    # A no_response is inconsistent only when a POSITIVE response (replied or
+    # meeting_booked) occurred strictly BEFORE it: the deal had already
+    # responded, so the verdict is wrong. `sent`/`bounced` before a no_response
+    # is the normal flow; a reply AFTER a no_response is the valid late-reply
+    # supersession. Each no_response row is checked, not just the earliest.
+    conflicts = 0
+    if has_events:
+        (conflicts,) = conn.execute(
+            """SELECT COUNT(*)
+               FROM engagement_events nr
+               WHERE nr.kind = 'no_response'
+                 AND EXISTS (
+                   SELECT 1 FROM engagement_events pos
+                   WHERE pos.deal_id = nr.deal_id
+                     AND pos.kind IN ('replied', 'meeting_booked')
+                     AND pos.occurred_at < nr.occurred_at
+                 )"""
+        ).fetchone()
+    r.engagement_projection_conflicts = conflicts
+
+    # ── Breaches ───────────────────────────────────────────────────────────
+    if r.engagement_orphans > 0:
+        r.breaches.append(
+            f"ENGAGEMENT engagementOrphans {r.engagement_orphans} > 0"
+        )
+    if r.engagement_projection_conflicts > 0:
+        r.breaches.append(
+            f"ENGAGEMENT engagementProjectionConflicts"
+            f" {r.engagement_projection_conflicts} > 0"
+        )
+
+
 def audit(
     conn: sqlite3.Connection,
     max_quarantine_rate: float,
@@ -401,6 +485,7 @@ def audit(
             f"SLO p95_latency {r.p95_latency_ms}ms > {max_p95_ms}ms"
         )
     audit_outcomes(conn, r)
+    audit_engagement(conn, r)
     return r
 
 
@@ -438,6 +523,9 @@ def render(r: AuditReport) -> str:
         f"    won-to-deployed med "
         f"{hours(r.median_time_closed_won_to_deployed_hours)}",
         f"    deployed-to-landed  {hours(r.median_time_deployed_to_landed_hours)}",
+        "  engagement integrity:",
+        f"    orphans ........... {r.engagement_orphans}",
+        f"    proj conflicts .... {r.engagement_projection_conflicts}",
         "-" * 48,
         "  RESULT: " + ("PASS" if r.ok else "FAIL"),
         *[f"    - {b}" for b in r.breaches],
