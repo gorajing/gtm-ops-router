@@ -32,6 +32,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
+  computeEngagementAttribution,
+  type EngagementAttribution,
+} from "./attribution.js";
+import {
   ENRICHMENT_FACT_MAX_AGE_DAYS,
   ENRICHMENT_FACT_MIN_CONFIDENCE,
   MAX_FUTURE_SKEW_MS,
@@ -209,6 +213,7 @@ interface ConsoleState {
   roleQueueLimit: number;
   policyEvaluation: PolicyEvaluationReports;
   policyRecommendationRuns: PolicyRecommendationRunRecord[];
+  engagementAttribution: EngagementAttribution;
 }
 
 type PreviewResult =
@@ -474,6 +479,7 @@ function buildState(store: Store, sinkLabel: string): ConsoleState {
     policyRecommendationRuns: store.policyRecommendationRuns(
       STATE_POLICY_RECOMMENDATION_RUN_LIMIT,
     ),
+    engagementAttribution: computeEngagementAttribution(store),
   };
 }
 

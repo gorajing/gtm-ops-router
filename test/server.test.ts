@@ -5502,3 +5502,98 @@ describe("server dashboard", () => {
     expect(events.events[0]?.detail).toBe(`intake: ${payload.company}`);
   });
 });
+
+describe("GET /state engagementAttribution", () => {
+  it("includes engagementAttribution with correct shape on a fresh store", async () => {
+    const { baseUrl } = await app();
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as {
+      engagementAttribution: {
+        coverage: { complete: boolean; routedDealsTotal: number; routedDealsWithEngagement: number };
+        tiers: { meetingsInfluencedUsd: number; commercialSignalsUsd: number; pipelineInfluencedUsd: number };
+        rates: { replyRate: number | null; meetingRate: number | null; replyToMeetingRate: number | null };
+        winRateByEngagementPath: Array<{ path: string; routed: number; closedWon: number; winRate: number | null }>;
+        hoursSaved: { autoHandledDeals: number; agentDraftedTouchesSent: number; assumedTriageMin: number; assumedDraftMin: number; estimatedHours: number; modeled: true };
+      };
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.engagementAttribution).toBeDefined();
+    // shape checks
+    const ea = body.engagementAttribution;
+    // Empty store: 0 routed deals → coverage vacuously complete (Task 4 design).
+    expect(ea.coverage).toEqual({ complete: true, routedDealsTotal: 0, routedDealsWithEngagement: 0 });
+    expect(ea.tiers).toEqual({ meetingsInfluencedUsd: 0, commercialSignalsUsd: 0, pipelineInfluencedUsd: 0 });
+    expect(ea.rates.replyRate).toBeNull();
+    expect(ea.rates.meetingRate).toBeNull();
+    expect(ea.rates.replyToMeetingRate).toBeNull();
+    expect(Array.isArray(ea.winRateByEngagementPath)).toBe(true);
+    expect(ea.hoursSaved.modeled).toBe(true);
+    expect(ea.hoursSaved.estimatedHours).toBe(0);
+  });
+
+  it("includes engagementAttribution with routed deals after intake", async () => {
+    const { baseUrl } = await app();
+    await fetch(`${baseUrl}/deals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        company: "Engagement Test Co",
+        domain: "engtest.example",
+        contactName: "Era Ops",
+        contactEmail: "era@engtest.example",
+        dealUSD: 75000,
+        region: "NA",
+        sourceChannel: "inbound_form",
+        statedNeed: "automate scheduling across finance and sales handoffs",
+      }),
+    });
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as {
+      engagementAttribution: {
+        coverage: { complete: boolean; routedDealsTotal: number; routedDealsWithEngagement: number };
+        tiers: { meetingsInfluencedUsd: number; commercialSignalsUsd: number; pipelineInfluencedUsd: number };
+        rates: { replyRate: number | null; meetingRate: number | null; replyToMeetingRate: number | null };
+      };
+    };
+
+    expect(res.status).toBe(200);
+    // 1 routed deal, 0 with engagement data
+    expect(body.engagementAttribution.coverage.routedDealsTotal).toBe(1);
+    expect(body.engagementAttribution.coverage.routedDealsWithEngagement).toBe(0);
+    // no engagement rows → rates are null (denominator 0)
+    expect(body.engagementAttribution.rates.replyRate).toBeNull();
+    expect(body.engagementAttribution.rates.meetingRate).toBeNull();
+  });
+});
+
+describe("nonDemoEngagementEventCount guard shape (store contract)", () => {
+  it("returns 0 for an empty store on the demo deal ids", () => {
+    const store = new Store(":memory:");
+    try {
+      const count = store.nonDemoEngagementEventCount(
+        ["D-fb65c15017ef", "D-cdea8ac45022"],
+        [],
+      );
+      expect(typeof count).toBe("number");
+      expect(count).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("demo engagement guard (nonDemoEngagementEventCount)", () => {
+  it("reports 0 when the store has no engagement rows for the fixture deals", () => {
+    const store = new Store(":memory:");
+    try {
+      const count = store.nonDemoEngagementEventCount(
+        ["D-fb65c15017ef", "D-cdea8ac45022"],
+        ["demo-engagement-id-1", "demo-engagement-id-2"],
+      );
+      expect(count).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+});
