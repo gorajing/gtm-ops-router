@@ -3263,6 +3263,7 @@ describe("server dashboard", () => {
       "decision-dialog-reason": "textarea",
       "decision-dialog-title": "h2",
       "deployment-handoff": "div",
+      "full-funnel": "div",
       detail: "div",
       "draft-policy-btn": "button",
       "draft-work-item-btn": "button",
@@ -3570,6 +3571,32 @@ describe("server dashboard", () => {
           updatedAt: "2026-05-24T15:02:00.000Z",
         },
       ],
+      engagementAttribution: {
+        coverage: { complete: false, routedDealsTotal: 4, routedDealsWithEngagement: 3 },
+        tiers: {
+          meetingsInfluencedUsd: 60000,
+          commercialSignalsUsd: 0,
+          pipelineInfluencedUsd: 120000,
+        },
+        rates: {
+          replyRate: 0.5,
+          meetingRate: 0.25,
+          replyToMeetingRate: 0.5,
+        },
+        winRateByEngagementPath: [
+          { path: "met", routed: 1, closedWon: 1, winRate: 1 },
+          { path: "replied", routed: 2, closedWon: 1, winRate: 0.5 },
+          { path: "no_engagement", routed: 1, closedWon: 0, winRate: null },
+        ],
+        hoursSaved: {
+          autoHandledDeals: 5,
+          agentDraftedTouchesSent: 0,
+          assumedTriageMin: 8,
+          assumedDraftMin: 20,
+          estimatedHours: 0.67,
+          modeled: true,
+        },
+      },
     };
     const jsonResponse = (body: unknown, init?: ResponseInit): Response =>
       new Response(JSON.stringify(body), {
@@ -3925,6 +3952,71 @@ describe("server dashboard", () => {
       "Ask deployment to confirm owner and next milestone.",
     );
     expect(document.text("health")).toContain("integration mode: test sink");
+
+    // --- Full-funnel panel assertions ---
+    expect(document.text("full-funnel")).toContain("Full-funnel Attribution");
+    // Authority tiers
+    expect(document.text("full-funnel")).toContain("Meetings Influenced");
+    expect(document.text("full-funnel")).toContain("$60,000");
+    expect(document.text("full-funnel")).toContain("Commercial Signals");
+    expect(document.text("full-funnel")).toContain("$0");
+    expect(document.text("full-funnel")).toContain("Pipeline Influenced");
+    expect(document.text("full-funnel")).toContain("$120,000");
+    // Rates — non-null values rendered as %, null rendered as n/a
+    expect(document.text("full-funnel")).toContain("Reply Rate");
+    expect(document.text("full-funnel")).toContain("50.0%");
+    expect(document.text("full-funnel")).toContain("Meeting Rate");
+    expect(document.text("full-funnel")).toContain("25.0%");
+    expect(document.text("full-funnel")).toContain("Reply → Meeting");
+    // Win-rate by engagement path
+    expect(document.text("full-funnel")).toContain("met");
+    expect(document.text("full-funnel")).toContain("replied");
+    expect(document.text("full-funnel")).toContain("no_engagement");
+    // null winRate renders as n/a, not 0
+    expect(document.text("full-funnel")).toContain("n/a");
+    expect(document.text("full-funnel")).not.toMatch(/no_engagement[\s\S]*?\b0\.0%/);
+    // Hours saved — labeled modeled
+    expect(document.text("full-funnel")).toContain("Hours Saved");
+    expect(document.text("full-funnel")).toContain("0.67h");
+    expect(document.text("full-funnel")).toContain("modeled estimate");
+    expect(document.text("full-funnel")).toContain("8 min triage");
+    expect(document.text("full-funnel")).toContain("20 min draft");
+    // Reconciliation queue
+    expect(document.text("full-funnel")).toContain("Reconciliation Queue");
+    // Coverage banner when complete=false
+    expect(document.text("full-funnel")).toContain("Partial coverage");
+    expect(document.text("full-funnel")).toContain("3");
+    expect(document.text("full-funnel")).toContain("4");
+    // null winRate for no_engagement path renders as n/a via DOM walk
+    {
+      const fullFunnelRoot = document.querySelector("#full-funnel");
+      if (!fullFunnelRoot) throw new Error("full-funnel root missing");
+      const winRateRowsFound: Array<{ path: string; winRateText: string }> = [];
+      function walkWinRateRows(node: FakeConsoleElement): void {
+        if (node.tagName === "TR") {
+          const cells = node.children.filter(
+            (c): c is FakeConsoleElement => typeof c !== "string",
+          );
+          if (cells.length === 4) {
+            winRateRowsFound.push({
+              path: cells[0]?.textContent ?? "",
+              winRateText: cells[3]?.textContent ?? "",
+            });
+          }
+        }
+        for (const child of node.children) {
+          if (typeof child !== "string") walkWinRateRows(child);
+        }
+      }
+      walkWinRateRows(fullFunnelRoot);
+      const noEngRow = winRateRowsFound.find((r) => r.path === "no_engagement");
+      expect(noEngRow).toBeDefined();
+      expect(noEngRow?.winRateText).toBe("n/a");
+      const metRow = winRateRowsFound.find((r) => r.path === "met");
+      expect(metRow?.winRateText).toBe("100.0%");
+      const repliedRow = winRateRowsFound.find((r) => r.path === "replied");
+      expect(repliedRow?.winRateText).toBe("50.0%");
+    }
 
     const detail = document.querySelector("#detail");
     if (!detail) throw new Error("detail root missing from fake DOM");
@@ -5500,5 +5592,100 @@ describe("server dashboard", () => {
     expect(events.total).toBe(5);
     expect(events.truncated).toBe(false);
     expect(events.events[0]?.detail).toBe(`intake: ${payload.company}`);
+  });
+});
+
+describe("GET /state engagementAttribution", () => {
+  it("includes engagementAttribution with correct shape on a fresh store", async () => {
+    const { baseUrl } = await app();
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as {
+      engagementAttribution: {
+        coverage: { complete: boolean; routedDealsTotal: number; routedDealsWithEngagement: number };
+        tiers: { meetingsInfluencedUsd: number; commercialSignalsUsd: number; pipelineInfluencedUsd: number };
+        rates: { replyRate: number | null; meetingRate: number | null; replyToMeetingRate: number | null };
+        winRateByEngagementPath: Array<{ path: string; routed: number; closedWon: number; winRate: number | null }>;
+        hoursSaved: { autoHandledDeals: number; agentDraftedTouchesSent: number; assumedTriageMin: number; assumedDraftMin: number; estimatedHours: number; modeled: true };
+      };
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.engagementAttribution).toBeDefined();
+    // shape checks
+    const ea = body.engagementAttribution;
+    // Empty store: 0 routed deals → coverage vacuously complete (Task 4 design).
+    expect(ea.coverage).toEqual({ complete: true, routedDealsTotal: 0, routedDealsWithEngagement: 0 });
+    expect(ea.tiers).toEqual({ meetingsInfluencedUsd: 0, commercialSignalsUsd: 0, pipelineInfluencedUsd: 0 });
+    expect(ea.rates.replyRate).toBeNull();
+    expect(ea.rates.meetingRate).toBeNull();
+    expect(ea.rates.replyToMeetingRate).toBeNull();
+    expect(Array.isArray(ea.winRateByEngagementPath)).toBe(true);
+    expect(ea.hoursSaved.modeled).toBe(true);
+    expect(ea.hoursSaved.estimatedHours).toBe(0);
+  });
+
+  it("includes engagementAttribution with routed deals after intake", async () => {
+    const { baseUrl } = await app();
+    await fetch(`${baseUrl}/deals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        company: "Engagement Test Co",
+        domain: "engtest.example",
+        contactName: "Era Ops",
+        contactEmail: "era@engtest.example",
+        dealUSD: 75000,
+        region: "NA",
+        sourceChannel: "inbound_form",
+        statedNeed: "automate scheduling across finance and sales handoffs",
+      }),
+    });
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as {
+      engagementAttribution: {
+        coverage: { complete: boolean; routedDealsTotal: number; routedDealsWithEngagement: number };
+        tiers: { meetingsInfluencedUsd: number; commercialSignalsUsd: number; pipelineInfluencedUsd: number };
+        rates: { replyRate: number | null; meetingRate: number | null; replyToMeetingRate: number | null };
+      };
+    };
+
+    expect(res.status).toBe(200);
+    // 1 routed deal, 0 with engagement data
+    expect(body.engagementAttribution.coverage.routedDealsTotal).toBe(1);
+    expect(body.engagementAttribution.coverage.routedDealsWithEngagement).toBe(0);
+    // no engagement rows → rates are null (denominator 0)
+    expect(body.engagementAttribution.rates.replyRate).toBeNull();
+    expect(body.engagementAttribution.rates.meetingRate).toBeNull();
+  });
+});
+
+describe("nonDemoEngagementEventCount guard shape (store contract)", () => {
+  it("returns 0 for an empty store on the demo deal ids", () => {
+    const store = new Store(":memory:");
+    try {
+      const count = store.nonDemoEngagementEventCount(
+        ["D-fb65c15017ef", "D-cdea8ac45022"],
+        [],
+      );
+      expect(typeof count).toBe("number");
+      expect(count).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("demo engagement guard (nonDemoEngagementEventCount)", () => {
+  it("reports 0 when the store has no engagement rows for the fixture deals", () => {
+    const store = new Store(":memory:");
+    try {
+      const count = store.nonDemoEngagementEventCount(
+        ["D-fb65c15017ef", "D-cdea8ac45022"],
+        ["demo-engagement-id-1", "demo-engagement-id-2"],
+      );
+      expect(count).toBe(0);
+    } finally {
+      store.close();
+    }
   });
 });

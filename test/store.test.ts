@@ -6774,6 +6774,33 @@ describe("store — importEngagementFeedback idempotency", () => {
     store.close();
   });
 
+  it("nonDemoEngagementEventCount also counts non-demo commercial_signals, not just engagement_events", () => {
+    const store = new Store(":memory:");
+    store.recordRouted({ ...routed(), id: "D-x" }, 0, {
+      mode: "dry_run",
+      status: "dry_run",
+    });
+    // A real (non-demo) commercial signal, with NO engagement events.
+    store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-x",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [],
+            commercialSignals: [opportunitySignal("real-sig-1")],
+          },
+        ],
+      }),
+    );
+    // The guard must see the signal and block layering (>=1), not 0.
+    expect(store.nonDemoEngagementEventCount(["D-x"], [])).toBeGreaterThanOrEqual(1);
+    store.close();
+  });
+
   it("same eventId + changed payload writes an idempotency_violation and skips", () => {
     const store = new Store(":memory:");
     store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });

@@ -4379,6 +4379,60 @@ export class Store {
     ).n;
   }
 
+  // Counts engagement_events + commercial_signals rows on demo fixture deals
+  // that were NOT written by the demo fixture (real / non-demo rows). cli.ts
+  // uses this to refuse layering engagement fixtures onto a DB that already has
+  // non-demo data. The fixture import writes BOTH tables, so a non-demo row in
+  // EITHER table on a fixture deal must block layering.
+  nonDemoEngagementEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number {
+    if (dealIds.length === 0) return 0;
+    assertSqlParameterBudget(
+      dealIds.length + demoSourceEventIds.length,
+      "non-demo engagement fixture guard",
+    );
+    // Tables may not exist yet on a store from before Task 2/3's DDL.
+    const tableExists = (name: string): boolean =>
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .get(name) !== undefined;
+    const dealPlaceholders = dealIds.map(() => "?").join(", ");
+    const sourcePlaceholders = demoSourceEventIds.map(() => "?").join(", ");
+    const sourceFilter =
+      demoSourceEventIds.length === 0
+        ? ""
+        : ` AND source_event_id NOT IN (${sourcePlaceholders})`;
+    const params: string[] =
+      demoSourceEventIds.length === 0
+        ? [...dealIds]
+        : [...dealIds, ...demoSourceEventIds];
+
+    let total = 0;
+    if (tableExists("engagement_events")) {
+      total += (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) n FROM engagement_events
+             WHERE deal_id IN (${dealPlaceholders})${sourceFilter}`,
+          )
+          .get(...params) as { n: number }
+      ).n;
+    }
+    if (tableExists("commercial_signals")) {
+      total += (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) n FROM commercial_signals
+             WHERE deal_id IN (${dealPlaceholders})${sourceFilter}`,
+          )
+          .get(...params) as { n: number }
+      ).n;
+    }
+    return total;
+  }
+
   recordLocalOutcome(input: LocalOutcomeInput): LocalOutcomeWriteResult {
     assertCanonicalIsoUtc(input.occurredAt, "outcome occurredAt");
     const eventKey = JSON.stringify([

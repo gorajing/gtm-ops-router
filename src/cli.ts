@@ -22,6 +22,12 @@ import {
   demoOutcomeSourceEventIds,
   type DemoOutcomeFixtureResult,
 } from "./demo-fixtures.js";
+import {
+  applyDemoEngagementFixtures,
+  demoEngagementFixtureDealIds,
+  demoEngagementSourceEventIds,
+  type DemoEngagementResult,
+} from "./demo-engagement-fixtures.js";
 import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
 import {
   type IntegrationBuild,
@@ -264,9 +270,60 @@ function rejectPersistentDemoOutcomeLayering(
   process.exitCode = 2;
 }
 
+type DemoEngagementLayerEligibility =
+  | { ok: true }
+  | { ok: false; nonDemoEngagementEvents: number };
+
+function checkPersistentDemoEngagementEligibility(store: {
+  nonDemoEngagementEventCount(
+    dealIds: readonly string[],
+    demoSourceEventIds: readonly string[],
+  ): number;
+}): DemoEngagementLayerEligibility {
+  const fixtureDealIds = demoEngagementFixtureDealIds();
+  const nonDemoEngagementEvents = store.nonDemoEngagementEventCount(
+    fixtureDealIds,
+    demoEngagementSourceEventIds(),
+  );
+  if (nonDemoEngagementEvents === 0) return { ok: true };
+  return { ok: false, nonDemoEngagementEvents };
+}
+
+function rejectPersistentDemoEngagementLayering(
+  check: Exclude<DemoEngagementLayerEligibility, { ok: true }>,
+  store: { close(): void },
+): void {
+  console.error(
+    `[demo engagement] refusing to layer fixtures into ${routerDbPath()} with ` +
+      `${check.nonDemoEngagementEvents} non-demo engagement rows on fixture deals; ` +
+      "use a fresh router DB or rerun without --demo-engagement.",
+  );
+  store.close();
+  process.exitCode = 2;
+}
+
+function logDemoEngagementResult(result: DemoEngagementResult): void {
+  if (result.eventsRecorded > 0 || result.eventsDuplicate > 0) {
+    console.log(
+      `[demo engagement] imported: ${result.eventsRecorded} events recorded, ` +
+        `${result.eventsDuplicate} duplicates, ` +
+        `${result.commercialSignalsRecorded} commercial signals recorded, ` +
+        `${result.unknownDealRejections.length} unknown deal rejections`,
+    );
+  }
+  if (result.unknownDealRejections.length > 0) {
+    const detail = result.unknownDealRejections
+      .map((r) => `${r.routerDealId}(${r.eventCount})`)
+      .join(", ");
+    console.warn(`[demo engagement] unknown deal rejections: ${detail}`);
+  }
+}
+
 async function cmdDemo(args: string[]): Promise<void> {
   const wantsDemoOutcomes = args.includes("--demo-outcomes");
   const skipsDemoOutcomes = args.includes("--no-demo-outcomes");
+  const skipsDemoEngagement = args.includes("--no-demo-engagement");
+  const wantsDemoEngagementExplicit = args.includes("--demo-engagement");
   if (wantsDemoOutcomes && skipsDemoOutcomes) {
     console.warn(
       "[demo outcomes] both demo outcome flags passed; --no-demo-outcomes wins",
@@ -274,6 +331,15 @@ async function cmdDemo(args: string[]): Promise<void> {
   } else if (wantsDemoOutcomes) {
     console.warn(
       "[demo outcomes] demo layers outcomes by default; --demo-outcomes is a no-op here",
+    );
+  }
+  if (wantsDemoEngagementExplicit && skipsDemoEngagement) {
+    console.warn(
+      "[demo engagement] both engagement flags passed; --no-demo-engagement wins",
+    );
+  } else if (wantsDemoEngagementExplicit) {
+    console.warn(
+      "[demo engagement] demo layers engagement by default; --demo-engagement is a no-op here",
     );
   }
   const Store = await loadStore();
@@ -305,6 +371,15 @@ async function cmdDemo(args: string[]): Promise<void> {
       store.routedByIds(demoOutcomeFixtureDealIds()),
     );
     logDemoOutcomeFixtureResult(demoOutcomes);
+  }
+  if (!skipsDemoEngagement) {
+    // :memory: store has no prior state; guard is always ok but kept for
+    // symmetry with cmdRun so the code paths match.
+    const demoEngagement = applyDemoEngagementFixtures(
+      store,
+      store.routedByIds(demoEngagementFixtureDealIds()),
+    );
+    logDemoEngagementResult(demoEngagement);
   }
 
   console.log(renderMetricsTable(store.metrics()));
@@ -341,10 +416,25 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
       "[demo outcomes] both demo outcome flags passed; --no-demo-outcomes wins",
     );
   }
+  const skipsDemoEngagement = args.includes("--no-demo-engagement");
+  const wantsDemoEngagement =
+    args.includes("--demo-engagement") && !skipsDemoEngagement;
+  if (args.includes("--demo-engagement") && skipsDemoEngagement) {
+    console.warn(
+      "[demo engagement] both engagement flags passed; --no-demo-engagement wins",
+    );
+  }
   if (wantsDemoOutcomes) {
     const check = checkPersistentDemoOutcomeEligibility(store);
     if (!check.ok) {
       rejectPersistentDemoOutcomeLayering(check, store);
+      return;
+    }
+  }
+  if (wantsDemoEngagement) {
+    const check = checkPersistentDemoEngagementEligibility(store);
+    if (!check.ok) {
+      rejectPersistentDemoEngagementLayering(check, store);
       return;
     }
   }
@@ -374,6 +464,20 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
     );
     logDemoOutcomeFixtureResult(demoOutcomes);
   }
+  if (wantsDemoEngagement) {
+    // Second guard: keeps layering safe if a future intake path records
+    // engagement rows. Revisit when processBatch can emit engagement events.
+    const check = checkPersistentDemoEngagementEligibility(store);
+    if (!check.ok) {
+      rejectPersistentDemoEngagementLayering(check, store);
+      return;
+    }
+    const demoEngagement = applyDemoEngagementFixtures(
+      store,
+      store.routedByIds(demoEngagementFixtureDealIds()),
+    );
+    logDemoEngagementResult(demoEngagement);
+  }
   console.log(renderMetricsTable(store.metrics()));
   store.close();
 }
@@ -382,6 +486,11 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   if (args.includes("--demo-outcomes") || args.includes("--no-demo-outcomes")) {
     console.warn(
       "[demo outcomes] serve reads the existing SQLite state; ignoring demo outcome flags",
+    );
+  }
+  if (args.includes("--demo-engagement") || args.includes("--no-demo-engagement")) {
+    console.warn(
+      "[demo engagement] serve reads the existing SQLite state; ignoring demo engagement flags",
     );
   }
   const port = Number(portArg ?? 8787);
@@ -508,7 +617,7 @@ async function main(): Promise<void> {
     default:
       console.error(
         `unknown command: ${cmd ?? "(none)"} — expected demo | run | serve | doctor | export-sales` +
-          ` (flags: --flaky | --integrations | --live-integrations | --demo-outcomes | --no-demo-outcomes | --send-test | --limit | --out | --include-all-routes)`,
+          ` (flags: --flaky | --integrations | --live-integrations | --demo-outcomes | --no-demo-outcomes | --demo-engagement | --no-demo-engagement | --send-test | --limit | --out | --include-all-routes)`,
       );
       process.exitCode = 2;
   }
