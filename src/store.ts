@@ -1303,7 +1303,7 @@ const SCHEMA: string[] = [
      occurred_at TEXT NOT NULL,
      payload_json TEXT NOT NULL,
      created_at TEXT NOT NULL,
-     UNIQUE (source, source_event_id),
+     UNIQUE (deal_id, source, source_event_id),
      CHECK (source IN ('sales_observed', 'sales_window_evaluator')),
      CHECK (kind IN ('sent', 'replied', 'meeting_booked', 'bounced', 'no_response'))
    )`,
@@ -1318,7 +1318,7 @@ const SCHEMA: string[] = [
      amount_usd INTEGER,
      crm_ref TEXT,
      created_at TEXT NOT NULL,
-     UNIQUE (source, source_event_id),
+     UNIQUE (deal_id, source, source_event_id),
      CHECK (source IN ('sales_reported')),
      CHECK (kind IN ('opportunity_created'))
    )`,
@@ -8450,10 +8450,11 @@ export class Store {
           .prepare(
             `SELECT source_payload_hash
              FROM engagement_events
-             WHERE source = ?
+             WHERE deal_id = ?
+               AND source = ?
                AND source_event_id = ?`,
           )
-          .get(source, event.eventId) as
+          .get(dealId, source, event.eventId) as
           | { source_payload_hash: string }
           | undefined;
 
@@ -8528,10 +8529,11 @@ export class Store {
           .prepare(
             `SELECT source_payload_hash
              FROM commercial_signals
-             WHERE source = ?
+             WHERE deal_id = ?
+               AND source = ?
                AND source_event_id = ?`,
           )
-          .get(SALES_REPORTED_SOURCE, signal.eventId) as
+          .get(dealId, SALES_REPORTED_SOURCE, signal.eventId) as
           | { source_payload_hash: string }
           | undefined;
 

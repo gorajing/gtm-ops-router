@@ -6731,6 +6731,49 @@ describe("store — importEngagementFeedback idempotency", () => {
     store.close();
   });
 
+  it("the same eventId on two different routed deals records both (idempotency is per-deal)", () => {
+    const store = new Store(":memory:");
+    store.recordRouted({ ...routed(), id: "D-a" }, 0, {
+      mode: "dry_run",
+      status: "dry_run",
+    });
+    store.recordRouted({ ...routed(), id: "D-b" }, 0, {
+      mode: "dry_run",
+      status: "dry_run",
+    });
+
+    const shared = sentEvent("shared-evt-1"); // same eventId reused across deals
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-a",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [shared],
+          },
+          {
+            routerDealId: "D-b",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [shared],
+          },
+        ],
+      }),
+    );
+
+    // Per-deal idempotency: D-b's event must NOT be dropped as a duplicate of D-a's.
+    expect(result.eventsRecorded).toBe(2);
+    expect(result.eventsDuplicate).toBe(0);
+    expect(store.engagementEvents("D-a")).toHaveLength(1);
+    expect(store.engagementEvents("D-b")).toHaveLength(1);
+    store.close();
+  });
+
   it("same eventId + changed payload writes an idempotency_violation and skips", () => {
     const store = new Store(":memory:");
     store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
