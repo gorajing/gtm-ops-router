@@ -176,24 +176,24 @@ export function computeEngagementAttribution(
 
   // ── Rates (deal-grain, denominator 0 → null) ─────────────────────────────
   const sentCount = sentDeals.size;
-  const repliedCount = repliedDeals.size;
 
-  // Rates are intersections with the correct base, so they can never exceed 1,
-  // and a meeting on a deal that never replied (or a reply with no recorded
-  // send) does not distort the conversion. Denominator 0 → null.
-  const intersectionSize = (a: Set<string>, b: Set<string>): number => {
-    let n = 0;
-    for (const id of a) if (b.has(id)) n += 1;
-    return n;
-  };
+  // All rates are anchored to the SENT population so the funnel (sent → replied
+  // → meeting) stays internally consistent: a deal cannot reply or meet without
+  // first being sent to. Intersecting with `sent` guarantees rates ≤ 1 and
+  // ignores malformed no-sent records. Denominator 0 → null.
+  const sentReplied = new Set<string>();
+  for (const id of repliedDeals) if (sentDeals.has(id)) sentReplied.add(id);
+  const sentMeeting = new Set<string>();
+  for (const id of meetingDeals) if (sentDeals.has(id)) sentMeeting.add(id);
+  let sentRepliedMet = 0;
+  for (const id of sentReplied) if (meetingDeals.has(id)) sentRepliedMet += 1;
+
   const replyRate: number | null =
-    sentCount === 0 ? null : intersectionSize(repliedDeals, sentDeals) / sentCount;
+    sentCount === 0 ? null : sentReplied.size / sentCount;
   const meetingRate: number | null =
-    sentCount === 0 ? null : intersectionSize(meetingDeals, sentDeals) / sentCount;
+    sentCount === 0 ? null : sentMeeting.size / sentCount;
   const replyToMeetingRate: number | null =
-    repliedCount === 0
-      ? null
-      : intersectionSize(meetingDeals, repliedDeals) / repliedCount;
+    sentReplied.size === 0 ? null : sentRepliedMet / sentReplied.size;
 
   // ── Win-rate by engagement path ───────────────────────────────────────────
   // Path precedence (deal-grain, single path per deal):

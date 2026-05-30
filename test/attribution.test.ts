@@ -272,6 +272,23 @@ describe("computeEngagementAttribution — nullable rates", () => {
     expect(attr.rates.replyRate).toBe(1);
   });
 
+  it("replyToMeetingRate is anchored to the sent base — a replied+met deal that was never sent is excluded", () => {
+    const d1 = baseRoutedDeal("D-1");
+    const d4 = baseRoutedDeal("D-4");
+    const inner = makeInnerStore(d1, d4);
+    const events = [
+      engEvent("D-1", "sent", 1),
+      engEvent("D-1", "replied", 2), // D-1: sent + replied, no meeting
+      engEvent("D-4", "replied", 2), // D-4: replied + met but NEVER sent
+      engEvent("D-4", "meeting_booked", 3),
+    ];
+    const store = new StubAttributionStore(inner, events, [], false);
+    const attr = computeEngagementAttribution(store);
+
+    // sent∩replied = {D-1}; of those, 0 met → 0. D-4's meeting must NOT count.
+    expect(attr.rates.replyToMeetingRate).toBe(0);
+  });
+
   it("replyToMeetingRate is non-null when there are replied deals", () => {
     const deal = baseRoutedDeal("D-1");
     const inner = makeInnerStore(deal);
