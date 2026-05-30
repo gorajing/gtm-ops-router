@@ -6627,9 +6627,9 @@ describe("store — importEngagementFeedback happy path", () => {
     store.close();
   });
 
-  it("lastEngagementFeedbackCoverageComplete returns true before any import", () => {
+  it("lastEngagementFeedbackCoverageComplete returns false before any import (no feedback = not complete)", () => {
     const store = new Store(":memory:");
-    expect(store.lastEngagementFeedbackCoverageComplete()).toBe(true);
+    expect(store.lastEngagementFeedbackCoverageComplete()).toBe(false);
     store.close();
   });
 
@@ -6650,6 +6650,50 @@ describe("store — importEngagementFeedback happy path", () => {
       }),
     );
     expect(store.lastEngagementFeedbackCoverageComplete()).toBe(true);
+    store.close();
+  });
+});
+
+// ─── importEngagementFeedback — routed-only boundary ───────────────────────
+
+describe("store — importEngagementFeedback routed-only boundary", () => {
+  it("rejects engagement for a QUARANTINED deal (has a deals row but is not routed)", () => {
+    const store = new Store(":memory:");
+    // A quarantined deal HAS a deals row (stage='quarantined') but is NOT routed.
+    // The importer must reject it, not persist engagement for a non-routed deal.
+    store.recordQuarantine(
+      {
+        dealId: "D-quar",
+        stage: "enriched",
+        code: "enrichment_unresolved",
+        reason: "unknown company",
+        at: "2026-05-01T00:00:00.000Z",
+      },
+      0,
+      "enriched",
+      "enrichment_unresolved: unknown company",
+    );
+
+    const result = store.importEngagementFeedback(
+      engagementFeedback({
+        deals: [
+          {
+            routerDealId: "D-quar",
+            trace: {
+              sourceSystem: "sales",
+              boundary: "observed_engagement_not_router_truth",
+            },
+            events: [sentEvent("evt-q-1")],
+          },
+        ],
+      }),
+    );
+
+    expect(result.unknownDealRejections).toEqual([
+      { routerDealId: "D-quar", eventCount: 1 },
+    ]);
+    expect(result.eventsRecorded).toBe(0);
+    expect(store.engagementEvents("D-quar")).toHaveLength(0);
     store.close();
   });
 });

@@ -237,6 +237,41 @@ describe("computeEngagementAttribution — nullable rates", () => {
     expect(attr.rates.replyToMeetingRate).toBeNull(); // no replied → null denom
   });
 
+  it("replyToMeetingRate uses the replied∩met intersection — a meeting without a reply does not count", () => {
+    const d1 = baseRoutedDeal("D-1");
+    const d2 = baseRoutedDeal("D-2");
+    const inner = makeInnerStore(d1, d2);
+    const events = [
+      engEvent("D-1", "sent", 1),
+      engEvent("D-1", "replied", 2), // D-1 replied, did NOT meet
+      engEvent("D-2", "sent", 1),
+      engEvent("D-2", "meeting_booked", 3), // D-2 met WITHOUT replying
+    ];
+    const store = new StubAttributionStore(inner, events, [], false);
+    const attr = computeEngagementAttribution(store);
+
+    // Of the 1 deal that replied (D-1), 0 booked a meeting → 0, NOT 1.
+    expect(attr.rates.replyToMeetingRate).toBe(0);
+    expect(attr.rates.replyRate).toBe(0.5); // 1 replied of 2 sent
+    expect(attr.rates.meetingRate).toBe(0.5); // 1 met of 2 sent
+  });
+
+  it("replyRate cannot exceed 1 even when a reply lands on a deal with no sent event", () => {
+    const d1 = baseRoutedDeal("D-1");
+    const d3 = baseRoutedDeal("D-3");
+    const inner = makeInnerStore(d1, d3);
+    const events = [
+      engEvent("D-1", "sent", 1),
+      engEvent("D-1", "replied", 2),
+      engEvent("D-3", "replied", 2), // D-3 replied but was never "sent"
+    ];
+    const store = new StubAttributionStore(inner, events, [], false);
+    const attr = computeEngagementAttribution(store);
+
+    // sent = {D-1}; replied∩sent = {D-1} → 1/1 = 1, never 2/1.
+    expect(attr.rates.replyRate).toBe(1);
+  });
+
   it("replyToMeetingRate is non-null when there are replied deals", () => {
     const deal = baseRoutedDeal("D-1");
     const inner = makeInnerStore(deal);

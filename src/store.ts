@@ -8357,7 +8357,7 @@ export class Store {
          WHERE id = 1`,
       )
       .get() as { coverage_complete: number } | undefined;
-    if (!row) return true;
+    if (!row) return false;
     return row.coverage_complete !== 0;
   }
 
@@ -8373,7 +8373,7 @@ export class Store {
 
     for (const deal of payload.deals) {
       const dealRow = this.db
-        .prepare("SELECT id FROM deals WHERE id = ?")
+        .prepare("SELECT id FROM deals WHERE id = ? AND stage = 'routed'")
         .get(deal.routerDealId) as { id: string } | undefined;
 
       if (!dealRow) {
