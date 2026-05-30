@@ -41,3 +41,10 @@ if (TERMINAL_DRIFT_NOTIFICATION_LEASE_MS < MIN_READINESS_NOTIFICATION_LEASE_MS) 
     `TERMINAL_DRIFT_NOTIFICATION_LEASE_MS must be at least ${MIN_READINESS_NOTIFICATION_LEASE_MS}ms`,
   );
 }
+
+// ── Engagement attribution: hours-saved model assumptions (D9) ────────────
+// Minutes a human would spend triaging+routing one inbound deal.
+// Conservative (real times are usually higher) — under-claim a modeled number.
+export const ASSUMED_TRIAGE_MIN = 8;
+// Minutes to research+draft one outreach touch by hand.
+export const ASSUMED_DRAFT_MIN = 20;

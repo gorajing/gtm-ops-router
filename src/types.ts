@@ -356,6 +356,50 @@ export type OutcomeEventRecord =
       arrDeltaUsd: null;
     });
 
+export type EngagementEventSource = "sales_observed" | "sales_window_evaluator";
+
+export interface EngagementEventRecord {
+  id: string;
+  dealId: string;
+  source: EngagementEventSource;
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  kind: "sent" | "replied" | "meeting_booked" | "bounced" | "no_response";
+  occurredAt: string;
+  payloadJson: string;
+  createdAt: string;
+}
+
+export interface CommercialSignalRecord {
+  id: string;
+  dealId: string;
+  source: "sales_reported";
+  sourceEventId: string;
+  sourcePayloadHash: string;
+  kind: "opportunity_created";
+  occurredAt: string;
+  amountUsd: number | null;
+  crmRef: string | null;
+  createdAt: string;
+}
+
+export interface EngagementImportResult {
+  schemaVersion: string;
+  generatedAt: string;
+  coverage: {
+    complete: boolean;
+    scanned: number;
+    emitted: number;
+    since: string | null;
+  };
+  processedDeals: number;
+  eventsRecorded: number;
+  eventsDuplicate: number;
+  commercialSignalsRecorded: number;
+  commercialSignalsDuplicate: number;
+  unknownDealRejections: Array<{ routerDealId: string; eventCount: number }>;
+}
+
 export interface OutcomeRejectionRecord {
   id: string;
   dealId: string;

@@ -15,3 +15,5 @@ dist/
 
 # committed public demo fixture (live exports stay ignored)
 !data/sales-handoff.sample.json
+data/engagement-feedback*.json
+!data/engagement-feedback.sample.json
