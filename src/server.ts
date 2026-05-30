@@ -593,6 +593,10 @@ function consoleHtml(sinkLabel: string): string {
    <h2>Deployment Handoff</h2>
    <div class="handoff-wrap" id="deployment-handoff"></div>
   </div>
+  <div class="section">
+   <h2>Full-funnel Attribution</h2>
+   <div id="full-funnel"></div>
+  </div>
  </section>
  <section class="panel">
   <h2>Deal Detail</h2>

@@ -618,6 +618,140 @@ function clearUrlDealParam(){
   const hash = window.location.hash || "";
   window.history.replaceState(null, "", path + (query ? "?" + query : "") + hash);
 }
+function fmtRate(r){
+  if (r === null || r === undefined) return "n/a";
+  return (r * 100).toFixed(1) + "%";
+}
+function renderFullFunnelPanel(){
+  const root = qs("#full-funnel");
+  if (!root) return;
+  const attr = state && state.engagementAttribution;
+  if (
+    !attr ||
+    !attr.coverage ||
+    !attr.tiers ||
+    !attr.rates ||
+    !attr.hoursSaved ||
+    !Array.isArray(attr.winRateByEngagementPath)
+  ) {
+    root.replaceChildren(el("div", "empty", "No engagement attribution data available."));
+    return;
+  }
+  const nodes = [];
+
+  // --- Coverage banner ---
+  const cov = attr.coverage;
+  if (!cov.complete) {
+    const banner = el("div", "warn");
+    banner.append(
+      el("span", null, "Partial coverage: engagement data available for "),
+      el("span", null, String(cov.routedDealsWithEngagement)),
+      el("span", null, " of "),
+      el("span", null, String(cov.routedDealsTotal)),
+      el("span", null, " routed deals. Rates are over covered deals only; missing = unknown, not negative.")
+    );
+    nodes.push(banner);
+  }
+
+  // --- Authority tiers (overlapping sets — set differences are diagnostic, not a numeric cascade) ---
+  nodes.push(el("div", "muted", "Pipeline influence by source authority (overlapping sets — set differences are the diagnostic, not a ranking)"));
+  const tiersTable = el("table");
+  const tiersHead = document.createElement("tr");
+  ["Authority", "Metric", "Amount (USD)"].forEach(function(h){ tiersHead.append(el("th", null, h)); });
+  tiersTable.append(tiersHead);
+  const tiers = attr.tiers;
+  const tierRows = [
+    ["Observed (Sales)", "Meetings Influenced", tiers.meetingsInfluencedUsd],
+    ["Reported (Sales)", "Commercial Signals", tiers.commercialSignalsUsd],
+    ["Authoritative (Router)", "Pipeline Influenced", tiers.pipelineInfluencedUsd],
+  ];
+  for (let i = 0; i < tierRows.length; i++) {
+    const authority = tierRows[i][0];
+    const metric = tierRows[i][1];
+    const amount = tierRows[i][2];
+    const row = document.createElement("tr");
+    row.append(cell(authority, "muted"), cell(metric), cell(fmtMoney.format(amount)));
+    tiersTable.append(row);
+  }
+  nodes.push(tiersTable);
+
+  // --- Engagement rates ---
+  nodes.push(el("div", "muted", "Engagement rates (deal-grain; n/a when denominator is 0)"));
+  const ratesTable = el("table");
+  const ratesHead = document.createElement("tr");
+  ["Rate", "Value"].forEach(function(h){ ratesHead.append(el("th", null, h)); });
+  ratesTable.append(ratesHead);
+  const rates = attr.rates;
+  const rateRows = [
+    ["Reply Rate", fmtRate(rates.replyRate)],
+    ["Meeting Rate", fmtRate(rates.meetingRate)],
+    ["Reply → Meeting", fmtRate(rates.replyToMeetingRate)],
+  ];
+  for (let i = 0; i < rateRows.length; i++) {
+    const label = rateRows[i][0];
+    const value = rateRows[i][1];
+    const row = document.createElement("tr");
+    row.append(cell(label), cell(value, value === "n/a" ? "muted" : null));
+    ratesTable.append(row);
+  }
+  nodes.push(ratesTable);
+
+  // --- Win rate by engagement path ---
+  nodes.push(el("div", "muted", "Win rate by engagement path (closed_won ÷ routed, deal-grain)"));
+  const winTable = el("table");
+  const winHead = document.createElement("tr");
+  ["Path", "Routed", "Closed Won", "Win Rate"].forEach(function(h){ winHead.append(el("th", null, h)); });
+  winTable.append(winHead);
+  const pathRows = attr.winRateByEngagementPath || [];
+  if (pathRows.length) {
+    for (let i = 0; i < pathRows.length; i++) {
+      const pathRow = pathRows[i];
+      const winRateText = pathRow.winRate === null ? "n/a" : fmtRate(pathRow.winRate);
+      const row = document.createElement("tr");
+      row.append(
+        cell(pathRow.path),
+        cell(String(pathRow.routed)),
+        cell(String(pathRow.closedWon)),
+        cell(winRateText, pathRow.winRate === null ? "muted" : null)
+      );
+      winTable.append(row);
+    }
+  } else {
+    const emptyRow = document.createElement("tr");
+    const td = document.createElement("td");
+    td.setAttribute("colspan", "4");
+    td.textContent = "No engagement path data yet.";
+    emptyRow.append(td);
+    winTable.append(emptyRow);
+  }
+  nodes.push(winTable);
+
+  // --- Hours saved (modeled estimate) ---
+  const hs = attr.hoursSaved;
+  nodes.push(el("div", "muted", "Hours Saved (modeled estimate, assumptions shown)"));
+  const hsTable = el("table");
+  const hsHead = document.createElement("tr");
+  ["Metric", "Value"].forEach(function(h){ hsHead.append(el("th", null, h)); });
+  hsTable.append(hsHead);
+  const hsRows = [
+    ["Hours Saved", fmtHours(hs.estimatedHours)],
+    ["Auto-handled Deals", String(hs.autoHandledDeals)],
+    ["Agent-drafted Touches Sent", String(hs.agentDraftedTouchesSent)],
+  ];
+  for (let i = 0; i < hsRows.length; i++) {
+    const row = document.createElement("tr");
+    row.append(cell(hsRows[i][0]), cell(hsRows[i][1]));
+    hsTable.append(row);
+  }
+  nodes.push(hsTable);
+  nodes.push(el("div", "muted", "modeled estimate — " + String(hs.assumedTriageMin) + " min triage + " + String(hs.assumedDraftMin) + " min draft per touch; not measured time"));
+
+  // --- Reconciliation queue note ---
+  nodes.push(el("div", "muted", "Reconciliation Queue"));
+  nodes.push(el("div", "muted", "Commercial signals from Sales are non-authoritative observations. Confirm them into the authoritative commercial_states via the Lifecycle Controls panel on a deal before counting as revenue."));
+
+  root.replaceChildren(el("h2", null, "Full-funnel Attribution"), ...nodes);
+}
 function renderKpis(){
   const m = state.metrics;
   const readiness = m.deploymentReadiness || {not_required:0,pending:0,ready:0,blocked:0};
@@ -2491,6 +2625,7 @@ async function loadState(){
     renderSuggestionSurfaces({ detail: false });
     renderExceptions();
     renderDeploymentHandoff();
+    renderFullFunnelPanel();
     scheduleRenderDetail();
     return "ok";
   } catch (err) {
@@ -2508,6 +2643,7 @@ async function loadState(){
       qs("#agent-suggestions").replaceChildren(el("div", "empty", msg));
       qs("#exceptions").replaceChildren(el("div", "empty", msg));
       qs("#deployment-handoff").replaceChildren(el("div", "empty", msg));
+      qs("#full-funnel") && qs("#full-funnel").replaceChildren(el("div", "empty", msg));
       qs("#detail").replaceChildren(el("div", "empty", msg));
     }
     return "error";
