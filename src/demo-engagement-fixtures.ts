@@ -338,6 +338,14 @@ export function applyDemoEngagementFixtures(
     resolvedDeals.push(deal);
   }
 
+  // Emit deals in the real producer's deterministic order (ascending by
+  // routerDealId), matching the sales repo's buildEngagementFeedback. This is
+  // what lets the live sales producer reproduce this sample byte-for-byte —
+  // the demo overlay must look exactly like real engagement feedback.
+  resolvedDeals.sort((a, b) =>
+    a.routerDealId < b.routerDealId ? -1 : a.routerDealId > b.routerDealId ? 1 : 0,
+  );
+
   const payload: EngagementFeedback = {
     schemaVersion: DEMO_ENGAGEMENT_FIXTURES.schemaVersion,
     generatedAt: DEMO_ENGAGEMENT_FIXTURES.generatedAt,

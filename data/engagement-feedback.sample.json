@@ -13,68 +13,6 @@
   },
   "deals": [
     {
-      "routerDealId": "D-fb65c15017ef",
-      "trace": {
-        "sourceSystem": "sales",
-        "boundary": "observed_engagement_not_router_truth"
-      },
-      "events": [
-        {
-          "kind": "sent",
-          "eventId": "ca9a3665-fb7f-4299-8b4b-236a3c365630",
-          "occurredAt": "2026-05-01T09:00:00.000Z",
-          "touchId": "ryder-touch-1",
-          "channel": "email"
-        },
-        {
-          "kind": "replied",
-          "eventId": "b9a9fc2a-d3e6-4629-924b-3d70904f70d5",
-          "occurredAt": "2026-05-02T14:30:00.000Z",
-          "touchId": "ryder-touch-1",
-          "replyIntent": "positive"
-        },
-        {
-          "kind": "meeting_booked",
-          "eventId": "3e1821ca-b04b-4f83-a64a-80630351a07e",
-          "occurredAt": "2026-05-03T10:00:00.000Z",
-          "touchId": "ryder-touch-1",
-          "meetingAt": "2026-05-06T15:00:00.000Z"
-        }
-      ],
-      "commercialSignals": [
-        {
-          "kind": "opportunity_created",
-          "eventId": "97b5e44a-c6e9-4cba-a64a-b2c1c6323cfb",
-          "occurredAt": "2026-05-06T16:00:00.000Z",
-          "amountUsd": 120000,
-          "crmRef": "HUB-RYDER-001"
-        }
-      ]
-    },
-    {
-      "routerDealId": "D-cdea8ac45022",
-      "trace": {
-        "sourceSystem": "sales",
-        "boundary": "observed_engagement_not_router_truth"
-      },
-      "events": [
-        {
-          "kind": "sent",
-          "eventId": "4526557d-0757-42ce-acb5-e4691670462d",
-          "occurredAt": "2026-05-01T09:15:00.000Z",
-          "touchId": "cargo-touch-1",
-          "channel": "linkedin"
-        },
-        {
-          "kind": "bounced",
-          "eventId": "3a7f9eee-3a6e-4bd5-bfed-b36a51e5385b",
-          "occurredAt": "2026-05-01T09:16:00.000Z",
-          "touchId": "cargo-touch-1",
-          "reason": "mailbox_full"
-        }
-      ]
-    },
-    {
       "routerDealId": "D-8eb789ad84fc",
       "trace": {
         "sourceSystem": "sales",
@@ -114,6 +52,68 @@
           "occurredAt": "2026-05-14T11:00:00.000Z",
           "touchId": "mystery-touch-1",
           "replyIntent": "neutral"
+        }
+      ]
+    },
+    {
+      "routerDealId": "D-cdea8ac45022",
+      "trace": {
+        "sourceSystem": "sales",
+        "boundary": "observed_engagement_not_router_truth"
+      },
+      "events": [
+        {
+          "kind": "sent",
+          "eventId": "4526557d-0757-42ce-acb5-e4691670462d",
+          "occurredAt": "2026-05-01T09:15:00.000Z",
+          "touchId": "cargo-touch-1",
+          "channel": "linkedin"
+        },
+        {
+          "kind": "bounced",
+          "eventId": "3a7f9eee-3a6e-4bd5-bfed-b36a51e5385b",
+          "occurredAt": "2026-05-01T09:16:00.000Z",
+          "touchId": "cargo-touch-1",
+          "reason": "mailbox_full"
+        }
+      ]
+    },
+    {
+      "routerDealId": "D-fb65c15017ef",
+      "trace": {
+        "sourceSystem": "sales",
+        "boundary": "observed_engagement_not_router_truth"
+      },
+      "events": [
+        {
+          "kind": "sent",
+          "eventId": "ca9a3665-fb7f-4299-8b4b-236a3c365630",
+          "occurredAt": "2026-05-01T09:00:00.000Z",
+          "touchId": "ryder-touch-1",
+          "channel": "email"
+        },
+        {
+          "kind": "replied",
+          "eventId": "b9a9fc2a-d3e6-4629-924b-3d70904f70d5",
+          "occurredAt": "2026-05-02T14:30:00.000Z",
+          "touchId": "ryder-touch-1",
+          "replyIntent": "positive"
+        },
+        {
+          "kind": "meeting_booked",
+          "eventId": "3e1821ca-b04b-4f83-a64a-80630351a07e",
+          "occurredAt": "2026-05-03T10:00:00.000Z",
+          "touchId": "ryder-touch-1",
+          "meetingAt": "2026-05-06T15:00:00.000Z"
+        }
+      ],
+      "commercialSignals": [
+        {
+          "kind": "opportunity_created",
+          "eventId": "97b5e44a-c6e9-4cba-a64a-b2c1c6323cfb",
+          "occurredAt": "2026-05-06T16:00:00.000Z",
+          "amountUsd": 120000,
+          "crmRef": "HUB-RYDER-001"
         }
       ]
     }
