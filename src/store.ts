@@ -1238,6 +1238,7 @@ const SCHEMA: string[] = [
    )`,
   `CREATE TABLE IF NOT EXISTS idempotency_violations (
      id TEXT PRIMARY KEY,
+     deal_id TEXT,
      source TEXT NOT NULL,
      source_event_id TEXT NOT NULL,
      scope TEXT NOT NULL,
@@ -1245,7 +1246,6 @@ const SCHEMA: string[] = [
      incoming_payload_hash TEXT NOT NULL,
      reason TEXT NOT NULL,
      created_at TEXT NOT NULL,
-     UNIQUE (source, source_event_id, scope),
      CHECK (
        scope IN (
          'commercial_state',
@@ -1731,7 +1731,12 @@ export class Store {
     this.ensureColumn("work_items", "agent_suggestion_source_event_id", "TEXT");
     this.backfillWorkItemSuggestionSourceEventIds();
     this.ensureWorkItemSuggestionSourceIndex();
+    // Order matters: add deal_id FIRST so the scopes rebuild (if it fires)
+    // carries deal_id forward, then (re)create the dedup index last since any
+    // table rebuild above drops it.
+    this.ensureIdempotencyViolationDealId();
     this.ensureIdempotencyViolationScopes();
+    this.ensureIdempotencyViolationDedupIndex();
     this.ensurePolicyRecommendationRunStatuses();
     this.backfillExternalNotificationLeases();
     this.backfillDerivedColumns();
@@ -1902,11 +1907,16 @@ export class Store {
       return;
     }
 
+    // deal_id was already added by ensureIdempotencyViolationDealId (which runs
+    // first), so the rebuilt table keeps the column and copies its values —
+    // never silently dropping per-deal attribution. Uniqueness stays on the
+    // COALESCE(deal_id, '') index, not an inline constraint.
     this.transaction(() => {
       this.db
         .prepare(
           `CREATE TABLE idempotency_violations_next (
              id TEXT PRIMARY KEY,
+             deal_id TEXT,
              source TEXT NOT NULL,
              source_event_id TEXT NOT NULL,
              scope TEXT NOT NULL,
@@ -1914,7 +1924,6 @@ export class Store {
              incoming_payload_hash TEXT NOT NULL,
              reason TEXT NOT NULL,
              created_at TEXT NOT NULL,
-             UNIQUE (source, source_event_id, scope),
              CHECK (
                scope IN (
                  'commercial_state',
@@ -1934,11 +1943,11 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO idempotency_violations_next (
-             id, source, source_event_id, scope, existing_payload_hash,
+             id, deal_id, source, source_event_id, scope, existing_payload_hash,
              incoming_payload_hash, reason, created_at
            )
            SELECT
-             id, source, source_event_id, scope, existing_payload_hash,
+             id, deal_id, source, source_event_id, scope, existing_payload_hash,
              incoming_payload_hash, reason, created_at
            FROM idempotency_violations`,
         )
@@ -1950,6 +1959,104 @@ export class Store {
         )
         .run();
     });
+  }
+
+  private ensureIdempotencyViolationDealId(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(idempotency_violations)")
+      .all() as Array<{ name: string }>;
+    const hasDealId = columns.some((col) => col.name === "deal_id");
+    const tableSql =
+      (
+        this.db
+          .prepare(
+            `SELECT sql FROM sqlite_master
+             WHERE type='table' AND name='idempotency_violations'`,
+          )
+          .get() as { sql: string | null } | undefined
+      )?.sql ?? "";
+    // The legacy inline constraint we must shed; uniqueness now lives in the
+    // COALESCE(deal_id, '') index. Detect it directly so a partially-migrated
+    // table (deal_id already added but the inline UNIQUE never dropped) is still
+    // rebuilt — otherwise INSERT OR IGNORE would hit the shared UNIQUE and
+    // silently drop a second deal's conflict.
+    const hasLegacyUnique =
+      /UNIQUE\s*\(\s*source\s*,\s*source_event_id\s*,\s*scope\s*\)/i.test(tableSql);
+    // Already at the target shape (deal_id present, no inline UNIQUE).
+    if (hasDealId && !hasLegacyUnique) {
+      return;
+    }
+    // Rebuild to add the nullable deal_id column and DROP the legacy inline
+    // UNIQUE(source, source_event_id, scope). Uniqueness moves to the
+    // COALESCE(deal_id, '') index (see ensureIdempotencyViolationDedupIndex):
+    // per-deal scopes (engagement_event, commercial_signal) dedup per deal,
+    // while NULL-deal scopes (deal_id → '') keep their original
+    // (source, source_event_id, scope) dedup. Existing deal_id values are kept
+    // when the column already exists; otherwise rows backfill deal_id NULL.
+    const dealIdSelect = hasDealId ? "deal_id" : "NULL";
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `CREATE TABLE idempotency_violations_next (
+             id TEXT PRIMARY KEY,
+             deal_id TEXT,
+             source TEXT NOT NULL,
+             source_event_id TEXT NOT NULL,
+             scope TEXT NOT NULL,
+             existing_payload_hash TEXT NOT NULL,
+             incoming_payload_hash TEXT NOT NULL,
+             reason TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             CHECK (
+               scope IN (
+                 'commercial_state',
+                 'deployment_facts',
+                 'outcome',
+                 'provider_observation',
+                 'agent_suggestion',
+                 'agent_suggestion_decision',
+                 'engagement_event',
+                 'commercial_signal'
+               ) OR
+               scope LIKE 'external_event_observation:%'
+             )
+           )`,
+        )
+        .run();
+      this.db
+        .prepare(
+          `INSERT INTO idempotency_violations_next (
+             id, deal_id, source, source_event_id, scope, existing_payload_hash,
+             incoming_payload_hash, reason, created_at
+           )
+           SELECT
+             id, ${dealIdSelect}, source, source_event_id, scope, existing_payload_hash,
+             incoming_payload_hash, reason, created_at
+           FROM idempotency_violations`,
+        )
+        .run();
+      this.db.prepare("DROP TABLE idempotency_violations").run();
+      this.db
+        .prepare(
+          "ALTER TABLE idempotency_violations_next RENAME TO idempotency_violations",
+        )
+        .run();
+    });
+  }
+
+  private ensureIdempotencyViolationDedupIndex(): void {
+    // Uniqueness key for INSERT OR IGNORE dedup. COALESCE(deal_id, '') folds the
+    // nullable column to '' so NULL-deal scopes dedup exactly as before, while a
+    // present deal_id makes engagement violations per-deal (the same eventId can
+    // legitimately conflict on two different deals → two rows, not a collision).
+    this.db
+      .prepare(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idempotency_violations_dedup
+           ON idempotency_violations (
+             source, source_event_id, scope, COALESCE(deal_id, '')
+           )`,
+      )
+      .run();
   }
 
   private idempotencyViolationsAllowScopes(
@@ -3045,17 +3152,19 @@ export class Store {
     incomingPayloadHash: string,
     reason: string,
     source = LOCAL_COMMERCIAL_SOURCE,
+    dealId: string | null = null,
   ): void {
     this.db
       .prepare(
         `INSERT OR IGNORE INTO idempotency_violations (
-           id, source, source_event_id, scope, existing_payload_hash,
+           id, deal_id, source, source_event_id, scope, existing_payload_hash,
            incoming_payload_hash, reason, created_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         randomUUID(),
+        dealId,
         source,
         sourceEventId,
         scope,
@@ -8523,6 +8632,7 @@ export class Store {
               payloadHash,
               "engagement event id replayed with a different payload",
               source,
+              dealId,
             );
             // Skip — do not overwrite
           }
@@ -8602,6 +8712,7 @@ export class Store {
               payloadHash,
               "commercial signal id replayed with a different payload",
               SALES_REPORTED_SOURCE,
+              dealId,
             );
             // Skip — do not overwrite
           }
