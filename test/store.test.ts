@@ -6962,6 +6962,333 @@ describe("store — importEngagementFeedback idempotency", () => {
     }
   });
 
+  it("an engagement event conflict records the violation WITH its deal_id", () => {
+    const dir = join(tmpdir(), `gtm-router-idem-dealid-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const deal = (events: EngagementEvent[]) => ({
+        routerDealId: "D-lease",
+        trace: {
+          sourceSystem: "sales" as const,
+          boundary: "observed_engagement_not_router_truth" as const,
+        },
+        events,
+      });
+      store.importEngagementFeedback(engagementFeedback({ deals: [deal([sentEvent("evt-1")])] }));
+      store.importEngagementFeedback(
+        engagementFeedback({ deals: [deal([{ ...sentEvent("evt-1"), channel: "linkedin" }])] }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const row = db
+          .prepare(
+            `SELECT deal_id FROM idempotency_violations
+             WHERE scope='engagement_event' AND source_event_id='evt-1'`,
+          )
+          .get() as { deal_id: string } | undefined;
+        expect(row?.deal_id).toBe("D-lease");
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the same eventId conflicting on two deals records two per-deal violations (no cross-deal collision)", () => {
+    const dir = join(tmpdir(), `gtm-router-idem-crossdeal-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordRouted({ ...routed(), id: "D-second", company: "Second Co" }, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      const deal = (routerDealId: string, events: EngagementEvent[]) => ({
+        routerDealId,
+        trace: {
+          sourceSystem: "sales" as const,
+          boundary: "observed_engagement_not_router_truth" as const,
+        },
+        events,
+      });
+      // Same eventId on both deals (allowed — engagement dedup is per-deal).
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [deal("D-lease", [sentEvent("evt-shared")]), deal("D-second", [sentEvent("evt-shared")])],
+        }),
+      );
+      // Conflict the SAME eventId on BOTH deals.
+      const changed = { ...sentEvent("evt-shared"), channel: "linkedin" as const };
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [deal("D-lease", [changed]), deal("D-second", [changed])],
+        }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const rows = db
+          .prepare(
+            `SELECT deal_id FROM idempotency_violations
+             WHERE scope='engagement_event' AND source_event_id='evt-shared'
+             ORDER BY deal_id`,
+          )
+          .all() as Array<{ deal_id: string }>;
+        expect(rows.map((r) => r.deal_id)).toEqual(["D-lease", "D-second"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a commercial signal conflict records the violation WITH its deal_id", () => {
+    const dir = join(tmpdir(), `gtm-router-idem-sig-dealid-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      const deal = (signals: CommercialSignal[]) => ({
+        routerDealId: "D-lease",
+        trace: {
+          sourceSystem: "sales" as const,
+          boundary: "observed_engagement_not_router_truth" as const,
+        },
+        events: [],
+        commercialSignals: signals,
+      });
+      store.importEngagementFeedback(engagementFeedback({ deals: [deal([opportunitySignal("sig-1")])] }));
+      store.importEngagementFeedback(
+        engagementFeedback({ deals: [deal([{ ...opportunitySignal("sig-1"), amountUsd: 99999 }])] }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const row = db
+          .prepare(
+            `SELECT deal_id FROM idempotency_violations
+             WHERE scope='commercial_signal' AND source_event_id='sig-1'`,
+          )
+          .get() as { deal_id: string } | undefined;
+        expect(row?.deal_id).toBe("D-lease");
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a legacy idempotency_violations table: adds deal_id + per-deal dedup index, preserving rows", () => {
+    const dir = join(tmpdir(), `gtm-router-idem-migrate-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      // Build the LEGACY (pre-deal_id) shape directly: inline UNIQUE, no deal_id.
+      const legacy = new DatabaseSync(dbPath);
+      legacy
+        .prepare(
+        `CREATE TABLE idempotency_violations (
+           id TEXT PRIMARY KEY,
+           source TEXT NOT NULL,
+           source_event_id TEXT NOT NULL,
+           scope TEXT NOT NULL,
+           existing_payload_hash TEXT NOT NULL,
+           incoming_payload_hash TEXT NOT NULL,
+           reason TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE (source, source_event_id, scope),
+           CHECK (
+             scope IN (
+               'commercial_state','deployment_facts','outcome',
+               'provider_observation','agent_suggestion','agent_suggestion_decision',
+               'engagement_event','commercial_signal'
+             ) OR scope LIKE 'external_event_observation:%'
+           )
+         )`,
+        )
+        .run();
+      legacy
+        .prepare(
+          `INSERT INTO idempotency_violations
+             (id, source, source_event_id, scope, existing_payload_hash,
+              incoming_payload_hash, reason, created_at)
+           VALUES ('v0','src','e0','commercial_state','h1','h2','legacy row',
+                   '2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+      legacy.close();
+
+      // Opening a Store on the legacy DB triggers the migration. Then exercise
+      // a cross-deal conflict THROUGH the migrated DB: the legacy shared
+      // UNIQUE(source, source_event_id, scope) would collapse these to one row;
+      // the migrated per-deal index must keep them separate.
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordRouted({ ...routed(), id: "D-second", company: "Second Co" }, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      const mkDeal = (routerDealId: string, events: EngagementEvent[]) => ({
+        routerDealId,
+        trace: {
+          sourceSystem: "sales" as const,
+          boundary: "observed_engagement_not_router_truth" as const,
+        },
+        events,
+      });
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [mkDeal("D-lease", [sentEvent("evt-m")]), mkDeal("D-second", [sentEvent("evt-m")])],
+        }),
+      );
+      const changed = { ...sentEvent("evt-m"), channel: "linkedin" as const };
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [mkDeal("D-lease", [changed]), mkDeal("D-second", [changed])],
+        }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const cols = db
+          .prepare("PRAGMA table_info(idempotency_violations)")
+          .all() as Array<{ name: string }>;
+        expect(cols.some((c) => c.name === "deal_id")).toBe(true);
+
+        // Legacy row preserved, with deal_id backfilled NULL.
+        const row = db
+          .prepare("SELECT deal_id, reason FROM idempotency_violations WHERE id='v0'")
+          .get() as { deal_id: string | null; reason: string };
+        expect(row.reason).toBe("legacy row");
+        expect(row.deal_id).toBeNull();
+
+        // Behavioral proof: the migrated DB dedups violations PER DEAL — two
+        // rows for the same eventId on two deals, not one collapsed row.
+        const perDeal = db
+          .prepare(
+            `SELECT deal_id FROM idempotency_violations
+             WHERE scope='engagement_event' AND source_event_id='evt-m'
+             ORDER BY deal_id`,
+          )
+          .all() as Array<{ deal_id: string }>;
+        expect(perDeal.map((r) => r.deal_id)).toEqual(["D-lease", "D-second"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds a partially-migrated table (deal_id present, legacy UNIQUE still there) to per-deal dedup", () => {
+    const dir = join(tmpdir(), `gtm-router-idem-partial-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      // Partially-migrated shape: deal_id column exists, but the legacy inline
+      // UNIQUE(source, source_event_id, scope) was never dropped. The migration
+      // must still rebuild (target shape = deal_id AND no inline UNIQUE),
+      // otherwise INSERT OR IGNORE hits the shared UNIQUE and drops a second
+      // deal's conflict.
+      const partial = new DatabaseSync(dbPath);
+      partial
+        .prepare(
+          `CREATE TABLE idempotency_violations (
+             id TEXT PRIMARY KEY,
+             deal_id TEXT,
+             source TEXT NOT NULL,
+             source_event_id TEXT NOT NULL,
+             scope TEXT NOT NULL,
+             existing_payload_hash TEXT NOT NULL,
+             incoming_payload_hash TEXT NOT NULL,
+             reason TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             UNIQUE (source, source_event_id, scope),
+             CHECK (
+               scope IN (
+                 'commercial_state','deployment_facts','outcome',
+                 'provider_observation','agent_suggestion','agent_suggestion_decision',
+                 'engagement_event','commercial_signal'
+               ) OR scope LIKE 'external_event_observation:%'
+             )
+           )`,
+        )
+        .run();
+      partial.close();
+
+      const store = new Store(dbPath);
+      store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
+      store.recordRouted({ ...routed(), id: "D-second", company: "Second Co" }, 0, {
+        mode: "dry_run",
+        status: "dry_run",
+      });
+      const mkDeal = (routerDealId: string, events: EngagementEvent[]) => ({
+        routerDealId,
+        trace: {
+          sourceSystem: "sales" as const,
+          boundary: "observed_engagement_not_router_truth" as const,
+        },
+        events,
+      });
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [mkDeal("D-lease", [sentEvent("evt-p")]), mkDeal("D-second", [sentEvent("evt-p")])],
+        }),
+      );
+      const changed = { ...sentEvent("evt-p"), channel: "linkedin" as const };
+      store.importEngagementFeedback(
+        engagementFeedback({
+          deals: [mkDeal("D-lease", [changed]), mkDeal("D-second", [changed])],
+        }),
+      );
+      store.close();
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        // The legacy inline UNIQUE is gone from the table definition.
+        const sql = (
+          db
+            .prepare(
+              `SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='idempotency_violations'`,
+            )
+            .get() as { sql: string }
+        ).sql;
+        expect(/UNIQUE\s*\(\s*source\s*,\s*source_event_id\s*,\s*scope\s*\)/i.test(sql)).toBe(
+          false,
+        );
+
+        // Per-deal dedup works: two rows for the same eventId across two deals.
+        const rows = db
+          .prepare(
+            `SELECT deal_id FROM idempotency_violations
+             WHERE scope='engagement_event' AND source_event_id='evt-p'
+             ORDER BY deal_id`,
+          )
+          .all() as Array<{ deal_id: string }>;
+        expect(rows.map((r) => r.deal_id)).toEqual(["D-lease", "D-second"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("same commercial signal eventId + changed payload writes an idempotency_violation and skips", () => {
     const store = new Store(":memory:");
     store.recordRouted(routed(), 0, { mode: "dry_run", status: "dry_run" });
