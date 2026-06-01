@@ -818,6 +818,8 @@ router deal id, `occurredAt`, and the two terminal states.
 ```text
 idempotency_violations (
   id TEXT PRIMARY KEY,
+  deal_id TEXT,               -- set for per-deal scopes (engagement_event,
+                              -- commercial_signal); NULL for all other scopes
   source TEXT NOT NULL,
   source_event_id TEXT NOT NULL,
   scope TEXT NOT NULL,
@@ -825,12 +827,16 @@ idempotency_violations (
   incoming_payload_hash TEXT NOT NULL,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  UNIQUE (source, source_event_id, scope),
   CHECK (
     scope IN ('commercial_state', 'deployment_facts') OR
     scope LIKE 'external_event_observation:%'
   )
 )
+
+-- Uniqueness lives in an expression index, not an inline constraint, so the
+-- nullable deal_id can partition per-deal scopes without breaking NULL-deal ones:
+UNIQUE INDEX idempotency_violations_dedup
+  ON idempotency_violations (source, source_event_id, scope, COALESCE(deal_id, ''))
 ```
 
 ```text
@@ -993,11 +999,13 @@ before commit. Do not use silent `INSERT OR IGNORE` for
 mismatches.
 Generate `idempotency_violations.id` as a UUIDv4 and use `scope` values such as
 `commercial_state`, `deployment_facts`, or
-`external_event_observation:<observation_code>`; the unique constraint keeps
+`external_event_observation:<observation_code>`; the unique index keeps
 replayed violations from creating unbounded rows. Use `INSERT OR IGNORE` (or
 equivalent `ON CONFLICT DO NOTHING`) only for replayed violation rows with the
-same `(source, source_event_id, scope)`. Phase 1 intentionally stores at most
-one violation row per source event per scope; if the same source event is later
+same `(source, source_event_id, scope, COALESCE(deal_id, ''))` — per-deal scopes
+(`engagement_event`, `commercial_signal`) key on `deal_id`; all others fold to
+`''`. Phase 1 intentionally stores at most one violation row per source event
+per scope (per deal, for per-deal scopes); if the same source event is later
 replayed with a third payload hash, return the existing violation rather than
 appending another row. A mismatched replay is considered claimed and terminal
 after the violation is committed; retries should observe the existing violation
