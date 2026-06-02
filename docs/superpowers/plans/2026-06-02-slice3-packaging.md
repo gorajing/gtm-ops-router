@@ -32,14 +32,16 @@
 ```markdown
 ## The closed loop (and how to verify it in ~5 minutes)
 
-A **closed** GTM loop that runs end to end — no mock-ups:
+A GTM loop that **closes** — what the router routes, it later **measures**:
 
 > inbound deal → **real, grounded LLM enrichment** → score → route (sales / finance / legal) → sales handoff → **sales engagement feedback → router measurement**
 
 The router decides what revenue work should happen and records why; the companion
 [`gorajing/sales`](https://github.com/gorajing/sales) repo turns the right accounts
-into evidence-grounded outreach and feeds observed engagement back. **What the
-router routes, it later measures** — the loop closes.
+into evidence-grounded outreach and feeds observed engagement back. The **forward
+leg** (router → enrich → route → handoff → Sales import) runs end-to-end as a demo;
+the **reverse leg** (Sales engagement → router measurement) is a **proven
+byte-for-byte contract**, not a single end-to-end command (verify both below).
 
 **What's hard here (the judgment, not just the code):**
 
@@ -75,7 +77,7 @@ router routes, it later measures** — the loop closes.
 
 - [ ] **Step 2: Verify every cited command.**
   - `npm test` → record the exact `Tests N passed` count; ensure the prose doesn't hardcode a wrong number (it cites "the full suite", no number — good).
-  - `npx tsx scripts/gen-engagement-sample.ts && git diff --exit-code data/engagement-feedback.sample.json` → must exit 0 (prints nothing / "byte-identical").
+  - `npx tsx scripts/gen-engagement-sample.ts && git diff --exit-code data/engagement-feedback.sample.json` → the generator prints `wrote …/engagement-feedback.sample.json`; `git diff --exit-code` is silent on success; overall exit 0 (no diff = byte-identical).
   - `npm run run -- data/inbound.seed.jsonl --demo-engagement` then `npm run serve` → confirm the dashboard serves and the Full-funnel panel renders engagement rows (curl `http://localhost:8787/state` and grep for `engagementAttribution`); then stop serve.
   - `npx tsx scripts/enrich-smoke.ts` with NO key → exits 2 (guard). (Do NOT run the keyed path — no key; the doc only documents it.)
   Expected: all commands behave as the prose claims. If any differs, fix the prose to match ground truth.
@@ -93,7 +95,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ### Task 2: README — stale fixes (tagline, domain map, cross-repo, future bullet, architecture, dashboard flag)
 
-**Files:** Modify `README.md` (lines ~5, 14, 24, 29-32, 47-75, 98, 311-314, 341-352).
+**Files:** Modify `README.md` (lines ~5, 14, 24, 29-32, 47-75, 88-89, 98, 311-314, 341-352).
 
 - [ ] **Step 1: Tagline (line 5).** Replace:
 
@@ -154,17 +156,14 @@ reproduces the router's committed `data/engagement-feedback.sample.json` exactly
 [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md).)
 ```
 
-- [ ] **Step 5: Dashboard-seed flag (line 98).** The engagement/attribution panel needs `--demo-engagement`. Change line 98 from:
+- [ ] **Step 5: Quickstart command-block comments (lines 88-89, 98).** Three fixes, all in the same `bash` block. `cmdDemo` layers engagement **by default** (`src/cli.ts:342` — "demo layers engagement by default; --demo-engagement is a no-op here"), so line 88's comment is incomplete and line 89's `--no-demo-outcomes` is NOT "intake→route only" (engagement still layers). And the dashboard panel needs `--demo-engagement` on the persistent `run` seed.
 
-```
-npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes  # seed SQLite with receipts + post-sale outcomes
-```
-
-to:
-
-```
-npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes --demo-engagement  # seed receipts + post-sale outcomes + engagement (Full-funnel panel)
-```
+  - Line 88: change `npm run demo            # deterministic batch + post-sale outcomes — no API keys, no ports`
+    → `npm run demo            # deterministic batch + post-sale outcomes + engagement — no API keys, no ports`
+  - Line 89: change `npm run demo -- --no-demo-outcomes # intake→route only, no in-memory outcome fixtures`
+    → `npm run demo -- --no-demo-outcomes --no-demo-engagement # intake→route only, no in-memory fixtures`
+  - Line 98: change `npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes  # seed SQLite with receipts + post-sale outcomes`
+    → `npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes --demo-engagement  # seed receipts + post-sale outcomes + engagement (Full-funnel panel)`
 
 - [ ] **Step 6: "What I'd build next" — the enricher bullet is now DONE (lines 311-314).** Replace:
 
