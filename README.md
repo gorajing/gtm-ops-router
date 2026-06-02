@@ -8,6 +8,52 @@ mock-ups. It runs.
 
 ---
 
+## The closed loop (and how to verify it in ~5 minutes)
+
+A GTM loop that **closes** — what the router routes, it later **measures**:
+
+> inbound deal → **real, grounded LLM enrichment** → score → route (sales / finance / legal) → sales handoff → **sales engagement feedback → router measurement**
+
+The router decides what revenue work should happen and records why; the companion
+[`gorajing/sales`](https://github.com/gorajing/sales) repo turns the right accounts
+into evidence-grounded outreach and feeds observed engagement back. The **forward
+leg** (router → enrich → route → handoff → Sales import) runs end-to-end as a demo;
+the **reverse leg** (Sales engagement → router measurement) is a **proven
+byte-for-byte contract**, not a single end-to-end command (verify both below).
+
+**What's hard here (the judgment, not just the code):**
+
+- **Honest enrichment.** Firmographics are inferred by an LLM (Claude) grounded in
+  collected public evidence (homepage + DNS + tech signals), with a **code-owned
+  confidence ceiling the model cannot inflate**, SSRF-safe fetching,
+  prompt-injection isolation, and **quarantine-on-uncertainty** — an unknown
+  company is never guessed. Keyless, a deterministic fixture is the default.
+- **Typed failure handling + per-deal idempotency**, end to end.
+- **A byte-for-byte cross-repo contract** — `sales` emits exactly the
+  engagement-feedback bytes the router consumes.
+- **Measurement that gates trust** — attribution, coverage, honest (nullable) rates.
+
+**Verify it (no setup, no key):**
+
+- `npm test` — the full suite, every failure mode asserted.
+- **Closed loop, byte-for-byte:**
+  `npx tsx scripts/gen-engagement-sample.ts && git diff --exit-code data/engagement-feedback.sample.json`
+  — the committed engagement sample regenerates identically (the `sales` repo's
+  frozen `gen:engagement-sample` reproduces these same bytes).
+- **Measurement dashboard:**
+  `npm run run -- data/inbound.seed.jsonl --demo-engagement`, then `npm run serve`
+  → the **Full-funnel panel** at `http://localhost:8787` shows engagement attribution.
+
+**Verify the live enricher (your own API key):**
+
+- `ANTHROPIC_API_KEY=… npx tsx scripts/enrich-smoke.ts stripe.com somenonexistentco.invalid`
+  → real grounded firmographics + an honest quarantine for the unresolvable one.
+
+**Read:** [`src/pipeline.ts`](src/pipeline.ts) (stage order + error boundaries) and
+[`src/enrich/`](src/enrich/) (the grounded enricher + its guardrails).
+
+---
+
 ## Read this first (the 60-second map)
 
 Start in [`src/pipeline.ts`](src/pipeline.ts) — the stage order and error
