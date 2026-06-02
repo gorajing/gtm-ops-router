@@ -31,8 +31,9 @@ changes** (the one `.ts` touch is a doc-comment in `src/enrich/enricher.ts`).
 - No new demo command, no router CLI/API import for engagement feedback, and no
   wiring a new "full-loop" runner. Lean on existing runnable artifacts:
   `npm test`, the byte-for-byte sample regeneration (`gen-engagement-sample.ts`
-  + `git diff --exit-code`), `npm run demo -- --demo-engagement` + `npm run
-  serve` (dashboard attribution), and `npm run demo:cross-repo` (forward leg).
+  + `git diff --exit-code`), `npm run run -- data/inbound.seed.jsonl
+  --demo-engagement` + `npm run serve` (dashboard attribution; `run` writes the
+  persistent DB, `demo` is in-memory), and `npm run demo:cross-repo` (forward leg).
 - No committed real-enrichment sample/transcript — the code + smoke command are
   the proof.
 - No restructure of the existing README domain map, `RUNBOOK.md`, or
