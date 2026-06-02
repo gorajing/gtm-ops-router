@@ -21,11 +21,16 @@ function v4InCidr(n: number, baseStr: string, bits: number): boolean {
   const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
   return (n & mask) === (base & mask);
 }
+// Covers the internal-SSRF threat (private / loopback / link-local / CGNAT)
+// plus the IANA IPv4 special-purpose registry. The AS112/AMT entries
+// (192.31.196/24, 192.52.193/24, 192.175.48/24) are public anycast — not
+// internally reachable — and are listed only for registry fidelity.
 const V4_BLOCKED: Array<[string, number]> = [
   ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
   ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
-  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
-  ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+  ["192.31.196.0", 24], ["192.52.193.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16],
+  ["192.175.48.0", 24], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+  ["224.0.0.0", 4], ["240.0.0.0", 4],
 ];
 function isPublicV4(ip: string): boolean {
   const n = v4ToInt(ip);
@@ -81,6 +86,7 @@ function isPublicV6(ip: string): boolean {
   if (h[0]! === 0x2001 && h[1]! === 0x0db8) return false;       // 2001:db8::/32 documentation
   if (h[0]! === 0x2002) return false;                          // 2002::/16 6to4 (may embed private v4)
   if (h[0]! === 0x3fff && (h[1]! & 0xf000) === 0) return false; // 3fff::/20 documentation
+  if (h[0]! === 0x2620 && h[1]! === 0x004f && h[2]! === 0x8000) return false; // 2620:4f:8000::/48 AS112-v6
   return true;
 }
 export function isPublicUnicastIp(ip: string): boolean {
