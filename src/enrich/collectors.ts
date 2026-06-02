@@ -1,6 +1,6 @@
 import dns from "node:dns";
 import net from "node:net";
-import { safeFetch, type SafeFetchResult } from "./safe-fetch.js";
+import { safeFetch, isPublicUnicastIp, type SafeFetchResult } from "./safe-fetch.js";
 
 // Injection seam for tests ONLY. Production callers (defaultCollectors) use the
 // SSRF-safe default; never pass a non-safe fetcher from production code.
@@ -60,8 +60,13 @@ export async function collectDns(domain: string | undefined): Promise<DnsSignal 
       dns.promises.resolveTxt(domain).catch(() => []),
       dns.promises.lookup(domain, { all: true }).catch(() => []),
     ]);
-    if (mx.length === 0 && txt.length === 0 && addrs.length === 0) return null;
-    return { mx: mx.map((m) => m.exchange), txt: txt.map((t) => t.join("")), hasAddress: addrs.length > 0 };
+    // hasAddress means a PUBLIC unicast address — a domain resolving only to
+    // private/loopback IPs (which safeFetch would block) is NOT public web
+    // presence and must not grant DNS coverage downstream. Reuse the same
+    // predicate safeFetch trusts.
+    const hasAddress = addrs.some((a) => isPublicUnicastIp(a.address));
+    if (mx.length === 0 && txt.length === 0 && !hasAddress) return null;
+    return { mx: mx.map((m) => m.exchange), txt: txt.map((t) => t.join("")), hasAddress };
   } catch {
     return null;
   }

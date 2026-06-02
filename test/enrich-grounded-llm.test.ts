@@ -36,6 +36,16 @@ describe("GroundedLlmEnricher", () => {
     const e = new GroundedLlmEnricher({ collect: async () => richBundle, synthesize: async () => { throw new Error("api down"); } });
     await expect(e.enrich(deal)).rejects.toThrow(/api down/);
   });
+  it("grants NO dns coverage when the domain resolves only to private IPs (hasAddress=false)", async () => {
+    const bundle: EvidenceBundle = { domain: "x.example", homepage: null, dns: { mx: [], txt: [], hasAddress: false }, techSignals: [] };
+    const e = await enricher({ ...goodFirmo, selfConfidence: 0.99 }, bundle).enrich(deal);
+    expect(e?.confidence).toBe(0.15); // dns present but non-public → no-evidence ceiling, quarantined by the gate
+  });
+  it("grants dns coverage for a public dns-only domain (hasAddress=true)", async () => {
+    const bundle: EvidenceBundle = { domain: "x.example", homepage: null, dns: { mx: [], txt: [], hasAddress: true }, techSignals: [] };
+    const e = await enricher({ ...goodFirmo, selfConfidence: 0.99 }, bundle).enrich(deal);
+    expect(e?.confidence).toBe(0.55); // homepage:false + dns(public):true → 0.5 + 0.05
+  });
   it("isolates an injection-laden company name as JSON data, not a raw prompt line", async () => {
     let captured = "";
     const e = new GroundedLlmEnricher({

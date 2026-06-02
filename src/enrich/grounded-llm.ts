@@ -66,7 +66,14 @@ export class GroundedLlmEnricher implements Enricher {
     const key = enrichmentSubjectKey(deal);
     if (this.cache.has(key)) return this.cache.get(key)!;
     const bundle = await this.deps.collect(deal);
-    const coverage: Coverage = { homepage: bundle.homepage !== null, dns: bundle.dns !== null, tech: bundle.techSignals.length > 0 };
+    // DNS coverage requires a PUBLIC address (bundle.dns.hasAddress) — a domain
+    // resolving only to private IPs (homepage blocked by safeFetch) must not
+    // grant a confidence boost. MX/TXT hints still reach the LLM but don't count.
+    const coverage: Coverage = {
+      homepage: bundle.homepage !== null,
+      dns: bundle.dns?.hasAddress === true,
+      tech: bundle.techSignals.length > 0,
+    };
     // ALL attacker-influenceable values (company, domain, collected evidence) go
     // INSIDE one JSON-encoded block. JSON escaping neutralizes newlines/quotes, so
     // an injection-laden company name becomes an inert string value, not a prompt line.
