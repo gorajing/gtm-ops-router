@@ -92,14 +92,17 @@ Three parts:
      - **Closed-loop, byte-for-byte:** `npx tsx scripts/gen-engagement-sample.ts
        && git diff --exit-code data/engagement-feedback.sample.json` — the
        committed sample regenerates identically (the test asserts `toEqual`, so
-       cite THIS for true byte-for-byte). The reverse contract holds across repos
-       (the `sales` `export:engagement-feedback` produces these same bytes).
-     - **Measurement / attribution (dashboard, not terminal):** seed engagement
-       then serve — `npm run demo -- --demo-engagement` (or `run … --demo-engagement`)
-       to populate, then `npm run serve` → the **Full-funnel panel** at the
-       dashboard shows attribution. (`npm run demo`'s *terminal* output shows
-       routing/quarantine/metrics, **not** attribution rates — attribution is in
-       `/state` + the dashboard.)
+       cite THIS command for true byte-for-byte). Cross-repo, the `sales` repo's
+       **frozen** `gen:engagement-sample` produces these *same bytes* (its
+       `export:engagement-feedback` CLI stamps a live `generatedAt`, so that's
+       the live path, NOT the byte-identical one).
+     - **Measurement / attribution (dashboard, not terminal):** populate the
+       **persistent** DB then serve — `npm run run -- data/inbound.seed.jsonl
+       --demo-engagement`, then `npm run serve` (same DB path; default
+       `data/router.db`) → the **Full-funnel panel** shows attribution. (Use
+       `run`, not `demo`: `demo` uses an in-memory store `serve` can't read.
+       And `npm run demo`'s *terminal* output shows routing/quarantine/metrics,
+       **not** attribution rates — attribution lives in `/state` + the dashboard.)
    - **Keyed (live LLM):** `ANTHROPIC_API_KEY=… npx tsx scripts/enrich-smoke.ts
      stripe.com somenonexistentco.invalid` → real grounded enrichment + honest
      quarantine.
@@ -108,11 +111,13 @@ Three parts:
 
    **Loop-closure framing (honest):** the forward leg is runnable end-to-end
    (`npm run demo:cross-repo`: router → handoff → sales). The reverse leg is
-   proven by the **byte-for-byte contract** (sales emits exactly the
-   `sales.engagement-feedback.v1` the router consumes via
-   `Store.importEngagementFeedback`) + the router's `--demo-engagement`
-   attribution — NOT by a single end-to-end command. Do **not** imply
-   `demo:cross-repo` closes the loop, and do not invent a full-loop runner.
+   proven two ways: the **runtime contract** (sales' live
+   `export:engagement-feedback` emits `sales.engagement-feedback.v1`, which the
+   router consumes via `Store.importEngagementFeedback`) and the **byte-for-byte
+   identity** (sales' frozen `gen:engagement-sample` reproduces the router's
+   committed sample exactly) + the router's `--demo-engagement` attribution —
+   NOT by a single end-to-end command. Do **not** imply `demo:cross-repo` closes
+   the loop, and do not invent a full-loop runner.
 
 ## Accuracy guardrail (non-negotiable)
 
@@ -142,5 +147,6 @@ truth, not guessed.
   bullet, the forward-only loop).
 - All cited keyless verify-commands run green (confirmed during implementation);
   the smoke command's guards are verified.
-- Docs-only: the full test suite and the byte-for-byte demo remain green (no
-  code touched).
+- Docs + one doc-comment: the full test suite and the byte-for-byte demo remain
+  green (no code-*logic* touched — the only `.ts` edit is the `enricher.ts`
+  comment).
