@@ -76,10 +76,13 @@ describe("isPublicUnicastIp", () => {
   const publicV4 = ["8.8.8.8", "1.1.1.1", "93.184.216.34"];
   const blockedV4 = [
     "0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1",
-    "172.16.0.1", "192.0.2.1", "192.168.1.1", "198.18.0.1", "198.51.100.1",
-    "203.0.113.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+    "172.16.0.1", "192.0.0.1", "192.0.2.1", "192.88.99.1", "192.168.1.1",
+    "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
   ];
-  const blockedV6 = ["::", "::1", "fc00::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:7f00:1"];
+  const blockedV6 = [
+    "::", "::1", "fc00::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:7f00:1",
+    "2001:db8::1", "2002::1", "::a9fe:1", // 2001:db8::/32, 2002::/16, IPv4-compatible 169.254.0.1
+  ];
   const publicV6 = ["2606:4700:4700::1111"];
 
   it("accepts public IPv4", () => { for (const ip of publicV4) expect(isPublicUnicastIp(ip)).toBe(true); });
@@ -122,9 +125,9 @@ function v4InCidr(n: number, baseStr: string, bits: number): boolean {
 }
 const V4_BLOCKED: Array<[string, number]> = [
   ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
-  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.2.0", 24], ["192.168.0.0", 16],
-  ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4],
-  ["240.0.0.0", 4],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
+  ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
 ];
 function isPublicV4(ip: string): boolean {
   const n = v4ToInt(ip);
@@ -167,6 +170,12 @@ function isPublicV6(ip: string): boolean {
   if (m) return isPublicV4(m);
   if (h.every((x) => x === 0)) return false; // ::
   if (!(h[0] | h[1] | h[2] | h[3] | h[4] | h[5] | h[6]) && h[7] === 1) return false; // ::1
+  // IPv4-compatible ::a.b.c.d (deprecated): top 96 bits zero, not :: / ::1 → unwrap+recheck
+  if (!(h[0] | h[1] | h[2] | h[3] | h[4] | h[5]) && (h[6] | h[7])) {
+    return isPublicV4(`${(h[6] >> 8) & 255}.${h[6] & 255}.${(h[7] >> 8) & 255}.${h[7] & 255}`);
+  }
+  if (h[0] === 0x2001 && h[1] === 0x0db8) return false; // 2001:db8::/32 documentation
+  if (h[0] === 0x2002) return false; // 2002::/16 6to4 (may embed private v4)
   if ((h[0] & 0xfe00) === 0xfc00) return false; // fc00::/7
   if ((h[0] & 0xffc0) === 0xfe80) return false; // fe80::/10
   if ((h[0] & 0xff00) === 0xff00) return false; // ff00::/8
@@ -182,7 +191,8 @@ export function isPublicUnicastIp(ip: string): boolean {
 export interface SafeFetchResult {
   status: number;
   contentType: string;
-  text: string;
+  headers: string; // joined "k: v\n…" — used for tech detection (Server, X-Powered-By, …)
+  text: string;    // RAW body (not stripped) so tech markers in <script src> survive
 }
 
 async function resolveAllPublic(hostname: string): Promise<dns.LookupAddress[]> {
@@ -249,7 +259,10 @@ export async function safeFetch(
       if (total > maxBytes) { res.destroy(); throw new Error(`body exceeds ${maxBytes} bytes`); }
       chunks.push(c as Buffer);
     }
-    return { status: res.statusCode ?? 0, contentType, text: Buffer.concat(chunks).toString("utf8") };
+    const headers = Object.entries(res.headers)
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v ?? ""}`)
+      .join("\n");
+    return { status: res.statusCode ?? 0, contentType, headers, text: Buffer.concat(chunks).toString("utf8") };
   }
 }
 ```
@@ -280,39 +293,41 @@ Three keyless collectors; each returns its signal or `null` and **never throws**
 
 ```typescript
 import { describe, it, expect } from "vitest";
-import { collectHomepage, collectTech, type Fetcher } from "../src/enrich/collectors.js";
+import { fetchHomepageRaw, parseHomepage, collectTech, type Fetcher } from "../src/enrich/collectors.js";
 
-const okFetch: Fetcher = async () => ({
-  status: 200,
-  contentType: "text/html",
-  text: `<html><head><title>Acme Freight</title><meta name="description" content="3PL logistics"></head>
-         <body>We are a freight brokerage. <script src="https://js.hs-scripts.com/x.js"></script></body></html>`,
-});
+const html = `<html><head><title>Acme Freight</title><meta name="description" content="3PL logistics"></head>
+  <body>We are a freight brokerage. <script src="https://js.hs-scripts.com/x.js"></script> twilio</body></html>`;
+const okFetch: Fetcher = async () => ({ status: 200, contentType: "text/html", headers: "server: nginx", text: html });
 
-describe("collectHomepage", () => {
-  it("extracts title/description/excerpt for a valid domain", async () => {
-    const sig = await collectHomepage("acme.example", okFetch);
-    expect(sig?.title).toBe("Acme Freight");
-    expect(sig?.description).toContain("3PL");
-    expect(sig?.textExcerpt).toContain("freight brokerage");
+describe("fetchHomepageRaw", () => {
+  it("returns the RAW result (scripts intact) for a valid domain", async () => {
+    const raw = await fetchHomepageRaw("acme.example", okFetch);
+    expect(raw?.text).toContain("hs-scripts");
   });
   it("returns null (no throw) when the fetch fails", async () => {
-    const sig = await collectHomepage("acme.example", async () => { throw new Error("blocked"); });
-    expect(sig).toBeNull();
+    expect(await fetchHomepageRaw("acme.example", async () => { throw new Error("blocked"); })).toBeNull();
   });
-  it("returns null when domain is absent — never fetches the company-name fallback", async () => {
+  it("returns null and does NOT fetch when domain is absent (never the company-name fallback)", async () => {
     let called = false;
-    const sig = await collectHomepage(undefined, async () => { called = true; return { status: 200, contentType: "", text: "" }; });
-    expect(sig).toBeNull();
+    const raw = await fetchHomepageRaw(undefined, async () => { called = true; return { status: 200, contentType: "", headers: "", text: "" }; });
+    expect(raw).toBeNull();
     expect(called).toBe(false);
   });
 });
 
+describe("parseHomepage", () => {
+  it("extracts title/description and a script-stripped excerpt (the LLM-facing data)", () => {
+    const sig = parseHomepage(html);
+    expect(sig.title).toBe("Acme Freight");
+    expect(sig.description).toContain("3PL");
+    expect(sig.textExcerpt).toContain("freight brokerage");
+    expect(sig.textExcerpt).not.toContain("hs-scripts"); // excerpt is clean
+  });
+});
+
 describe("collectTech", () => {
-  it("detects known SaaS markers from html + headers", () => {
-    const tech = collectTech(`<script src="https://js.hs-scripts.com/x"></script> twilio`, "");
-    expect(tech).toContain("hubspot");
-    expect(tech).toContain("twilio");
+  it("detects markers from RAW html + headers (not the stripped excerpt)", () => {
+    expect(collectTech(html, "server: nginx")).toEqual(expect.arrayContaining(["hubspot", "twilio"]));
   });
   it("returns [] when nothing matches", () => {
     expect(collectTech("<html></html>", "")).toEqual([]);
@@ -343,7 +358,7 @@ export interface EvidenceBundle {
   techSignals: string[];
 }
 
-function isFetchableHostname(domain: string | undefined): domain is string {
+export function isFetchableHostname(domain: string | undefined): domain is string {
   if (!domain) return false;
   const host = domain.trim().toLowerCase();
   if (!host || net.isIP(host)) return false; // only real hostnames; IP literals go through safeFetch's own guard anyway
@@ -355,17 +370,27 @@ function stripTags(html: string): string {
     .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-export async function collectHomepage(domain: string | undefined, fetcher: Fetcher = defaultFetcher): Promise<HomepageSignal | null> {
+/** Fetch the homepage RAW (fail-soft). null on any failure OR when there is no
+ *  real domain — the company-name fallback is NEVER a fetch target. The raw body
+ *  is needed for tech detection (markers live in <script src>), so callers parse
+ *  the LLM-facing signal and run tech detection from the SAME raw result. */
+export async function fetchHomepageRaw(domain: string | undefined, fetcher: Fetcher = defaultFetcher): Promise<SafeFetchResult | null> {
   if (!isFetchableHostname(domain)) return null;
   try {
     const res = await fetcher(`https://${domain}`);
     if (res.status >= 400 || !/text\/html|text\//i.test(res.contentType)) return null;
-    const title = res.text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? null;
-    const description = res.text.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)?.[1]?.trim() ?? null;
-    return { title, description, textExcerpt: stripTags(res.text).slice(0, 2000) };
+    return res;
   } catch {
-    return null; // fail-soft: absent evidence, never throw
+    return null;
   }
+}
+
+/** Pure: derive the LLM-facing homepage signal. textExcerpt is script-stripped
+ *  (clean data for the prompt) — tech detection runs on the RAW html, not this. */
+export function parseHomepage(html: string): HomepageSignal {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? null;
+  const description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)?.[1]?.trim() ?? null;
+  return { title, description, textExcerpt: stripTags(html).slice(0, 2000) };
 }
 
 export async function collectDns(domain: string | undefined): Promise<DnsSignal | null> {
@@ -389,8 +414,10 @@ const TECH_MARKERS: Array<[string, RegExp]> = [
   ["segment", /segment\.com|cdn\.segment/i], ["marketo", /marketo/i], ["aircall", /aircall/i],
   ["genesys", /genesys/i], ["gong", /gong\.io/i],
 ];
-export function collectTech(html: string, headers: string): string[] {
-  const hay = `${html}\n${headers}`;
+/** Run on RAW html + the header string — markers live in <script src>/headers, which
+ *  the stripped excerpt removes. */
+export function collectTech(rawHtml: string, headers: string): string[] {
+  const hay = `${rawHtml}\n${headers}`;
   return TECH_MARKERS.filter(([, re]) => re.test(hay)).map(([name]) => name);
 }
 ```
@@ -649,7 +676,18 @@ Wires collectors → evidence bundle → Claude synthesis (zod-validated) → `r
 
 **Files:**
 - Create: `src/enrich/grounded-llm.ts`
+- Modify: `src/types.ts:653-664` (add `"llm"`), `test/types.test.ts`
 - Test: `test/enrich-grounded-llm.test.ts`
+
+- [ ] **Step 0: Add `"llm"` to the provider enum first** — `GroundedLlmEnricher.name: ProviderObservationProvider = "llm"` will not typecheck until `"llm"` is in `PROVIDER_OBSERVATION_PROVIDERS` (`src/types.ts:653-664`). Add it and update the provider-enum assertion in `test/types.test.ts`. (The DB CHECK migration that lets *existing* DBs accept it is Task 7 — fresh DBs created by the test/build already include it once the enum is updated.)
+
+```typescript
+export const PROVIDER_OBSERVATION_PROVIDERS = [
+  "fixture", "manual", "website", "hubspot", "apollo",
+  "clearbit", "clay", "warehouse", "csv", "agent",
+  "llm",
+] as const;
+```
 
 - [ ] **Step 1: Write failing tests** (`test/enrich-grounded-llm.test.ts`)
 
@@ -659,7 +697,7 @@ import { GroundedLlmEnricher } from "../src/enrich/grounded-llm.js";
 import type { LlmFirmographics } from "../src/enrich/confidence.js";
 
 const deal = { id: "D-1", company: "Acme", domain: "acme.example" } as any;
-const richBundle = { homepage: { title: "Acme", description: null, textExcerpt: "freight" }, dns: { mx: ["mx"], txt: [], hasAddress: true }, tech: ["twilio"] };
+const richBundle = { domain: "acme.example", homepage: { title: "Acme", description: null, textExcerpt: "freight" }, dns: { mx: ["mx"], txt: [], hasAddress: true }, techSignals: ["twilio"] };
 const goodFirmo: LlmFirmographics = {
   employees: { value: 400, basis: "evidence" }, industry: { value: "freight", basis: "evidence" },
   regulated: { value: true, basis: "evidence" }, techSignals: ["twilio"], selfConfidence: 0.8,
@@ -680,7 +718,7 @@ describe("GroundedLlmEnricher", () => {
   });
   it("an injected page cannot raise confidence above the code ceiling", async () => {
     // No homepage/dns coverage → ceiling 0.15, even though the model 'reports' 0.99.
-    const e = await enricher({ ...goodFirmo, selfConfidence: 0.99 }, { homepage: null, dns: null, tech: [] }).enrich(deal);
+    const e = await enricher({ ...goodFirmo, selfConfidence: 0.99 }, { domain: "acme.example", homepage: null, dns: null, techSignals: [] }).enrich(deal);
     expect(e?.confidence).toBe(0.15);
   });
   it("returns null when a routing-critical field is unknown", async () => {
@@ -705,16 +743,19 @@ import { z } from "zod";
 import type { Deal, Enrichment, ProviderObservationProvider } from "../types.js";
 import type { Enricher } from "./enricher.js";
 import { enrichmentSubjectKey } from "./enricher.js";
-import { collectHomepage, collectDns, collectTech, type EvidenceBundle } from "./collectors.js";
+import { fetchHomepageRaw, parseHomepage, collectDns, collectTech, type EvidenceBundle } from "./collectors.js";
 import { ClaudeClient } from "./claude-client.js";
 import { resolveEnrichment, type Coverage, type LlmFirmographics } from "./confidence.js";
 
-const FieldNum = z.object({ value: z.number().nullable(), basis: z.enum(["evidence", "inference", "unknown"]) });
+// value constraints mirror the store's parseEnrichmentPayload: employees is a
+// non-negative integer; tech signals are non-empty strings (else the store
+// rejects on evidence persistence while the deal still routes).
+const FieldNum = z.object({ value: z.number().int().nonnegative().nullable(), basis: z.enum(["evidence", "inference", "unknown"]) });
 const FieldStr = z.object({ value: z.string().nullable(), basis: z.enum(["evidence", "inference", "unknown"]) });
 const FieldBool = z.object({ value: z.boolean().nullable(), basis: z.enum(["evidence", "inference", "unknown"]) });
 const FirmographicsSchema = z.object({
   employees: FieldNum, industry: FieldStr, regulated: FieldBool,
-  techSignals: z.array(z.string()), selfConfidence: z.number(),
+  techSignals: z.array(z.string().min(1)), selfConfidence: z.number(),
 });
 const TOOL_NAME = "firmographics";
 const TOOL_SCHEMA = {
@@ -742,9 +783,10 @@ export interface Synthesizer { synthesize(system: string, user: string): Promise
 
 export const defaultCollectors: Collectors = {
   async collect(deal) {
-    const [homepage, dns] = await Promise.all([collectHomepage(deal.domain ?? undefined), collectDns(deal.domain ?? undefined)]);
-    const tech = homepage ? collectTech(homepage.textExcerpt, "") : [];
-    return { domain: deal.domain ?? null, homepage, dns, techSignals: tech };
+    const [raw, dns] = await Promise.all([fetchHomepageRaw(deal.domain ?? undefined), collectDns(deal.domain ?? undefined)]);
+    const homepage = raw ? parseHomepage(raw.text) : null;
+    const techSignals = raw ? collectTech(raw.text, raw.headers) : []; // RAW html + headers, not the stripped excerpt
+    return { domain: deal.domain ?? null, homepage, dns, techSignals };
   },
 };
 
@@ -793,24 +835,26 @@ git commit -m "feat(enrich): GroundedLlmEnricher — collectors + Claude + confi
 
 ---
 
-### Task 7: Provider taxonomy `"llm"` + `provider_observations` CHECK migration
+### Task 7: `provider_observations` + `enriched_subject_facts` provider-CHECK migration
 
-Add `"llm"` to the provider enum and rebuild the `provider_observations` CHECK on existing DBs (the CHECK is baked at table creation, `src/store.ts:981`). Generic detection mirrors `idempotencyViolationsAllowScopes` (`src/store.ts:2062`); the rebuild mirrors the idempotency temp-swap and recreates both indexes (`src/store.ts:1291-1292`).
+`"llm"` was added to the enum in Task 6. **Two** tables bake a provider CHECK at creation: `provider_observations` `CHECK (provider IN (…))` (`src/store.ts:981`) **and** `enriched_subject_facts` `CHECK (source_provider IN (…))` (`src/store.ts:986`). `recordEnrichmentObservation` writes a provider_observation **and immediately projects an `enriched_subject_facts` row** for company subjects, so an existing DB must accept `"llm"` in BOTH — otherwise live enrichment passes the observation insert then throws on the facts insert. Generic detection mirrors `idempotencyViolationsAllowScopes` (`src/store.ts:2062`); rebuilds mirror the idempotency temp-swap. `provider_observations` recreates its 2 indexes (`src/store.ts:1291-1292`); `enriched_subject_facts` has no separate index (PK only).
 
 **Files:**
-- Modify: `src/types.ts:653-664`, `src/store.ts` (add migration + constructor call after `src/store.ts:1739`)
-- Test: `test/types.test.ts`, `test/store.test.ts`
+- Modify: `src/store.ts` (two `ensure*` migrations + two constructor calls after `:1739`)
+- Test: `test/store.test.ts`
 
 - [ ] **Step 1: Write failing test** (append to `test/store.test.ts`)
 
 ```typescript
-describe("Store provider observation provider-check migration", () => {
-  it("widens the provider CHECK to admit 'llm' without losing rows, still rejects bogus providers", () => {
+describe("Store provider CHECK migration (provider_observations + enriched_subject_facts)", () => {
+  it("widens both provider CHECKs to admit 'llm' without losing rows; still rejects bogus", () => {
     const dir = join(tmpdir(), `gtm-router-provider-check-${process.pid}-${Date.now()}`);
     mkdirSync(dir);
     const dbPath = join(dir, "router.db");
     try {
       const legacy = new DatabaseSync(dbPath);
+      // Legacy provider_observations: provider CHECK lacks 'llm'. (subject_type is
+      // company-only, faithful to the real schema.)
       legacy.prepare(
         `CREATE TABLE provider_observations (
            id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_key TEXT NOT NULL,
@@ -818,7 +862,7 @@ describe("Store provider observation provider-check migration", () => {
            observed_at TEXT NOT NULL, expires_at TEXT, confidence REAL NOT NULL,
            raw_payload_json TEXT NOT NULL, normalized_payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
            UNIQUE (provider, source_event_id),
-           CHECK (subject_type IN ('contact','company')),
+           CHECK (subject_type IN ('company')),
            CHECK (provider IN ('fixture','manual','website','hubspot','apollo','clearbit','clay','warehouse','csv','agent')),
            CHECK (confidence >= 0 AND confidence <= 1)
          )`,
@@ -826,53 +870,63 @@ describe("Store provider observation provider-check migration", () => {
       legacy.prepare(
         `INSERT INTO provider_observations VALUES ('PO-legacy','company','acme.example','fixture','evt-legacy','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`,
       ).run();
+      // Legacy enriched_subject_facts: source_provider CHECK lacks 'llm'.
+      legacy.prepare(
+        `CREATE TABLE enriched_subject_facts (
+           subject_type TEXT NOT NULL, subject_key TEXT NOT NULL, employees INTEGER NOT NULL,
+           industry TEXT NOT NULL, tech_signals_json TEXT NOT NULL, regulated INTEGER NOT NULL,
+           confidence REAL NOT NULL, source_provider TEXT NOT NULL, source_observation_id TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, updated_at TEXT NOT NULL,
+           PRIMARY KEY (subject_type, subject_key),
+           CHECK (subject_type IN ('company')),
+           CHECK (source_provider IN ('fixture','manual','website','hubspot','apollo','clearbit','clay','warehouse','csv','agent')),
+           CHECK (employees >= 0), CHECK (regulated IN (0,1)),
+           CHECK (confidence >= 0 AND confidence <= 1), CHECK (json_valid(tech_signals_json))
+         )`,
+      ).run();
+      legacy.prepare(
+        `INSERT INTO enriched_subject_facts VALUES ('company','acme.example',100,'logistics','[]',0,0.9,'fixture','PO-legacy','2026-05-21T12:00:00.000Z',NULL,'2026-05-21T12:00:00.000Z')`,
+      ).run();
       legacy.close();
 
-      new Store(dbPath).close(); // migrates
+      new Store(dbPath).close(); // migrates BOTH tables
 
       const db = new DatabaseSync(dbPath);
       try {
-        const sql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_observations'`).get() as { sql: string }).sql;
-        expect(sql).toContain("'llm'");
+        for (const table of ["provider_observations", "enriched_subject_facts"]) {
+          const sql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}'`).get() as { sql: string }).sql;
+          expect(sql).toContain("'llm'");
+        }
         expect((db.prepare(`SELECT provider FROM provider_observations WHERE id='PO-legacy'`).get() as { provider: string }).provider).toBe("fixture");
-        db.prepare(`INSERT INTO provider_observations VALUES ('PO-llm','company','acme.example','llm','evt-llm','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run();
-        expect(() => db.prepare(`INSERT INTO provider_observations VALUES ('PO-x','company','acme.example','bogus','evt-x','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run()).toThrow();
+        expect((db.prepare(`SELECT source_provider FROM enriched_subject_facts WHERE subject_key='acme.example'`).get() as { source_provider: string }).source_provider).toBe("fixture");
+        db.prepare(`INSERT INTO provider_observations VALUES ('PO-llm','company','x.example','llm','evt-llm','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run();
+        db.prepare(`INSERT INTO enriched_subject_facts VALUES ('company','x.example',5,'logistics','[]',0,0.9,'llm','PO-llm','2026-05-21T12:00:00.000Z',NULL,'2026-05-21T12:00:00.000Z')`).run();
+        expect(() => db.prepare(`INSERT INTO provider_observations VALUES ('PO-x','company','y.example','bogus','evt-x','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run()).toThrow();
       } finally { db.close(); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 ```
 
-Also update `test/types.test.ts` (the provider-enum assertion near `:132`) to include `"llm"`.
+- [ ] **Step 2: Run — expect FAIL** (both CHECKs reject `'llm'` before the migrations exist)
 
-- [ ] **Step 2: Run — expect FAIL** (CHECK rejects `'llm'`; enum assertion fails)
+Run: `npx vitest run test/store.test.ts -t "provider CHECK migration"`
 
-Run: `npx vitest run test/store.test.ts -t "provider-check" test/types.test.ts`
-
-- [ ] **Step 3a: Add `"llm"` to `src/types.ts:653-664`**
-
-```typescript
-export const PROVIDER_OBSERVATION_PROVIDERS = [
-  "fixture", "manual", "website", "hubspot", "apollo",
-  "clearbit", "clay", "warehouse", "csv", "agent",
-  "llm",
-] as const;
-```
-
-- [ ] **Step 3b: Add the migration to `src/store.ts`** — call after `this.ensureIdempotencyViolationDedupIndex();` (`:1739`), before `this.ensurePolicyRecommendationRunStatuses();`:
+- [ ] **Step 3a: Add both constructor calls** in `src/store.ts` after `this.ensureIdempotencyViolationDedupIndex();` (`:1739`), before `this.ensurePolicyRecommendationRunStatuses();`:
 
 ```typescript
     this.ensureProviderObservationProviderCheck();
+    this.ensureEnrichedSubjectFactsProviderCheck();
 ```
 
-and add the method near the other `ensure*` helpers (after `idempotencyViolationsAllowScopes`, ~`:2072`):
+- [ ] **Step 3b: Add both migrations + the shared detector** near the other `ensure*` helpers (after `idempotencyViolationsAllowScopes`, ~`:2072`). `PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL` and `PROVIDER_OBSERVATION_PROVIDER_SQL` are module constants (`src/store.ts:188-193`) — reinterpolate them, never inline literal provider strings.
 
 ```typescript
   private ensureProviderObservationProviderCheck(): void {
     const row = this.db
       .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_observations'`)
       .get() as { sql: string | null } | undefined;
-    if (row?.sql && this.providerObservationAllowsProviders(row.sql, PROVIDER_OBSERVATION_PROVIDERS)) return;
+    if (row?.sql && this.providerCheckAllows(row.sql, "provider", PROVIDER_OBSERVATION_PROVIDERS)) return;
     this.transaction(() => {
       this.db.prepare(
         `CREATE TABLE provider_observations_next (
@@ -901,17 +955,49 @@ and add the method near the other `ensure*` helpers (after `idempotencyViolation
     });
   }
 
-  private providerObservationAllowsProviders(tableSql: string, providers: readonly string[]): boolean {
+  private ensureEnrichedSubjectFactsProviderCheck(): void {
+    const row = this.db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='enriched_subject_facts'`)
+      .get() as { sql: string | null } | undefined;
+    if (row?.sql && this.providerCheckAllows(row.sql, "source_provider", PROVIDER_OBSERVATION_PROVIDERS)) return;
+    this.transaction(() => {
+      this.db.prepare(
+        `CREATE TABLE enriched_subject_facts_next (
+           subject_type TEXT NOT NULL, subject_key TEXT NOT NULL, employees INTEGER NOT NULL,
+           industry TEXT NOT NULL, tech_signals_json TEXT NOT NULL, regulated INTEGER NOT NULL,
+           confidence REAL NOT NULL, source_provider TEXT NOT NULL, source_observation_id TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, updated_at TEXT NOT NULL,
+           PRIMARY KEY (subject_type, subject_key),
+           CHECK (subject_type IN (${PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL})),
+           CHECK (source_provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+           CHECK (employees >= 0), CHECK (regulated IN (0, 1)),
+           CHECK (confidence >= 0 AND confidence <= 1), CHECK (json_valid(tech_signals_json))
+         )`,
+      ).run();
+      this.db.prepare(
+        `INSERT INTO enriched_subject_facts_next (
+           subject_type, subject_key, employees, industry, tech_signals_json, regulated,
+           confidence, source_provider, source_observation_id, observed_at, expires_at, updated_at)
+         SELECT subject_type, subject_key, employees, industry, tech_signals_json, regulated,
+           confidence, source_provider, source_observation_id, observed_at, expires_at, updated_at
+         FROM enriched_subject_facts`,
+      ).run();
+      this.db.prepare("DROP TABLE enriched_subject_facts").run();
+      this.db.prepare("ALTER TABLE enriched_subject_facts_next RENAME TO enriched_subject_facts").run();
+    });
+  }
+
+  // Mirror of idempotencyViolationsAllowScopes. \b<column> avoids matching
+  // "provider" inside "source_provider" (and vice-versa) — column-scoped.
+  private providerCheckAllows(tableSql: string, column: "provider" | "source_provider", providers: readonly string[]): boolean {
     return providers.every((provider) => {
       const escaped = provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(`provider\\s+IN\\s*\\([^)]*'${escaped}'[^)]*\\)`, "i").test(tableSql);
+      return new RegExp(`\\b${column}\\s+IN\\s*\\([^)]*'${escaped}'[^)]*\\)`, "i").test(tableSql);
     });
   }
 ```
 
-> Note: confirm `PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL` and `PROVIDER_OBSERVATION_PROVIDER_SQL` are in scope where the method is placed (both defined `src/store.ts:188-193`). Recreate the two indexes inline (the `DROP TABLE` drops them).
-
-- [ ] **Step 4: Run — expect PASS** (and confirm the full suite is green — the migration runs on every Store open)
+- [ ] **Step 4: Run — expect PASS** (full suite; both migrations run on every Store open)
 
 Run: `npx vitest run && npx tsc --noEmit`
 Expected: all pass (existing count + the new migration test), tsc exit 0.
@@ -919,8 +1005,8 @@ Expected: all pass (existing count + the new migration test), tsc exit 0.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/types.ts src/store.ts test/types.test.ts test/store.test.ts
-git commit -m "feat(store): add 'llm' provider + provider_observations CHECK-rebuild migration"
+git add src/store.ts test/store.test.ts
+git commit -m "feat(store): migrate provider_observations + enriched_subject_facts CHECKs to admit 'llm'"
 ```
 
 ---
@@ -1014,6 +1100,9 @@ A `scripts/` probe that runs the real enricher against a couple of real domains 
 - [ ] **Step 1: Implement `scripts/enrich-smoke.ts`**
 
 ```typescript
+// Uses enrichWithGate (not raw enrich) so the output mirrors the pipeline's REAL
+// routing decision: low-confidence/null are quarantined, not printed as success.
+import { enrichWithGate } from "../src/pipeline.js";
 import { makeEnricher } from "../src/enrich/index.js";
 
 const domains = process.argv.slice(2);
@@ -1023,19 +1112,16 @@ if (!process.env.ANTHROPIC_API_KEY) { console.error("ANTHROPIC_API_KEY required 
 const enricher = makeEnricher(process.env);
 for (const domain of domains) {
   const deal = { id: `D-${domain}`, company: domain, domain } as any;
-  try {
-    const e = await enricher.enrich(deal);
-    console.log(`${domain}:`, e === null ? "QUARANTINE (null — not grounded)" : JSON.stringify(e));
-  } catch (err) {
-    console.log(`${domain}: ERROR ${(err as Error).message}`);
-  }
+  const r = await enrichWithGate(deal, enricher); // catches provider errors internally
+  if (r.ok) console.log(`${domain}: ROUTE       ${JSON.stringify(r.enrichment)}`);
+  else console.log(`${domain}: QUARANTINE  [${r.code}] ${r.reason}`);
 }
 ```
 
-- [ ] **Step 2: Manual verification** (not in CI; requires a key)
+- [ ] **Step 2: Manual verification** (not in CI; requires a key. `scripts/` runs via `tsx`, **not** `tsc` — it is outside the tsconfig `include`, same as `gen-engagement-sample.ts`.)
 
-Run: `ANTHROPIC_API_KEY=<key> SALES_DB_PATH=/tmp/x npx tsx scripts/enrich-smoke.ts stripe.com somenonexistentco.invalid`
-Expected: a real grounded enrichment for `stripe.com` with a sensible confidence; `QUARANTINE`/low-confidence for the bogus domain. Record the output in the PR description.
+Run: `ANTHROPIC_API_KEY=<key> npx tsx scripts/enrich-smoke.ts stripe.com somenonexistentco.invalid`
+Expected: `stripe.com: ROUTE {...}` with a sensible confidence; `somenonexistentco.invalid: QUARANTINE [enrichment_unresolved] …` (or `insufficient_data` if evidence is thin → confidence below 0.2). Record the output in the PR description.
 
 - [ ] **Step 3: Commit**
 
