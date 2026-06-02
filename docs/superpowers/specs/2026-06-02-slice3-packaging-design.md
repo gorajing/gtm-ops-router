@@ -5,11 +5,12 @@
 ## Goal
 
 Bring the public-facing narrative (`README.md`, `docs/DEMO_SCRIPT.md`,
-`docs/SYSTEM_MAP.md`) current with **Slice 2** (real, grounded LLM enrichment)
-and **Plan B** (the closed engagement-feedback loop), and add a tight
-**reviewer entry-point** — so a hiring reviewer (GTM / forward-deployed
+`docs/SYSTEM_MAP.md`, `ASSUMPTIONS.md`) current with **Slice 2** (real, grounded
+LLM enrichment) and **Plan B** (the closed engagement-feedback loop), and add a
+tight **reviewer entry-point** — so a hiring reviewer (GTM / forward-deployed
 engineer roles at Series A/B AI-native companies) grasps the now-true claim in
-~60 seconds and can verify it. **Docs only — no code changes.**
+~60 seconds and can verify it. **Docs + stale doc-comments only — no code-logic
+changes** (the one `.ts` touch is a doc-comment in `src/enrich/enricher.ts`).
 
 ## Decisions (locked during brainstorming)
 
@@ -27,9 +28,11 @@ engineer roles at Series A/B AI-native companies) grasps the now-true claim in
 
 ## Non-goals (YAGNI)
 
-- No new demo command and no wiring a new "full-loop" runner. Lean on existing
-  runnable artifacts: `npm test`, `npm run demo`, the byte-for-byte sample
-  regeneration, `npm run demo:cross-repo`, and the dashboard (`npm run serve`).
+- No new demo command, no router CLI/API import for engagement feedback, and no
+  wiring a new "full-loop" runner. Lean on existing runnable artifacts:
+  `npm test`, the byte-for-byte sample regeneration (`gen-engagement-sample.ts`
+  + `git diff --exit-code`), `npm run demo -- --demo-engagement` + `npm run
+  serve` (dashboard attribution), and `npm run demo:cross-repo` (forward leg).
 - No committed real-enrichment sample/transcript — the code + smoke command are
   the proof.
 - No restructure of the existing README domain map, `RUNBOOK.md`, or
@@ -56,6 +59,19 @@ engineer roles at Series A/B AI-native companies) grasps the now-true claim in
   enrichment smoke note.
 - **`docs/SYSTEM_MAP.md`** predates the `src/enrich/` module + engagement-feedback
   tables → reflect them and the closed-loop ownership boundary.
+- **`ASSUMPTIONS.md:22`** still states enrichment is a deterministic fixture (not
+  a live provider) → update to "real grounded LLM enrichment (keyed) with a
+  deterministic fixture fallback (keyless)."
+- **`src/enrich/enricher.ts:4,56`** — the moved doc-comments still say the shipped
+  implementation is "only a deterministic fixture" and the production seam is
+  "not shipped." The reviewer entry-point sends people to `src/enrich/`, so this
+  comment **actively contradicts the Slice-2 claim**. Update the comments to
+  reflect that the real `GroundedLlmEnricher` (`src/enrich/grounded-llm.ts`) ships
+  alongside the fixture. **Comment-only — no code logic changes.**
+- **`README.md:14`** domain map says "8 domains" and has no engagement/measurement
+  domain, though the store now owns `engagement_events`, `commercial_signals`,
+  `engagement_feedback_meta`. Since the map is a source-of-truth table, add the
+  measurement/engagement domain (and correct the count).
 
 ## The reviewer entry-point (new README section near the top, ~15–20 lines)
 
@@ -70,16 +86,33 @@ Three parts:
    prompt-injection guardrails, quarantine-on-uncertainty); typed failure
    handling + per-deal idempotency; a byte-for-byte cross-repo contract;
    measurement that gates trust.
-3. **Verify it (the proof menu):**
-   - **Keyless (no setup):** `npm test` (the real count), `npm run demo`
-     (routing + engagement attribution = the measurement spine), the
-     byte-for-byte sample (regenerate → identical to the committed file), the
-     dashboard (`npm run serve`).
+3. **Verify it (the proof menu — every command confirmed accurate, see guardrail):**
+   - **Keyless (no setup):**
+     - `npm test` — the real suite count (structural correctness).
+     - **Closed-loop, byte-for-byte:** `npx tsx scripts/gen-engagement-sample.ts
+       && git diff --exit-code data/engagement-feedback.sample.json` — the
+       committed sample regenerates identically (the test asserts `toEqual`, so
+       cite THIS for true byte-for-byte). The reverse contract holds across repos
+       (the `sales` `export:engagement-feedback` produces these same bytes).
+     - **Measurement / attribution (dashboard, not terminal):** seed engagement
+       then serve — `npm run demo -- --demo-engagement` (or `run … --demo-engagement`)
+       to populate, then `npm run serve` → the **Full-funnel panel** at the
+       dashboard shows attribution. (`npm run demo`'s *terminal* output shows
+       routing/quarantine/metrics, **not** attribution rates — attribution is in
+       `/state` + the dashboard.)
    - **Keyed (live LLM):** `ANTHROPIC_API_KEY=… npx tsx scripts/enrich-smoke.ts
      stripe.com somenonexistentco.invalid` → real grounded enrichment + honest
      quarantine.
    - **Read:** `src/pipeline.ts` (stage order + error boundaries), `src/enrich/`
-     (the real enricher + guardrails).
+     (the real grounded enricher + guardrails).
+
+   **Loop-closure framing (honest):** the forward leg is runnable end-to-end
+   (`npm run demo:cross-repo`: router → handoff → sales). The reverse leg is
+   proven by the **byte-for-byte contract** (sales emits exactly the
+   `sales.engagement-feedback.v1` the router consumes via
+   `Store.importEngagementFeedback`) + the router's `--demo-engagement`
+   attribution — NOT by a single end-to-end command. Do **not** imply
+   `demo:cross-repo` closes the loop, and do not invent a full-loop runner.
 
 ## Accuracy guardrail (non-negotiable)
 
@@ -91,9 +124,13 @@ truth, not guessed.
 
 ## Files
 
-- **gtm-ops-router:** `README.md` (reviewer entry-point + stale fixes),
-  `docs/DEMO_SCRIPT.md` (reverse leg + smoke note), `docs/SYSTEM_MAP.md`
-  (`src/enrich/` module + engagement-feedback tables + closed loop).
+- **gtm-ops-router:** `README.md` (reviewer entry-point + stale fixes: tagline,
+  domain-map path/count + engagement domain, the "future" enricher bullet, the
+  reverse leg), `docs/DEMO_SCRIPT.md` (reverse leg + smoke note),
+  `docs/SYSTEM_MAP.md` (`src/enrich/` module + engagement-feedback tables +
+  closed loop), `ASSUMPTIONS.md` (enrichment now real + fallback),
+  `src/enrich/enricher.ts` (**doc-comment only** — the "fixture-only / not
+  shipped" comment that contradicts Slice 2).
 - **sales:** `README.md` (one reciprocal paragraph — "produces the
   `sales.engagement-feedback.v1` the router consumes").
 
