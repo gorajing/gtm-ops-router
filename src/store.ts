@@ -1737,6 +1737,8 @@ export class Store {
     this.ensureIdempotencyViolationDealId();
     this.ensureIdempotencyViolationScopes();
     this.ensureIdempotencyViolationDedupIndex();
+    this.ensureProviderObservationProviderCheck();
+    this.ensureEnrichedSubjectFactsProviderCheck();
     this.ensurePolicyRecommendationRunStatuses();
     this.backfillExternalNotificationLeases();
     this.backfillDerivedColumns();
@@ -2068,6 +2070,80 @@ export class Store {
       return new RegExp(`scope\\s+IN\\s*\\([^)]*'${escaped}'[^)]*\\)`, "i").test(
         tableSql,
       );
+    });
+  }
+
+  private ensureProviderObservationProviderCheck(): void {
+    const row = this.db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_observations'`)
+      .get() as { sql: string | null } | undefined;
+    if (row?.sql && this.providerCheckAllows(row.sql, "provider", PROVIDER_OBSERVATION_PROVIDERS)) return;
+    this.transaction(() => {
+      this.db.prepare(
+        `CREATE TABLE provider_observations_next (
+           id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_key TEXT NOT NULL,
+           provider TEXT NOT NULL, source_event_id TEXT NOT NULL, source_payload_hash TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, confidence REAL NOT NULL,
+           raw_payload_json TEXT NOT NULL, normalized_payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+           UNIQUE (provider, source_event_id),
+           CHECK (subject_type IN (${PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL})),
+           CHECK (provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+           CHECK (confidence >= 0 AND confidence <= 1)
+         )`,
+      ).run();
+      this.db.prepare(
+        `INSERT INTO provider_observations_next (
+           id, subject_type, subject_key, provider, source_event_id, source_payload_hash,
+           observed_at, expires_at, confidence, raw_payload_json, normalized_payload_json, created_at)
+         SELECT id, subject_type, subject_key, provider, source_event_id, source_payload_hash,
+           observed_at, expires_at, confidence, raw_payload_json, normalized_payload_json, created_at
+         FROM provider_observations`,
+      ).run();
+      this.db.prepare("DROP TABLE provider_observations").run();
+      this.db.prepare("ALTER TABLE provider_observations_next RENAME TO provider_observations").run();
+      this.db.prepare("CREATE INDEX IF NOT EXISTS idx_provider_observations_subject ON provider_observations(subject_type, subject_key, observed_at DESC)").run();
+      this.db.prepare("CREATE INDEX IF NOT EXISTS idx_provider_observations_provider ON provider_observations(provider, observed_at DESC)").run();
+    });
+  }
+
+  private ensureEnrichedSubjectFactsProviderCheck(): void {
+    const row = this.db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='enriched_subject_facts'`)
+      .get() as { sql: string | null } | undefined;
+    if (row?.sql && this.providerCheckAllows(row.sql, "source_provider", PROVIDER_OBSERVATION_PROVIDERS)) return;
+    this.transaction(() => {
+      this.db.prepare(
+        `CREATE TABLE enriched_subject_facts_next (
+           subject_type TEXT NOT NULL, subject_key TEXT NOT NULL, employees INTEGER NOT NULL,
+           industry TEXT NOT NULL, tech_signals_json TEXT NOT NULL, regulated INTEGER NOT NULL,
+           confidence REAL NOT NULL, source_provider TEXT NOT NULL, source_observation_id TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, updated_at TEXT NOT NULL,
+           PRIMARY KEY (subject_type, subject_key),
+           CHECK (subject_type IN (${PROVIDER_OBSERVATION_SUBJECT_TYPE_SQL})),
+           CHECK (source_provider IN (${PROVIDER_OBSERVATION_PROVIDER_SQL})),
+           CHECK (employees >= 0), CHECK (regulated IN (0, 1)),
+           CHECK (confidence >= 0 AND confidence <= 1), CHECK (json_valid(tech_signals_json))
+         )`,
+      ).run();
+      this.db.prepare(
+        `INSERT INTO enriched_subject_facts_next (
+           subject_type, subject_key, employees, industry, tech_signals_json, regulated,
+           confidence, source_provider, source_observation_id, observed_at, expires_at, updated_at)
+         SELECT subject_type, subject_key, employees, industry, tech_signals_json, regulated,
+           confidence, source_provider, source_observation_id, observed_at, expires_at, updated_at
+         FROM enriched_subject_facts`,
+      ).run();
+      this.db.prepare("DROP TABLE enriched_subject_facts").run();
+      this.db.prepare("ALTER TABLE enriched_subject_facts_next RENAME TO enriched_subject_facts").run();
+    });
+  }
+
+  // Mirror of idempotencyViolationsAllowScopes. \b<column> avoids matching
+  // "provider" inside "source_provider" (and vice-versa) — column-scoped.
+  private providerCheckAllows(tableSql: string, column: "provider" | "source_provider", providers: readonly string[]): boolean {
+    return providers.every((provider) => {
+      const escaped = provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${column}\\s+IN\\s*\\([^)]*'${escaped}'[^)]*\\)`, "i").test(tableSql);
     });
   }
 
