@@ -7478,3 +7478,64 @@ describe("store — importEngagementFeedback boundary", () => {
     store.close();
   });
 });
+
+describe("Store provider CHECK migration (provider_observations + enriched_subject_facts)", () => {
+  it("widens both provider CHECKs to admit 'llm' without losing rows; still rejects bogus", () => {
+    const dir = join(tmpdir(), `gtm-router-provider-check-${process.pid}-${Date.now()}`);
+    mkdirSync(dir);
+    const dbPath = join(dir, "router.db");
+    try {
+      const legacy = new DatabaseSync(dbPath);
+      // Legacy provider_observations: provider CHECK lacks 'llm'. (subject_type is
+      // company-only, faithful to the real schema.)
+      legacy.prepare(
+        `CREATE TABLE provider_observations (
+           id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_key TEXT NOT NULL,
+           provider TEXT NOT NULL, source_event_id TEXT NOT NULL, source_payload_hash TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, confidence REAL NOT NULL,
+           raw_payload_json TEXT NOT NULL, normalized_payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+           UNIQUE (provider, source_event_id),
+           CHECK (subject_type IN ('company')),
+           CHECK (provider IN ('fixture','manual','website','hubspot','apollo','clearbit','clay','warehouse','csv','agent')),
+           CHECK (confidence >= 0 AND confidence <= 1)
+         )`,
+      ).run();
+      legacy.prepare(
+        `INSERT INTO provider_observations VALUES ('PO-legacy','company','acme.example','fixture','evt-legacy','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`,
+      ).run();
+      // Legacy enriched_subject_facts: source_provider CHECK lacks 'llm'.
+      legacy.prepare(
+        `CREATE TABLE enriched_subject_facts (
+           subject_type TEXT NOT NULL, subject_key TEXT NOT NULL, employees INTEGER NOT NULL,
+           industry TEXT NOT NULL, tech_signals_json TEXT NOT NULL, regulated INTEGER NOT NULL,
+           confidence REAL NOT NULL, source_provider TEXT NOT NULL, source_observation_id TEXT NOT NULL,
+           observed_at TEXT NOT NULL, expires_at TEXT, updated_at TEXT NOT NULL,
+           PRIMARY KEY (subject_type, subject_key),
+           CHECK (subject_type IN ('company')),
+           CHECK (source_provider IN ('fixture','manual','website','hubspot','apollo','clearbit','clay','warehouse','csv','agent')),
+           CHECK (employees >= 0), CHECK (regulated IN (0,1)),
+           CHECK (confidence >= 0 AND confidence <= 1), CHECK (json_valid(tech_signals_json))
+         )`,
+      ).run();
+      legacy.prepare(
+        `INSERT INTO enriched_subject_facts VALUES ('company','acme.example',100,'logistics','[]',0,0.9,'fixture','PO-legacy','2026-05-21T12:00:00.000Z',NULL,'2026-05-21T12:00:00.000Z')`,
+      ).run();
+      legacy.close();
+
+      new Store(dbPath).close(); // migrates BOTH tables
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        for (const table of ["provider_observations", "enriched_subject_facts"]) {
+          const sql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}'`).get() as { sql: string }).sql;
+          expect(sql).toContain("'llm'");
+        }
+        expect((db.prepare(`SELECT provider FROM provider_observations WHERE id='PO-legacy'`).get() as { provider: string }).provider).toBe("fixture");
+        expect((db.prepare(`SELECT source_provider FROM enriched_subject_facts WHERE subject_key='acme.example'`).get() as { source_provider: string }).source_provider).toBe("fixture");
+        db.prepare(`INSERT INTO provider_observations VALUES ('PO-llm','company','x.example','llm','evt-llm','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run();
+        db.prepare(`INSERT INTO enriched_subject_facts VALUES ('company','x.example',5,'logistics','[]',0,0.9,'llm','PO-llm','2026-05-21T12:00:00.000Z',NULL,'2026-05-21T12:00:00.000Z')`).run();
+        expect(() => db.prepare(`INSERT INTO provider_observations VALUES ('PO-x','company','y.example','bogus','evt-x','h','2026-05-21T12:00:00.000Z',NULL,0.9,'{}','{}','2026-05-21T12:00:00.000Z')`).run()).toThrow();
+      } finally { db.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

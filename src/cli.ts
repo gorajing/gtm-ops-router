@@ -28,7 +28,7 @@ import {
   demoEngagementSourceEventIds,
   type DemoEngagementResult,
 } from "./demo-engagement-fixtures.js";
-import { FixtureEnricher, type FixtureEntry } from "./enrich.js";
+import { FixtureEnricher, makeEnricher, type FixtureEntry } from "./enrich.js";
 import {
   type IntegrationBuild,
   type IntegrationConfigBundle,
@@ -406,7 +406,7 @@ async function cmdRun(file: string | undefined, args: string[]): Promise<void> {
   }
   const Store = await loadStore();
   const store = new Store(routerDbPath());
-  const enricher = new FixtureEnricher(loadFixture());
+  const enricher = makeEnricher(process.env);
   const { opts, configBundle } = pipelineOptions(args);
   const skipsDemoOutcomes = args.includes("--no-demo-outcomes");
   const wantsDemoOutcomes =
@@ -501,7 +501,7 @@ async function cmdServe(portArg: string | undefined, args: string[]): Promise<vo
   }
   const Store = await loadStore();
   const store = new Store(routerDbPath());
-  const enricher = new FixtureEnricher(loadFixture());
+  const enricher = makeEnricher(process.env);
   const mode = integrationMode(args);
   const {
     label,

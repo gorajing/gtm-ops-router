@@ -140,6 +140,7 @@ describe("enrichment evidence vocabulary", () => {
       "warehouse",
       "csv",
       "agent",
+      "llm",
     ]);
     expect(ProviderObservationSubjectType.safeParse("contact").success).toBe(false);
     expect(ProviderObservationProvider.safeParse("linkedin").success).toBe(false);
