@@ -661,6 +661,7 @@ export const PROVIDER_OBSERVATION_PROVIDERS = [
   "warehouse",
   "csv",
   "agent",
+  "llm",
 ] as const;
 export const ProviderObservationProvider = z.enum(
   PROVIDER_OBSERVATION_PROVIDERS,
