@@ -82,6 +82,7 @@ describe("isPublicUnicastIp", () => {
   const blockedV6 = [
     "::", "::1", "fc00::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:7f00:1",
     "2001:db8::1", "2002::1", "::a9fe:1", // 2001:db8::/32, 2002::/16, IPv4-compatible 169.254.0.1
+    "2001::1", "64:ff9b::1", "100::1", "4000::1", "5f00::1", "3fff::1", // 2001::/23, NAT64, discard, unassigned, docs
   ];
   const publicV6 = ["2606:4700:4700::1111"];
 
@@ -174,11 +175,15 @@ function isPublicV6(ip: string): boolean {
   if (!(h[0] | h[1] | h[2] | h[3] | h[4] | h[5]) && (h[6] | h[7])) {
     return isPublicV4(`${(h[6] >> 8) & 255}.${h[6] & 255}.${(h[7] >> 8) & 255}.${h[7] & 255}`);
   }
-  if (h[0] === 0x2001 && h[1] === 0x0db8) return false; // 2001:db8::/32 documentation
-  if (h[0] === 0x2002) return false; // 2002::/16 6to4 (may embed private v4)
-  if ((h[0] & 0xfe00) === 0xfc00) return false; // fc00::/7
-  if ((h[0] & 0xffc0) === 0xfe80) return false; // fe80::/10
-  if ((h[0] & 0xff00) === 0xff00) return false; // ff00::/8
+  // Allow ONLY global unicast 2000::/3 (an allowlist, not a denylist). This
+  // rejects ULA fc00::/7, link-local fe80::/10, multicast ff00::/8, discard
+  // 100::/64, NAT64 64:ff9b::/96, and all unassigned space (4000::/3 and up) at once.
+  if (h[0] < 0x2000 || h[0] > 0x3fff) return false;
+  // Carve out special-purpose ranges that live INSIDE 2000::/3:
+  if (h[0] === 0x2001 && h[1] < 0x0200) return false;        // 2001::/23 IETF protocol (teredo/benchmark/orchid)
+  if (h[0] === 0x2001 && h[1] === 0x0db8) return false;       // 2001:db8::/32 documentation
+  if (h[0] === 0x2002) return false;                          // 2002::/16 6to4 (may embed private v4)
+  if (h[0] === 0x3fff && (h[1] & 0xf000) === 0) return false; // 3fff::/20 documentation
   return true;
 }
 export function isPublicUnicastIp(ip: string): boolean {
@@ -755,7 +760,7 @@ const FieldStr = z.object({ value: z.string().nullable(), basis: z.enum(["eviden
 const FieldBool = z.object({ value: z.boolean().nullable(), basis: z.enum(["evidence", "inference", "unknown"]) });
 const FirmographicsSchema = z.object({
   employees: FieldNum, industry: FieldStr, regulated: FieldBool,
-  techSignals: z.array(z.string().min(1)), selfConfidence: z.number(),
+  techSignals: z.array(z.string().trim().min(1)), selfConfidence: z.number(),
 });
 const TOOL_NAME = "firmographics";
 const TOOL_SCHEMA = {
