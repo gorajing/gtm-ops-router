@@ -26,7 +26,17 @@ export function evidenceCeiling(c: Coverage): number {
 /** Clamp the model to the code ceiling and enforce routing-critical completeness.
  *  Returns null (→ quarantine) when employees/industry/regulated can't be grounded. */
 export function resolveEnrichment(f: LlmFirmographics, c: Coverage): Enrichment | null {
-  if (f.employees.basis === "unknown" || f.employees.value === null) return null;
+  // employees must be a PLAUSIBLE positive integer — reject 0 / negative /
+  // fractional / NaN / Infinity rather than route on a placeholder headcount.
+  // (Self-sufficient: does not rely on the caller's zod schema upstream.)
+  if (
+    f.employees.basis === "unknown" ||
+    f.employees.value === null ||
+    !Number.isInteger(f.employees.value) ||
+    f.employees.value < 1
+  ) {
+    return null;
+  }
   if (f.industry.basis === "unknown" || f.industry.value === null || f.industry.value.trim() === "") return null;
   if (f.regulated.basis === "unknown" || f.regulated.value === null) return null;
   const self = Number.isFinite(f.selfConfidence) ? Math.max(0, Math.min(1, f.selfConfidence)) : 0;

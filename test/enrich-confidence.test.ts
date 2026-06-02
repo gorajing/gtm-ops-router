@@ -39,4 +39,9 @@ describe("resolveEnrichment", () => {
   it("allows empty techSignals (not routing-critical)", () => {
     expect(resolveEnrichment({ ...full, techSignals: [] }, cov())).not.toBeNull();
   });
+  it("returns null on an implausible employee count (0 / negative / non-finite / fractional)", () => {
+    for (const value of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, 12.5]) {
+      expect(resolveEnrichment({ ...full, employees: { value, basis: "evidence" } }, cov())).toBeNull();
+    }
+  });
 });
