@@ -19,6 +19,10 @@ describe("fetchHomepageRaw", () => {
     expect(raw).toBeNull();
     expect(called).toBe(false);
   });
+  it("returns null on a non-2xx final response (e.g. a 3xx safeFetch did not follow)", async () => {
+    const raw = await fetchHomepageRaw("acme.example", async () => ({ status: 304, contentType: "text/html", headers: "", text: "" }));
+    expect(raw).toBeNull();
+  });
 });
 
 describe("parseHomepage", () => {

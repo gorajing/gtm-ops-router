@@ -2,6 +2,8 @@ import dns from "node:dns";
 import net from "node:net";
 import { safeFetch, type SafeFetchResult } from "./safe-fetch.js";
 
+// Injection seam for tests ONLY. Production callers (defaultCollectors) use the
+// SSRF-safe default; never pass a non-safe fetcher from production code.
 export type Fetcher = (url: string) => Promise<SafeFetchResult>;
 const defaultFetcher: Fetcher = (url) => safeFetch(url);
 
@@ -34,7 +36,8 @@ export async function fetchHomepageRaw(domain: string | undefined, fetcher: Fetc
   if (!isFetchableHostname(domain)) return null;
   try {
     const res = await fetcher(`https://${domain}`);
-    if (res.status >= 400 || !/text\/html|text\//i.test(res.contentType)) return null;
+    // 2xx only — a final non-2xx (incl. a 3xx safeFetch did not follow) is not a usable homepage.
+    if (res.status < 200 || res.status >= 300 || !/text\/html|text\//i.test(res.contentType)) return null;
     return res;
   } catch {
     return null;
