@@ -13,7 +13,9 @@ if (domains.length === 0) {
   console.error("usage: ANTHROPIC_API_KEY=... tsx scripts/enrich-smoke.ts <domain> [domain...]");
   process.exit(2);
 }
-if (!process.env.ANTHROPIC_API_KEY) {
+// Match makeEnricher's condition exactly — a whitespace-only key would otherwise
+// pass this guard but fall back to the fixture enricher, silently running non-live.
+if (!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY.trim() === "") {
   console.error("ANTHROPIC_API_KEY required for live smoke (without it makeEnricher returns the fixture enricher)");
   process.exit(2);
 }
