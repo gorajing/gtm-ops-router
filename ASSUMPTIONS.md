@@ -9,6 +9,11 @@ reverse-engineer the boundary.
 - The pipeline, typed domain model, failure taxonomy, idempotency, retry/
   backoff classification, persistence, metrics, audit, and tests are real and
   run. The numbers in the README are asserted in the test suite.
+- **Enrichment is real**: a grounded LLM enricher (Claude) infers firmographics
+  from collected public evidence (homepage + DNS + tech signals), with a
+  code-owned confidence ceiling, SSRF-safe fetching, prompt-injection isolation,
+  and quarantine-on-uncertainty. It runs when `ANTHROPIC_API_KEY` is set;
+  `src/enrich/` + `scripts/enrich-smoke.ts`.
 - SQLite persistence is real SQL via Node's built-in `node:sqlite`.
 - The Python audit (`ops_audit.py`) reads the same database and is a genuine
   SLO gate (non-zero exit on breach) — wire it to cron/CI as-is.
@@ -19,10 +24,12 @@ reverse-engineer the boundary.
 
 ## Stubbed (deliberately, and visibly)
 
-- **Enrichment** is a deterministic fixture (`data/enrichment.fixture.json`),
-  not a live provider. The `Enricher` interface is the seam; an Apollo/
-  warehouse adapter drops in without touching the pipeline. Unknown company →
-  quarantined, never guessed — that behavior is real, the data source is not.
+- **The keyless enrichment default is a deterministic fixture**
+  (`data/enrichment.fixture.json`) — so the demo is reproducible with no API key.
+  With `ANTHROPIC_API_KEY` set, the real grounded LLM enricher (above) runs
+  instead, behind the same `Enricher` seam; a vendor adapter (Apollo/warehouse)
+  is a further drop-in. Unknown company → quarantined, never guessed — that
+  behavior is real in both modes.
 - **The downstream write (sink)** defaults to `LoggingSink` and dry-run: it
   logs the intended CRM upsert and writes nothing external. `--integrations`
   swaps in the HubSpot + Slack sink in dry-run mode, so the cross-system
