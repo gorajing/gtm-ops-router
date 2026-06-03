@@ -3,8 +3,9 @@
 Two repos, one explicit seam:
 
 ```text
-inbound deal -> route/work item -> sales handoff JSON -> evidence research -> drafted outreach -> critic review
-        gtm-ops-router                         gorajing/sales
+inbound deal -> route/work item -> sales handoff JSON ─────► evidence research -> drafted outreach -> critic review
+        gtm-ops-router                                              gorajing/sales
+       measurement  ◄──────────────  sales.engagement-feedback.v1  ◄──────────  observed engagement
 ```
 
 `gtm-ops-router` is the GTM operating ledger. It decides what work should
@@ -23,12 +24,14 @@ invariants.
 | Concern | Owner | Source of truth |
 |---|---|---|
 | Deal intake, validation, quarantine | `gtm-ops-router` | `deals`, `events` |
-| Enrichment observations and projected facts | `gtm-ops-router` | `provider_observations`, `enriched_subject_facts` |
+| Enrichment observations and projected facts (real grounded LLM; fixture fallback) | `gtm-ops-router` | `provider_observations`, `enriched_subject_facts` |
 | Score, route, owner, finance/legal flags | `gtm-ops-router` | routed deal projection |
 | HubSpot/Slack receipts and retry history | `gtm-ops-router` | `external_event_keys`, `external_event_observations` |
 | Commercial lifecycle and deployment readiness | `gtm-ops-router` | `commercial_states`, `deployment_*`, `outcome_*` |
 | Role queues, work items, agent suggestions | `gtm-ops-router` | `work_items`, `work_item_events`, `agent_suggestions` |
 | Cross-repo seed payload | `gtm-ops-router` | `gtm-ops-router.sales-handoff.v1` export |
+| Engagement feedback + attribution (closed loop) | `gtm-ops-router` | `engagement_events`, `commercial_signals`, `engagement_feedback_meta` |
+| Engagement-feedback producer | `gorajing/sales` | `sales.engagement-feedback.v1` export (frozen `gen:engagement-sample` = byte-for-byte) |
 | Imported GTM context on an account | `gorajing/sales` | `gtm_handoff_imports` |
 | Public evidence capture and audit | `gorajing/sales` | `evidence`, `extraction_audits` |
 | Drafts, cited claims, critics, revisions | `gorajing/sales` | sequences, touches, revisions, critiques |
@@ -54,7 +57,7 @@ cd /path/to/gtm-ops-router
 npm run demo:cross-repo
 ```
 
-That command proves the full local seam:
+That command proves the **forward** seam (router → Sales handoff → Sales import):
 
 - Router produces a persistent operating ledger with dry-run HubSpot/Slack
   receipts and demo lifecycle outcomes in an isolated ignored SQLite file.
@@ -63,6 +66,11 @@ That command proves the full local seam:
 - Sales runs committed migrations against an isolated ignored SQLite file and
   imports that handoff idempotently.
 - The script prints Sales account URLs with account name and router deal id.
+
+The **reverse** leg (Sales engagement → router measurement) is not exercised by
+this forward demo; it is proven as a byte-for-byte contract — regenerate the
+committed sample with `npx tsx scripts/gen-engagement-sample.ts && git diff
+--exit-code data/engagement-feedback.sample.json`.
 
 Set `SALES_REPO=/absolute/path/to/Sales` if the Sales repo is not a sibling of
 this repo.

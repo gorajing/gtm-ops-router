@@ -2,16 +2,63 @@
 
 **A working GTM ops control plane for AI-native revenue teams.**
 
-Inbound deal → enrich → score → route across **sales / finance / legal**, with
-typed failure handling, idempotent persistence, and live observability. No
-mock-ups. It runs.
+Inbound deal → **real grounded LLM enrichment** (keyless fixture fallback) → score
+→ route across **sales / finance / legal** → sales handoff → **engagement feedback
+→ measurement**. Typed failure handling, idempotent persistence, a byte-for-byte
+cross-repo contract, and live observability. No mock-ups. It runs, and the loop closes.
+
+---
+
+## The closed loop (and how to verify it in ~5 minutes)
+
+A GTM loop that **closes** — what the router routes, it later **measures**:
+
+> inbound deal → **real, grounded LLM enrichment** → score → route (sales / finance / legal) → sales handoff → **sales engagement feedback → router measurement**
+
+The router decides what revenue work should happen and records why; the companion
+[`gorajing/sales`](https://github.com/gorajing/sales) repo turns the right accounts
+into evidence-grounded outreach and feeds observed engagement back. The **forward
+leg** (router → enrich → route → handoff → Sales import) runs end-to-end as a demo;
+the **reverse leg** (Sales engagement → router measurement) is a **proven
+byte-for-byte contract**, not a single end-to-end command (verify both below).
+
+**What's hard here (the judgment, not just the code):**
+
+- **Honest enrichment.** Firmographics are inferred by an LLM (Claude) grounded in
+  collected public evidence (homepage + DNS + tech signals), with a **code-owned
+  confidence ceiling the model cannot inflate**, SSRF-safe fetching,
+  prompt-injection isolation, and **quarantine-on-uncertainty** — an unknown
+  company is never guessed. Keyless, a deterministic fixture is the default.
+- **Typed failure handling + per-deal idempotency**, end to end.
+- **A byte-for-byte cross-repo contract** — `sales` emits exactly the
+  engagement-feedback bytes the router consumes.
+- **Measurement that gates trust** — attribution, coverage, honest (nullable) rates.
+
+**Verify it (no setup, no key):**
+
+- `npm test` — the full suite, every failure mode asserted.
+- **Closed loop, byte-for-byte:**
+  `npx tsx scripts/gen-engagement-sample.ts && git diff --exit-code data/engagement-feedback.sample.json`
+  — the committed engagement sample regenerates identically (the `sales` repo's
+  frozen `gen:engagement-sample` reproduces these same bytes).
+- **Measurement dashboard:**
+  `npm run run -- data/inbound.seed.jsonl --demo-engagement`, then `npm run serve`
+  → the **Full-funnel panel** at `http://localhost:8787` shows engagement attribution.
+
+**Verify the live enricher (your own API key):**
+
+- `ANTHROPIC_API_KEY=… npx tsx scripts/enrich-smoke.ts stripe.com somenonexistentco.invalid`
+  → real grounded firmographics + an honest quarantine for the unresolvable one.
+
+**Read:** [`src/pipeline.ts`](src/pipeline.ts) (stage order + error boundaries) and
+[`src/enrich/`](src/enrich/) (the grounded enricher + its guardrails).
 
 ---
 
 ## Read this first (the 60-second map)
 
 Start in [`src/pipeline.ts`](src/pipeline.ts) — the stage order and error
-boundaries are the core. Everything else is one of 8 domains; each owns a few
+boundaries are the core. Everything else is one of 9 domains; each owns a few
 tables and a few modules:
 
 | # | Domain | Start in | Tables |
@@ -21,15 +68,17 @@ tables and a few modules:
 | 3 | Commercial lifecycle | `store.ts` (commercial-state fns) | `commercial_states` |
 | 4 | Deployment readiness | `store.ts` (readiness fns) | `deployment_facts`, `deployment_facts_rejections`, `deployment_readiness` |
 | 5 | Post-sale outcome loop | `store.ts` (outcome fns) · `ops_audit.py` | `outcome_events`, `outcome_rejections` |
-| 6 | Enrichment evidence | `enrich.ts` · `store.ts` | `provider_observations`, `enriched_subject_facts` |
+| 6 | Enrichment (real, grounded LLM; fixture fallback) | `src/enrich/` · `store.ts` | `provider_observations`, `enriched_subject_facts` |
 | 7 | Agent governance (draft, human-decides) | `store.ts` · `demo-fixtures.ts` | `agent_suggestions`, `policy_recommendation_runs` |
 | 8 | Operator workflow + console | `server.ts` | `work_items`, `work_item_events` |
+| 9 | Engagement feedback + measurement (closed loop) | `engagement.ts` · `store.ts` · `attribution.ts` | `engagement_events`, `commercial_signals`, `engagement_feedback_meta` |
 | — | Integrity / audit (cross-cutting) | `store.ts` · `ops_audit.py` | `integration_config`, `idempotency_violations` |
 
-The cross-repo handoff (`src/sales-handoff.ts` → JSON) feeds the companion
-Sales repo. See **[docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)** for the ownership
-boundary and **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** for the end-to-end
-demo.
+The cross-repo handoff (`src/sales-handoff.ts` → JSON) feeds the companion Sales
+repo; the Sales repo feeds **engagement** back as `sales.engagement-feedback.v1`,
+which the router imports for measurement — so the loop closes. See
+**[docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)** for the ownership boundary and
+**[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** for the end-to-end demo.
 
 ## Why this exists
 
@@ -74,6 +123,14 @@ Run the full cross-repo demo with `npm run demo:cross-repo`, or follow
 export lives at `data/sales-handoff.sample.json`, so the Sales side can be
 demoed without setting up the router first.
 
+The loop is bidirectional. The Sales repo also **produces** observed engagement as
+a versioned `sales.engagement-feedback.v1` payload that the router imports
+(`Store.importEngagementFeedback`) to compute attribution and coverage. The reverse
+contract is proven **byte-for-byte**: the Sales repo's frozen `gen:engagement-sample`
+reproduces the router's committed `data/engagement-feedback.sample.json` exactly.
+(This is a forward + reverse *contract*, not a single end-to-end runner — see
+[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md).)
+
 ---
 
 ## Run it (about 60 seconds)
@@ -85,8 +142,8 @@ universal; claiming honest about its floor.
 
 ```bash
 npm install
-npm run demo            # deterministic batch + post-sale outcomes — no API keys, no ports
-npm run demo -- --no-demo-outcomes # intake→route only, no in-memory outcome fixtures
+npm run demo            # deterministic batch + post-sale outcomes + engagement — no API keys, no ports
+npm run demo -- --no-demo-outcomes --no-demo-engagement # intake→route only, no outcome/engagement fixture overlays
 npm run demo -- --integrations # same run, HubSpot + Slack dry-run receipts
 npm run demo -- --flaky # same data, live sink faults: retry-then-succeed + a terminal reject
 npm run doctor          # live HubSpot/Slack setup check; no secrets printed
@@ -95,7 +152,7 @@ npm run export:sales -- --out data/sales-handoff.json # JSON handoff seed for go
 npm test                # TypeScript suite, incl. every failure mode
 
 # Dashboard proof surface:
-npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes  # seed SQLite with receipts + post-sale outcomes
+npm run run -- data/inbound.seed.jsonl --integrations --demo-outcomes --demo-engagement  # seed receipts + post-sale outcomes + engagement (Full-funnel panel)
 npm run serve -- --integrations                       # open http://localhost:8787
 
 # Python side (stdlib only):
@@ -308,10 +365,11 @@ That boundary is a deliberate design output, not a missing feature.
 
 ## What I'd build next (ownership beyond the demo)
 
-- Live `Enricher` adapter (Apollo/Clearbit/internal warehouse) behind the
-  existing seam + a circuit breaker; dead-letter requeue after upstream
-  recovery. (Retry/backoff, terminal-vs-retryable, dry-run, and the SLO gate
-  are already built — see `sink.ts`, `integrations.ts`, and `ops_audit.py`.)
+- A vendor `Enricher` adapter (Apollo/Clearbit/internal warehouse) behind the
+  existing seam — a drop-in next to the **already-shipped grounded LLM enricher**
+  (`src/enrich/`), plus a circuit breaker and dead-letter requeue after upstream
+  recovery. (Retry/backoff, terminal-vs-retryable, dry-run, and the SLO gate are
+  already built — see `sink.ts`, `integrations.ts`, and `ops_audit.py`.)
 - Auth on `POST /deals`; structured log shipping; alerting wired to the
   existing audit gate.
 - **The self-improving loop:** the dashboard now scores routing decisions
@@ -347,9 +405,11 @@ inbound ─► intake ─► enrich ─► score ─► route ─► sink ──
 data/router.db ─► ops_audit.py   (Python: invariant + SLO gate, exit 1 on breach)
 ```
 
-Each stage is single-purpose and swappable; the pipeline doesn't change when
-an enricher or sink does. Read `pipeline.ts` first (~430 lines) — the stage
-order and error boundaries are the interesting part. The pipeline stages stay
+Each stage is single-purpose and swappable; the pipeline doesn't change when an
+enricher or sink does — the enrichment seam now ships a **real grounded LLM
+enricher** (`src/enrich/`, keyless fixture fallback) behind the same interface.
+Read `pipeline.ts` first (~430 lines) — the stage order and error boundaries are
+the interesting part. The pipeline stages stay
 small; the line count concentrates in `store.ts` (the single SQLite
 data-access layer — one cohesive class, signposted by domain) and
 `integrations.ts` (HubSpot + Slack adapters with retry/backoff).
