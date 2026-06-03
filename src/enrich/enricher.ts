@@ -1,10 +1,10 @@
 /**
  * Stage 2 — Enrich. Pluggable by design.
  *
- * The `Enricher` interface is the seam where a real provider (Apollo,
- * Clearbit, an internal data warehouse) drops in. The shipped implementation
- * is a deterministic fixture so the demo is reproducible and needs no API
- * keys — but the seam proves the system is API-ready, not a toy.
+ * The `Enricher` interface is the seam. This file holds the interface and the
+ * keyless `FixtureEnricher` (deterministic, no API keys). The real, grounded LLM
+ * enricher ships in `grounded-llm.ts` and is selected by `makeEnricher()` when
+ * `ANTHROPIC_API_KEY` is set — the seam is live, not aspirational.
  *
  * Critical failure-mode decision: an unknown company returns `null`. We do
  * NOT fabricate firmographics. A guessed enrichment is worse than a known
@@ -54,7 +54,9 @@ export class FixtureEnricher implements Enricher {
 }
 
 /*
- * Production seam (not shipped — no secrets in a public artifact):
+ * The production seam is SHIPPED: `GroundedLlmEnricher` (`grounded-llm.ts`) is a
+ * real provider over the Anthropic API, keyed via ANTHROPIC_API_KEY. A vendor
+ * adapter remains a drop-in behind the same interface — e.g.:
  *
  *   export class ApolloEnricher implements Enricher {
  *     readonly name = "apollo";
