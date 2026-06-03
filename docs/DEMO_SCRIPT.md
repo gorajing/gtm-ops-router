@@ -111,6 +111,35 @@ be cited; the validator rejects any claim that isn't a verbatim substring of a
 snippet. This is the line the system enforces — router context never launders
 itself into a cited fact.
 
+### 5. The loop closes (reverse leg) + real enrichment
+
+The forward leg above is runnable end to end. The **reverse leg** — Sales's
+observed engagement flowing back to router measurement — is proven by **contract**,
+not a single command (the router consumes engagement feedback via
+`Store.importEngagementFeedback`; there is no end-to-end CLI runner):
+
+```bash
+# Router: byte-for-byte reverse contract — regenerate the committed sample, expect no diff
+npx tsx scripts/gen-engagement-sample.ts && git diff --exit-code data/engagement-feedback.sample.json
+
+# Sales: the frozen producer reproduces those SAME bytes (live `export:engagement-feedback`
+# stamps a real generatedAt, so it is the live path, not the byte-identical one)
+cd ../Sales && pnpm gen:engagement-sample && git diff --exit-code data/engagement-feedback.sample.json
+
+# Router: see the measurement consuming engagement — attribution in the dashboard
+cd ../gtm-ops-router
+npm run run -- data/inbound.seed.jsonl --demo-engagement   # persistent DB; `demo` is in-memory
+npm run serve                                              # http://localhost:8787 → Full-funnel panel
+```
+
+**Real enrichment (your own key).** Keyless, enrichment is the deterministic
+fixture (so this demo needs no setup). With a key, the real grounded LLM enricher
+runs:
+
+```bash
+ANTHROPIC_API_KEY=… npx tsx scripts/enrich-smoke.ts stripe.com somenonexistentco.invalid
+```
+
 ## The one sentence
 
 > Two repos, one explicit seam: the router decides what work happens; Sales
