@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>01-open</title>
+    <style>
+    :root {
+      --paper: #f7f3ea;
+      --paper-2: #eceff1;
+      --ink: #151719;
+      --muted: #59636f;
+      --hair: #ced4da;
+      --teal: #0b7773;
+      --blue: #315aa8;
+      --amber: #b86d16;
+      --red: #a9363f;
+      --green: #347c52;
+      --violet: #6852a3;
+      --white: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 1280px; height: 720px; overflow: hidden; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--paper);
+      color: var(--ink);
+      letter-spacing: 0;
+    }
+    .stage {
+      position: relative;
+      width: 1280px;
+      height: 720px;
+      padding: 46px 56px;
+      overflow: hidden;
+      background:
+        linear-gradient(90deg, rgba(21,23,25,0.045) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(21,23,25,0.04) 1px, transparent 1px),
+        var(--paper);
+      background-size: 64px 64px;
+    }
+    .stage::after {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      border: 1px solid rgba(21,23,25,0.18);
+      pointer-events: none;
+    }
+    h1, h2, p { margin: 0; }
+    h1 {
+      max-width: 760px;
+      font-size: 70px;
+      line-height: 0.94;
+      font-weight: 850;
+    }
+    h2 {
+      max-width: 760px;
+      font-size: 48px;
+      line-height: 1;
+      font-weight: 820;
+    }
+    .sub {
+      max-width: 650px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 21px;
+      line-height: 1.36;
+      font-weight: 520;
+    }
+    .topline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+      font-size: 13px;
+      font-weight: 760;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 5px 9px;
+      border: 1px solid var(--ink);
+      border-radius: 6px;
+      background: var(--white);
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 780;
+      white-space: nowrap;
+    }
+    .pill.teal { border-color: var(--teal); color: var(--teal); }
+    .pill.blue { border-color: var(--blue); color: var(--blue); }
+    .pill.amber { border-color: var(--amber); color: var(--amber); }
+    .pill.red { border-color: var(--red); color: var(--red); }
+    .pill.green { border-color: var(--green); color: var(--green); }
+    .card {
+      border: 1px solid var(--hair);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.86);
+      box-shadow: 0 16px 30px rgba(21,23,25,0.08);
+    }
+    .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      letter-spacing: 0;
+    }
+    .caption {
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .fade-up { opacity: 0; transform: translateY(18px); animation: fadeUp 680ms ease forwards; }
+    .fade-left { opacity: 0; transform: translateX(24px); animation: fadeLeft 720ms ease forwards; }
+    .scale-in { opacity: 0; transform: scale(0.96); animation: scaleIn 660ms ease forwards; }
+    .d1 { animation-delay: 160ms; }
+    .d2 { animation-delay: 360ms; }
+    .d3 { animation-delay: 620ms; }
+    .d4 { animation-delay: 860ms; }
+    .d5 { animation-delay: 1120ms; }
+    .d6 { animation-delay: 1380ms; }
+    @keyframes fadeUp { to { opacity: 1; transform: translateY(0); } }
+    @keyframes fadeLeft { to { opacity: 1; transform: translateX(0); } }
+    @keyframes scaleIn { to { opacity: 1; transform: scale(1); } }
+    @keyframes drawLine { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+    @keyframes pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+    @keyframes driftPacket {
+      0% { offset-distance: 0%; opacity: 0; }
+      8% { opacity: 1; }
+      86% { opacity: 1; }
+      100% { offset-distance: 100%; opacity: 0; }
+    }
+    @keyframes scanDown {
+      0% { transform: translateY(-20px); opacity: 0; }
+      20%, 70% { opacity: 1; }
+      100% { transform: translateY(330px); opacity: 0; }
+    }
+    @keyframes dashboardPan {
+      0%, 18% { transform: translateY(0); }
+      70%, 100% { transform: translateY(-1120px); }
+    }
+    @keyframes blink { 0%, 48% { opacity: 1; } 49%, 100% { opacity: 0.15; } }
+  </style>
+  </head>
+  <body>
+    <section class="stage scene-open">
+      <div class="topline fade-up">
+        <span class="pill teal">gorajing/gtm-ops-router</span>
+        <span>control plane for AI-native revenue teams</span>
+      </div>
+      <h1 class="fade-up d1">Inbound demand, routed with receipts.</h1>
+      <p class="sub fade-up d2">Every deal becomes accountable work or a visible exception. No guessed enrichment. No silent drops.</p>
+
+      <div class="router-map scale-in d3">
+        <div class="lane-label inbound-label">inbound</div>
+        <div class="lane-label router-label">router ledger</div>
+        <div class="lane-label queue-label">work queues</div>
+        <div class="inbound-stack">
+          <div class="deal-card">Ryder Digital <b>$120K</b></div>
+          <div class="deal-card">Cargo Loop <b>$60K</b></div>
+          <div class="deal-card muted-card">Mystery Logistics <b>?</b></div>
+        </div>
+        <div class="router-core">
+          <div class="core-ring"></div>
+          <div class="core-title">route()</div>
+          <div class="core-sub">score + policy + receipts</div>
+        </div>
+        <div class="queue-stack">
+          <div class="queue-card sales">Sales owner</div>
+          <div class="queue-card finance">Finance flag</div>
+          <div class="queue-card legal">Legal review</div>
+          <div class="queue-card audit">Audit trail</div>
+        </div>
+        <div class="path path-a"></div>
+        <div class="path path-b"></div>
+        <div class="packet packet-a"></div>
+        <div class="packet packet-b"></div>
+      </div>
+
+      <style>
+        .scene-open h1 { width: 720px; }
+        .router-map {
+          position: absolute;
+          right: 56px;
+          bottom: 50px;
+          width: 575px;
+          height: 420px;
+        }
+        .lane-label {
+          position: absolute;
+          top: 0;
+          font-size: 13px;
+          font-weight: 850;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+        .inbound-label { left: 18px; }
+        .router-label { left: 226px; }
+        .queue-label { right: 72px; }
+        .inbound-stack { position: absolute; left: 0; top: 48px; display: grid; gap: 12px; width: 175px; }
+        .deal-card {
+          min-height: 78px;
+          padding: 16px;
+          border: 1px solid var(--hair);
+          border-left: 5px solid var(--blue);
+          border-radius: 8px;
+          background: var(--white);
+          font-size: 18px;
+          font-weight: 800;
+          box-shadow: 0 14px 26px rgba(21,23,25,0.08);
+        }
+        .deal-card b { display: block; margin-top: 8px; font-size: 15px; color: var(--muted); }
+        .muted-card { border-left-color: var(--red); color: var(--muted); }
+        .router-core {
+          position: absolute;
+          left: 225px;
+          top: 108px;
+          width: 150px;
+          height: 150px;
+          display: grid;
+          place-items: center;
+          text-align: center;
+          border: 2px solid var(--ink);
+          border-radius: 8px;
+          background: #fff8e8;
+          z-index: 2;
+        }
+        .core-ring {
+          position: absolute;
+          inset: 14px;
+          border: 2px dashed var(--teal);
+          border-radius: 8px;
+          animation: pulse 1800ms ease infinite;
+        }
+        .core-title { font-size: 26px; font-weight: 900; }
+        .core-sub { margin-top: 40px; position: absolute; font-size: 12px; color: var(--muted); font-weight: 760; }
+        .queue-stack { position: absolute; right: 0; top: 44px; display: grid; gap: 11px; width: 170px; }
+        .queue-card {
+          padding: 14px 15px;
+          min-height: 54px;
+          border: 1px solid var(--hair);
+          border-radius: 8px;
+          background: var(--white);
+          font-size: 16px;
+          font-weight: 850;
+        }
+        .sales { border-left: 5px solid var(--green); }
+        .finance { border-left: 5px solid var(--amber); }
+        .legal { border-left: 5px solid var(--violet); }
+        .audit { border-left: 5px solid var(--red); }
+        .path {
+          position: absolute;
+          height: 3px;
+          background: var(--ink);
+          transform-origin: left center;
+          animation: drawLine 920ms ease forwards;
+          opacity: 0.8;
+        }
+        .path-a { left: 176px; top: 180px; width: 49px; animation-delay: 880ms; }
+        .path-b { left: 376px; top: 180px; width: 29px; animation-delay: 1180ms; }
+        .packet {
+          position: absolute;
+          width: 16px;
+          height: 16px;
+          border-radius: 4px;
+          background: var(--teal);
+          offset-rotate: 0deg;
+          animation: driftPacket 2700ms ease-in-out infinite;
+        }
+        .packet-a { offset-path: path("M 84 84 L 292 180 L 486 80"); animation-delay: 1400ms; }
+        .packet-b { offset-path: path("M 82 178 L 292 180 L 486 194"); animation-delay: 1820ms; background: var(--amber); }
+      </style>
+    </section>
+  </body>
+</html>
