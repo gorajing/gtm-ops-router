@@ -2,9 +2,9 @@
 
 **A working GTM ops control plane for AI-native revenue teams.**
 
-[![gtm-ops-router — watch the HD demo video](assets/demo-poster.png)](assets/demo.mp4)
+![gtm-ops-router — inbound deal → enrich → score → route → handoff, with the loop closing](assets/demo.gif)
 
-[Watch the HD MP4 demo](assets/demo.mp4) · [video claim ledger](assets/demo-video/claim-ledger.md)
+[HD MP4 file](assets/demo.mp4) · [video claim ledger](assets/demo-video/claim-ledger.md)
 
 Inbound deal → **real grounded LLM enrichment** (keyless fixture fallback) → score
 → route across **sales / finance / legal** → sales handoff → **engagement feedback

@@ -86,6 +86,6 @@ assets/demo.mp4
 ```
 
 ```text
-assets/demo-poster.png
-1280x720 PNG poster linking to assets/demo.mp4
+assets/demo.gif
+800x450, 10fps, 35.800000s, 15,884,290 bytes
 ```
