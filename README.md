@@ -4,7 +4,7 @@
 
 ![gtm-ops-router — inbound deal → enrich → score → route → handoff, with the loop closing](assets/demo.gif)
 
-[HD MP4 file](assets/demo.mp4) · [video claim ledger](assets/demo-video/claim-ledger.md)
+[video claim ledger](assets/demo-video/claim-ledger.md)
 
 Inbound deal → **real grounded LLM enrichment** (keyless fixture fallback) → score
 → route across **sales / finance / legal** → sales handoff → **engagement feedback
