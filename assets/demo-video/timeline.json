@@ -3,49 +3,13 @@
   "width": 1280,
   "height": 720,
   "fps": 30,
-  "transition": 0.42,
-  "fade_in": 0.18,
+  "transition": 0,
+  "fade_in": 0.12,
   "fade_out": 0.45,
   "clips": [
     {
-      "id": "01-open",
-      "file": "clips/01-open.mp4",
-      "duration": 4.5
-    },
-    {
-      "id": "02-leak",
-      "file": "clips/02-leak.mp4",
-      "duration": 4.6
-    },
-    {
-      "id": "03-policy",
-      "file": "clips/03-policy.mp4",
-      "duration": 4.8
-    },
-    {
-      "id": "04-run",
-      "file": "clips/04-run.mp4",
-      "duration": 5.2
-    },
-    {
-      "id": "05-loop",
-      "file": "clips/05-loop.mp4",
-      "duration": 5
-    },
-    {
-      "id": "06-product",
-      "file": "clips/06-product.mp4",
-      "duration": 5.4
-    },
-    {
-      "id": "07-audit",
-      "file": "clips/07-audit.mp4",
-      "duration": 4.8
-    },
-    {
-      "id": "08-close",
-      "file": "clips/08-close.mp4",
-      "duration": 4.4
+      "id": "operator-session",
+      "file": "clips/operator-session.mp4"
     }
   ]
 }

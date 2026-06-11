@@ -2,14 +2,15 @@
 
 **A working GTM ops control plane for AI-native revenue teams.**
 
-![gtm-ops-router — inbound deal → enrich → score → route → handoff, with the loop closing](assets/demo.gif)
+![gtm-ops-router — one routed deal through handoff, engagement feedback, source-of-truth tiers, and audit](assets/demo.gif)
 
 [video claim ledger](assets/demo-video/claim-ledger.md)
 
-Inbound deal → **real grounded LLM enrichment** (keyless fixture fallback) → score
-→ route across **sales / finance / legal** → sales handoff → **engagement feedback
-→ measurement**. Typed failure handling, idempotent persistence, a byte-for-byte
-cross-repo contract, and live observability. No mock-ups. It runs, and the loop closes.
+Watch one operator inspect the live dashboard for a local sample run: route
+decision, handoff receipts, Sales engagement feedback, source-of-truth tiers,
+and the audit gate. Typed failure handling, idempotent persistence, a
+byte-for-byte cross-repo contract, and live observability. No mock-ups. It
+runs, and the loop stays honest.
 
 ---
 
