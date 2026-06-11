@@ -117,6 +117,7 @@ function directorCss() {
       display: none !important;
     }
     body.gtm-video-mode.stage-funnel #queue,
+    body.gtm-video-mode.stage-funnel #detail,
     body.gtm-video-mode.stage-funnel #role-queues,
     body.gtm-video-mode.stage-funnel #work-items,
     body.gtm-video-mode.stage-funnel #policy-evaluation,
@@ -209,7 +210,7 @@ function directorCss() {
       padding: 17px;
       border: 1px solid rgba(20,24,32,.18);
       border-radius: 10px;
-      background: rgba(255,255,255,.96);
+      background: #ffffff;
       box-shadow: 0 18px 46px rgba(20,24,32,.18);
       opacity: 0;
       transform: translateX(18px);
@@ -349,6 +350,11 @@ function directorInit() {
     focus.classList.add("show");
   }
 
+  function clearFocus() {
+    focus.classList.remove("show");
+    focusLabel.textContent = "";
+  }
+
   function moveCursor(selector, xRatio = .5, yRatio = .5) {
     const rect = rectFor(selector);
     if (!rect) {
@@ -360,12 +366,16 @@ function directorInit() {
     cursor.classList.add("show");
   }
 
+  function hideCursor() {
+    cursor.classList.remove("show");
+  }
+
   function scrollToSelector(selector, block = "center") {
     const node = document.querySelector(selector);
     if (node) node.scrollIntoView({ behavior: "smooth", block, inline: "nearest" });
   }
 
-  window.__gtmVideoDirector = { setStage, setLower, setDrawer, setFocus, moveCursor, scrollToSelector };
+  window.__gtmVideoDirector = { setStage, setLower, setDrawer, setFocus, clearFocus, moveCursor, hideCursor, scrollToSelector };
 }
 
 function drawerRows(title, rows) {
@@ -505,8 +515,8 @@ async function main() {
     d.setStage("queue");
     d.setLower("The handoff leaves receipts.", "HubSpot and Slack are dry-run sinks here, but the receipt trail is a real event stream.");
     d.setDrawer(html, { dark: false });
-    d.setFocus("#detail", "receipt trail", 10);
-    d.moveCursor("#detail", .62, .56);
+    d.clearFocus();
+    d.hideCursor();
   }, drawerRows("event stream", eventRows));
   await page.waitForTimeout(4300);
 
@@ -514,6 +524,8 @@ async function main() {
   const coverage = state.engagementAttribution.coverage;
   await director((d, html) => {
     d.setStage("funnel");
+    d.clearFocus();
+    d.hideCursor();
     d.scrollToSelector("#full-funnel", "center");
     d.setLower("A signal is not truth.", "The dashboard shows Sales-reported motion without converting it into router-owned pipeline.");
     d.setDrawer(html);
@@ -525,8 +537,8 @@ async function main() {
   ]));
   await page.waitForTimeout(900);
   await director((d) => {
-    d.setFocus("#full-funnel", "full-funnel attribution", 10);
-    d.moveCursor("#full-funnel", .52, .34);
+    d.clearFocus();
+    d.hideCursor();
   });
   await page.waitForTimeout(4800);
 

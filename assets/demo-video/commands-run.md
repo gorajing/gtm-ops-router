@@ -108,12 +108,12 @@ Wrote /Users/jinchoi/Code/gtm-ops-router/assets/demo-video/timeline.json
 ```text
 node /Users/jinchoi/.codex/skills/cinematic-explainer-videos/scripts/assemble_timeline.mjs assets/demo-video/timeline.json
 Wrote /Users/jinchoi/Code/gtm-ops-router/assets/demo.mp4
-Estimated duration: 34.07s
+Estimated duration: 34.20s
 ```
 
 ```text
 bash /Users/jinchoi/.codex/skills/cinematic-explainer-videos/scripts/extract_review_frames.sh assets/demo.mp4 assets/demo-video/review-frames \
-  2.5:dashboard 7.4:workflow 12.3:route-detail 17.0:event-stream 22.5:authority-tiers 27.8:audit 32.0:close
+  2.5:dashboard 7.4:workflow 12.3:route-detail 16.8:event-stream 20.5:authority-intro 22.8:authority-tiers 27.8:audit 32.0:close
 ```
 
 ```text
@@ -127,7 +127,8 @@ ffmpeg -y -i assets/demo.mp4 -i /tmp/gtm-ops-router-demo-palette.png \
 ```
 
 ```text
-ffmpeg -y -ss 17.0 -i assets/demo.gif -frames:v 1 assets/demo-video/review-frames/gif-event-stream.png
+ffmpeg -y -ss 16.8 -i assets/demo.gif -frames:v 1 assets/demo-video/review-frames/gif-event-stream.png
+ffmpeg -y -ss 20.5 -i assets/demo.gif -frames:v 1 assets/demo-video/review-frames/gif-authority-intro.png
 ffmpeg -y -ss 27.8 -i assets/demo.gif -frames:v 1 assets/demo-video/review-frames/gif-audit.png
 ```
 
@@ -135,10 +136,10 @@ ffmpeg -y -ss 27.8 -i assets/demo.gif -frames:v 1 assets/demo-video/review-frame
 
 ```text
 assets/demo.mp4
-1280x720, 30fps, 34.066667s, 3,180,530 bytes
+1280x720, 30fps, 34.200000s, 3,173,710 bytes
 ```
 
 ```text
 assets/demo.gif
-900x506, 12fps, 34.080000s, 18,456,865 bytes
+900x506, 12fps, 34.160000s, 16,981,439 bytes
 ```
